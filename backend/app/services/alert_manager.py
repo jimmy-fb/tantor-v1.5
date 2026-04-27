@@ -262,6 +262,13 @@ def list_firing_for_cluster(cluster_id: str, db: Session) -> list[dict]:
         logger.warning("Alertmanager %s unreachable: %s", am_url, e)
         return []
 
+    # Alertmanager v2 reports state as "active" / "unprocessed" / "suppressed";
+    # the UI speaks "firing" / "pending" / "resolved". Translate at the boundary.
+    state_map = {
+        "active": "firing",
+        "unprocessed": "pending",
+        "suppressed": "firing",  # silenced/inhibited still fired, just hidden
+    }
     out: list[dict] = []
     for alert in payload:
         labels = alert.get("labels", {})
@@ -270,12 +277,12 @@ def list_firing_for_cluster(cluster_id: str, db: Session) -> list[dict]:
         if labels.get("tantor_cluster_id") != cluster_id:
             continue
         annotations = alert.get("annotations", {})
-        status = alert.get("status", {})
+        am_state = (alert.get("status") or {}).get("state", "active")
         out.append({
             "fingerprint": alert.get("fingerprint", ""),
             "alert_name": labels.get("alertname", "unknown"),
             "severity": labels.get("severity", "warning"),
-            "state": status.get("state", "firing"),
+            "state": state_map.get(am_state, "firing"),
             "started_at": alert.get("startsAt"),
             "ends_at": alert.get("endsAt"),
             "summary": annotations.get("summary"),

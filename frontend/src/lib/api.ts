@@ -305,3 +305,114 @@ export const getActivity = (params: {
   limit?: number;
   offset?: number;
 } = {}) => api.get<ActivityResponse>('/activity', { params }).then(r => r.data);
+
+// ── Alerting ────────────────────────────────────────
+export type Severity = 'info' | 'warning' | 'critical';
+export type ChannelKind = 'slack' | 'webhook' | 'email' | 'tantor_internal';
+
+export interface RuleTemplate {
+  id: string;
+  name: string;
+  severity: Severity;
+  for_seconds: number;
+  expr: string;
+  summary: string;
+  description: string;
+}
+export interface AlertRule {
+  id: string;
+  cluster_id: string;
+  name: string;
+  expr: string;
+  for_seconds: number;
+  severity: Severity;
+  summary: string | null;
+  description: string | null;
+  channel_ids: string[];
+  template: string | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+export interface AlertRuleCreate {
+  name: string;
+  expr: string;
+  for_seconds: number;
+  severity: Severity;
+  summary?: string | null;
+  description?: string | null;
+  channel_ids: string[];
+  template?: string | null;
+  enabled?: boolean;
+}
+export interface FiringAlert {
+  fingerprint: string;
+  alert_name: string;
+  severity: Severity;
+  state: 'firing' | 'pending' | 'resolved';
+  started_at: string | null;
+  ends_at: string | null;
+  summary: string | null;
+  description: string | null;
+  labels: Record<string, string>;
+}
+export interface FiringAlertsResponse {
+  alerts: FiringAlert[];
+  count: number;
+  alertmanager_url: string | null;
+  alertmanager_reachable: boolean;
+}
+export interface AlertIncident {
+  id: string;
+  fingerprint: string;
+  cluster_id: string | null;
+  rule_id: string | null;
+  alert_name: string;
+  severity: Severity;
+  status: 'firing' | 'resolved';
+  summary: string | null;
+  description: string | null;
+  started_at: string;
+  resolved_at: string | null;
+  last_seen_at: string;
+}
+export interface NotificationChannel {
+  id: string;
+  name: string;
+  kind: ChannelKind;
+  enabled: boolean;
+  config_redacted: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+export interface NotificationChannelCreate {
+  name: string;
+  kind: ChannelKind;
+  enabled: boolean;
+  config: Record<string, unknown>;
+}
+
+export const getRuleTemplates = (clusterId: string) =>
+  api.get<RuleTemplate[]>(`/clusters/${clusterId}/alerts/rule-templates`).then(r => r.data);
+export const getAlertRules = (clusterId: string) =>
+  api.get<AlertRule[]>(`/clusters/${clusterId}/alerts/rules`).then(r => r.data);
+export const createAlertRule = (clusterId: string, data: AlertRuleCreate) =>
+  api.post<AlertRule>(`/clusters/${clusterId}/alerts/rules`, data).then(r => r.data);
+export const updateAlertRule = (clusterId: string, ruleId: string, data: Partial<AlertRuleCreate>) =>
+  api.put<AlertRule>(`/clusters/${clusterId}/alerts/rules/${ruleId}`, data).then(r => r.data);
+export const deleteAlertRule = (clusterId: string, ruleId: string) =>
+  api.delete(`/clusters/${clusterId}/alerts/rules/${ruleId}`).then(r => r.data);
+export const getFiringAlerts = (clusterId: string) =>
+  api.get<FiringAlertsResponse>(`/clusters/${clusterId}/alerts/firing`).then(r => r.data);
+export const getAlertIncidents = (clusterId: string, status?: 'firing' | 'resolved', limit = 100) =>
+  api.get<AlertIncident[]>(`/clusters/${clusterId}/alerts/incidents`, { params: { status, limit } }).then(r => r.data);
+export const getNotificationChannels = () =>
+  api.get<NotificationChannel[]>('/notification-channels').then(r => r.data);
+export const createNotificationChannel = (data: NotificationChannelCreate) =>
+  api.post<NotificationChannel>('/notification-channels', data).then(r => r.data);
+export const updateNotificationChannel = (id: string, data: Partial<NotificationChannelCreate>) =>
+  api.put<NotificationChannel>(`/notification-channels/${id}`, data).then(r => r.data);
+export const deleteNotificationChannel = (id: string) =>
+  api.delete(`/notification-channels/${id}`).then(r => r.data);
+export const testNotificationChannel = (id: string, body: { severity?: Severity; summary?: string; description?: string } = {}) =>
+  api.post<{ success: boolean; message: string }>(`/notification-channels/${id}/test`, body).then(r => r.data);

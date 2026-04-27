@@ -457,7 +457,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/alertmanager/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/var/lib/alertmanager --web.listen-address=:{port}
+ExecStart=/opt/alertmanager/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/var/lib/alertmanager --web.listen-address=:{port} --cluster.listen-address=
 Restart=always
 
 [Install]

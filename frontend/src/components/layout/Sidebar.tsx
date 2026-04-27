@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Server, Network, Plus, Package, Users, BarChart3, LogOut, User, Shield, Link2, KeyRound, Activity } from 'lucide-react';
+import { LayoutDashboard, Server, Network, Plus, Package, Users, BarChart3, LogOut, User, Shield, Link2, KeyRound, Activity, Bell } from 'lucide-react';
 import { isAdmin, getUsername, clearTokens } from '../../lib/auth';
 import { getHealthInfo } from '../../lib/api';
 
@@ -30,6 +30,7 @@ export default function Sidebar() {
     { to: '/security-scan', icon: Shield, label: 'Security Scan' },
     { to: '/cluster-linking', icon: Link2, label: 'Cluster Linking' },
     { to: '/activity', icon: Activity, label: 'Activity' },
+    { to: '/alerts', icon: Bell, label: 'Alerts' },
     ...(admin ? [
       { to: '/users', icon: Users, label: 'Users', adminOnly: true },
       { to: '/ldap-settings', icon: KeyRound, label: 'LDAP / AD', adminOnly: true },

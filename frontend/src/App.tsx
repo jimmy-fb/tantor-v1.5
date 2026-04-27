@@ -15,6 +15,7 @@ import SecurityScan from './pages/SecurityScan';
 import ClusterLinking from './pages/ClusterLinking';
 import LdapSettings from './pages/LdapSettings';
 import Activity from './pages/Activity';
+import Alerts from './pages/Alerts';
 
 export default function App() {
   return (
@@ -36,6 +37,7 @@ export default function App() {
             <Route path="/cluster-linking" element={<ClusterLinking />} />
             <Route path="/ldap-settings" element={<LdapSettings />} />
             <Route path="/activity" element={<Activity />} />
+            <Route path="/alerts" element={<Alerts />} />
           </Route>
         </Route>
       </Routes>
