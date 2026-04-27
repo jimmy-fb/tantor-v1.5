@@ -1,6 +1,9 @@
 import logging
-from ldap3 import Server, Connection, ALL, SUBTREE, Tls
+import os
 import ssl
+import tempfile
+
+from ldap3 import Server, Connection, ALL, SUBTREE, Tls
 
 logger = logging.getLogger("tantor.ldap")
 
@@ -9,11 +12,43 @@ class LdapService:
     """Handles LDAP/AD authentication and user search operations."""
 
     @staticmethod
+    def _build_tls(config) -> Tls | None:
+        """Build a Tls object honoring tls_validate_cert + optional tls_ca_cert."""
+        if not config.use_ssl:
+            return None
+
+        # Existing rows from before this column was added will read None for
+        # tls_validate_cert; treat that as the secure default.
+        validate_cert = getattr(config, "tls_validate_cert", True)
+        if validate_cert is None:
+            validate_cert = True
+        ca_cert_pem = getattr(config, "tls_ca_cert", None)
+
+        if not validate_cert:
+            logger.warning(
+                "LDAPS server-cert validation is DISABLED for %s — vulnerable to MITM. "
+                "Configure tls_ca_cert and re-enable validation in production.",
+                config.server_url,
+            )
+            return Tls(validate=ssl.CERT_NONE)
+
+        if ca_cert_pem:
+            # ldap3's Tls reads the CA from a file path, so spill the PEM to a
+            # restricted temp file. The OS cleans these up on reboot, and we
+            # rewrite on every config save so stale files are harmless.
+            fd, path = tempfile.mkstemp(prefix="tantor-ldap-ca-", suffix=".pem")
+            with os.fdopen(fd, "w") as f:
+                f.write(ca_cert_pem)
+            os.chmod(path, 0o600)
+            return Tls(validate=ssl.CERT_REQUIRED, ca_certs_file=path)
+
+        # CERT_REQUIRED with the system trust store (works for public CAs).
+        return Tls(validate=ssl.CERT_REQUIRED)
+
+    @staticmethod
     def _create_server(config) -> Server:
         """Create an ldap3 Server object from config."""
-        tls = None
-        if config.use_ssl:
-            tls = Tls(validate=ssl.CERT_NONE)
+        tls = LdapService._build_tls(config)
         return Server(
             config.server_url,
             use_ssl=config.use_ssl,

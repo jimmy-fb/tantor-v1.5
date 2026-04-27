@@ -10,7 +10,7 @@ from app.database import Base, engine, SessionLocal
 from app.api import (
     hosts, clusters, ws, versions, topics, kafka_connect, security, ksqldb,
     auth, logs, monitoring, broker_config, rolling_restart,
-    upgrades, security_scan, cluster_linking, rebalance, ldap,
+    upgrades, security_scan, cluster_linking, rebalance, ldap, activity,
 )
 from app.models.kafka_user import KafkaUser  # noqa: F401 - ensure table creation
 from app.models.audit_log import AuditLog  # noqa: F401 - ensure table creation
@@ -21,7 +21,9 @@ from app.models.config_audit import ConfigAuditLog  # noqa: F401 - ensure table 
 
 from app.models.cluster_link import ClusterLink  # noqa: F401 - ensure table creation
 from app.models.ldap_config import LdapConfig  # noqa: F401 - ensure table creation
+from app.models.deployment_task import DeploymentTask  # noqa: F401 - ensure table creation
 from app.services.auth_service import AuthService
+from app.services.migrations import apply_runtime_migrations
 
 APP_VERSION = "1.0.0"
 
@@ -36,6 +38,8 @@ logger = logging.getLogger("tantor")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # Add columns introduced after a table was first created in older installs.
+    apply_runtime_migrations(engine)
     # Create default admin user on first run
     db = SessionLocal()
     try:
@@ -91,6 +95,7 @@ app.include_router(security_scan.router)
 app.include_router(cluster_linking.router)
 app.include_router(rebalance.router)
 app.include_router(ldap.router)
+app.include_router(activity.router)
 
 
 @app.get("/api/health")

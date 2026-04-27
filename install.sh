@@ -300,12 +300,33 @@ elif [ -f "$KAFKA_DEST" ]; then
     echo -e "${GREEN}✓ Kafka ${KAFKA_VERSION} already present${NC}"
 else
     echo -e "${YELLOW}  Downloading Kafka ${KAFKA_VERSION} (~113 MB)...${NC}"
-    KAFKA_URL="https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/${KAFKA_TGZ}"
-    if curl -fSL --connect-timeout 15 --max-time 600 --progress-bar -o "$KAFKA_DEST" "$KAFKA_URL"; then
+    # Try the primary mirror first, then archive, with one retry each.
+    KAFKA_URLS=(
+        "https://downloads.apache.org/kafka/${KAFKA_VERSION}/${KAFKA_TGZ}"
+        "https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/${KAFKA_TGZ}"
+    )
+    DOWNLOAD_OK=0
+    for url in "${KAFKA_URLS[@]}"; do
+        for attempt in 1 2; do
+            echo -e "${YELLOW}    [$attempt/2] $url${NC}"
+            if curl -fSL --connect-timeout 15 --max-time 600 --retry 0 --progress-bar -o "$KAFKA_DEST" "$url"; then
+                DOWNLOAD_OK=1
+                break 2
+            fi
+            rm -f "$KAFKA_DEST"
+            sleep 2
+        done
+    done
+
+    if [ $DOWNLOAD_OK -eq 1 ]; then
         echo -e "${GREEN}✓ Kafka ${KAFKA_VERSION} downloaded ($(du -sh "$KAFKA_DEST" | awk '{print $1}'))${NC}"
     else
-        echo -e "${YELLOW}⚠ Download failed. Upload Kafka binary via UI after install.${NC}"
-        rm -f "$KAFKA_DEST"
+        # Don't claim success — be explicit so the operator knows the state.
+        echo -e "${YELLOW}⚠ Could not download Kafka ${KAFKA_VERSION} from Apache mirrors.${NC}"
+        echo -e "${YELLOW}  Tantor will auto-download it on the first cluster deploy.${NC}"
+        echo -e "${YELLOW}  Air-gapped? Place ${KAFKA_TGZ} at:${NC}"
+        echo -e "${YELLOW}    $KAFKA_DEST${NC}"
+        echo -e "${YELLOW}  or upload via the Kafka Versions page after install.${NC}"
     fi
 fi
 

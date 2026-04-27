@@ -91,16 +91,53 @@ def start_deployment(cluster_id: str, background_tasks: BackgroundTasks, db: Ses
 
     task_id = str(uuid.uuid4())
     init_task(task_id, cluster_id)
-    background_tasks.add_task(deploy_cluster, cluster_id, task_id, db)
+    # The deploy worker opens its own DB session — never pass the request's
+    # session into a background task, that one closes when the response sends.
+    background_tasks.add_task(deploy_cluster, cluster_id, task_id)
     return DeploymentTaskResponse(task_id=task_id, cluster_id=cluster_id, status="running")
 
 
 @router.get("/{cluster_id}/deploy/{task_id}")
-def get_deployment_status(cluster_id: str, task_id: str, _: User = Depends(require_monitor_or_above)):
-    task = get_task(task_id)
+def get_deployment_status(
+    cluster_id: str,
+    task_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_monitor_or_above),
+):
+    task = get_task(task_id, db=db)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     return task
+
+
+@router.get("/{cluster_id}/deploy")
+def list_deployment_tasks(
+    cluster_id: str,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_monitor_or_above),
+):
+    """List recent deployment tasks for a cluster (most recent first)."""
+    from app.models.deployment_task import DeploymentTask
+    rows = (
+        db.query(DeploymentTask)
+        .filter(DeploymentTask.cluster_id == cluster_id)
+        .order_by(DeploymentTask.started_at.desc())
+        .limit(min(max(limit, 1), 100))
+        .all()
+    )
+    return [
+        {
+            "task_id": r.id,
+            "cluster_id": r.cluster_id,
+            "status": r.status,
+            "current_step": r.current_step,
+            "error_message": r.error_message,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        }
+        for r in rows
+    ]
 
 
 @router.post("/{cluster_id}/start", response_model=list[ServiceActionResponse])

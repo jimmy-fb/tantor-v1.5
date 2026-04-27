@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import String, Boolean, Integer
+from sqlalchemy import String, Boolean, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -11,8 +11,15 @@ class LdapConfig(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    server_url: Mapped[str] = mapped_column(String(500), nullable=True)  # ldap://ad.company.com:389
+    server_url: Mapped[str] = mapped_column(String(500), nullable=True)  # ldaps://ad.company.com:636
     use_ssl: Mapped[bool] = mapped_column(Boolean, default=False)
+    # When use_ssl is true, controls whether the server certificate is verified.
+    # Defaults to true — disabling it is allowed for self-signed dev directories
+    # but is INSECURE in production (vulnerable to MITM).
+    tls_validate_cert: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+    # Optional CA certificate (PEM) used to verify the LDAPS server when the
+    # directory presents a private/internal cert not signed by a public CA.
+    tls_ca_cert: Mapped[str | None] = mapped_column(Text, nullable=True)
     bind_dn: Mapped[str] = mapped_column(String(500), nullable=True)  # cn=admin,dc=example,dc=com
     encrypted_bind_password: Mapped[str] = mapped_column(String(1000), nullable=True)
     user_search_base: Mapped[str] = mapped_column(String(500), nullable=True)  # ou=users,dc=example,dc=com

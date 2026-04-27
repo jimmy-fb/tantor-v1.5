@@ -57,28 +57,32 @@ class PrereqChecker:
 
     @staticmethod
     def check_ram(client: paramiko.SSHClient) -> dict:
+        # Cloud VMs marketed as 4 GB typically report ~3.6 GB usable after kernel
+        # and cloud-init overhead, so the fail threshold sits below that floor.
         _, stdout, _ = SSHManager.exec_command(client, "free -m | awk '/Mem:/{print $2}'")
         try:
             ram_mb = int(stdout)
             ram_gb = ram_mb / 1024
             if ram_gb >= 8:
                 return {"name": "RAM", "status": "pass", "message": f"{ram_gb:.1f} GB available", "details": None}
-            elif ram_gb >= 4:
-                return {"name": "RAM", "status": "warn", "message": f"{ram_gb:.1f} GB — 8GB+ recommended", "details": None}
-            return {"name": "RAM", "status": "fail", "message": f"{ram_gb:.1f} GB — minimum 4GB required", "details": None}
+            elif ram_gb >= 3.5:
+                return {"name": "RAM", "status": "warn", "message": f"{ram_gb:.1f} GB — 8GB+ recommended for production", "details": None}
+            return {"name": "RAM", "status": "fail", "message": f"{ram_gb:.1f} GB — minimum 3.5GB required", "details": None}
         except ValueError:
             return {"name": "RAM", "status": "fail", "message": "Could not determine RAM", "details": stdout}
 
     @staticmethod
     def check_disk(client: paramiko.SSHClient) -> dict:
+        # 20 GB cloud root volumes typically show ~18-19 GB free after OS install,
+        # so the fail threshold sits below that floor.
         _, stdout, _ = SSHManager.exec_command(client, "df -BG /opt | tail -1 | awk '{print $4}' | tr -d 'G'")
         try:
             free_gb = int(stdout)
             if free_gb >= 50:
                 return {"name": "Disk Space", "status": "pass", "message": f"{free_gb} GB free on /opt", "details": None}
-            elif free_gb >= 20:
-                return {"name": "Disk Space", "status": "warn", "message": f"{free_gb} GB free — 50GB+ recommended", "details": None}
-            return {"name": "Disk Space", "status": "fail", "message": f"{free_gb} GB free — minimum 20GB", "details": None}
+            elif free_gb >= 15:
+                return {"name": "Disk Space", "status": "warn", "message": f"{free_gb} GB free — 50GB+ recommended for production", "details": None}
+            return {"name": "Disk Space", "status": "fail", "message": f"{free_gb} GB free — minimum 15GB", "details": None}
         except ValueError:
             return {"name": "Disk Space", "status": "fail", "message": "Could not determine disk space", "details": stdout}
 

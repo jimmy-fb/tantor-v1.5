@@ -5,6 +5,8 @@ class LdapConfigCreate(BaseModel):
     enabled: bool = False
     server_url: str
     use_ssl: bool = False
+    tls_validate_cert: bool = True
+    tls_ca_cert: str | None = None
     bind_dn: str
     bind_password: str
     user_search_base: str
@@ -20,6 +22,8 @@ class LdapConfigUpdate(BaseModel):
     enabled: bool | None = None
     server_url: str | None = None
     use_ssl: bool | None = None
+    tls_validate_cert: bool | None = None
+    tls_ca_cert: str | None = None
     bind_dn: str | None = None
     bind_password: str | None = None
     user_search_base: str | None = None
@@ -36,6 +40,9 @@ class LdapConfigResponse(BaseModel):
     enabled: bool
     server_url: str | None
     use_ssl: bool
+    tls_validate_cert: bool
+    # Whether a CA cert is configured. The PEM body itself is not returned.
+    tls_ca_cert_present: bool = False
     bind_dn: str | None
     user_search_base: str | None
     user_search_filter: str

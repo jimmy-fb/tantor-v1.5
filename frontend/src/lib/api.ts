@@ -279,3 +279,29 @@ export const getLdapConfig = () => api.get('/ldap/config').then(r => r.data);
 export const updateLdapConfig = (data: Record<string, unknown>) => api.put('/ldap/config', data).then(r => r.data);
 export const testLdapConnection = (data: { username: string; password: string }) => api.post('/ldap/test', data).then(r => r.data);
 export const syncLdapUsers = () => api.post('/ldap/sync-users').then(r => r.data);
+
+// ── Activity feed ───────────────────────────────────
+export interface ActivityEntry {
+  id: string;
+  kind: 'security' | 'config';
+  cluster_id: string | null;
+  cluster_name: string | null;
+  action: string;
+  resource: string;
+  actor: string | null;
+  details: string | null;
+  occurred_at: string;
+}
+export interface ActivityResponse {
+  entries: ActivityEntry[];
+  count: number;
+  has_more: boolean;
+}
+export const getActivity = (params: {
+  cluster_id?: string;
+  kind?: 'security' | 'config';
+  q?: string;
+  since?: string;
+  limit?: number;
+  offset?: number;
+} = {}) => api.get<ActivityResponse>('/activity', { params }).then(r => r.data);
