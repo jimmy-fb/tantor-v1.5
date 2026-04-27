@@ -54,11 +54,18 @@ class Settings(BaseSettings):
     # Monitoring
     PROMETHEUS_PORT: int = 9090
     GRAFANA_PORT: int = 3000
+    ALERTMANAGER_PORT: int = 9094  # not 9093 — Kafka KRaft uses :9093
     MONITORING_REPO_DIR: str = str(_BASE_DIR / "repo" / "monitoring")
     PROMETHEUS_VERSION: str = "2.51.0"
+    ALERTMANAGER_VERSION: str = "0.27.0"
     NODE_EXPORTER_VERSION: str = "1.7.0"
     JMX_EXPORTER_VERSION: str = "0.20.0"
     GRAFANA_VERSION: str = "10.4.1"
+
+    # Public URL the monitoring host can reach Tantor on (for Alertmanager
+    # webhooks). Required when monitoring lives on a different host than
+    # Tantor; defaults to localhost which is fine for single-host installs.
+    TANTOR_PUBLIC_URL: str = "http://localhost"
 
     # Ansible
     ANSIBLE_WORKING_DIR: str = str(_BASE_DIR / "ansible_work")

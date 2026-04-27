@@ -1,4 +1,4 @@
-"""Deploy Prometheus, Grafana, and JMX exporter for Kafka monitoring."""
+"""Deploy Prometheus, Grafana, Alertmanager, and JMX exporter for Kafka monitoring."""
 
 import json
 import logging
@@ -8,10 +8,13 @@ from pathlib import Path
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.models.alert_rule import AlertRule
 from app.models.cluster import Cluster
 from app.models.host import Host
+from app.models.notification_channel import NotificationChannel
 from app.models.service import Service
 from app.models.monitoring import MonitoringConfig
+from app.services import alert_manager
 from app.services.ssh_manager import SSHManager
 from app.services.crypto import decrypt
 
@@ -19,6 +22,7 @@ logger = logging.getLogger("tantor.monitoring_deployer")
 
 PROMETHEUS_VERSION = "2.51.0"
 GRAFANA_VERSION = getattr(settings, "GRAFANA_VERSION", "10.4.1")
+ALERTMANAGER_VERSION = getattr(settings, "ALERTMANAGER_VERSION", "0.27.0")
 JMX_EXPORTER_VERSION = "0.20.0"
 JMX_EXPORTER_PORT = 7071
 
@@ -69,7 +73,21 @@ class MonitoringDeployer:
         except Exception as e:
             steps.append({"step": "Grafana", "status": "failed", "error": str(e)})
 
-        # Step 4: Provision dashboards
+        # Step 4: Deploy Alertmanager (alongside Prometheus on the same host)
+        try:
+            MonitoringDeployer._deploy_alertmanager(mon_host, settings.ALERTMANAGER_PORT)
+            steps.append({"step": "Alertmanager", "status": "success"})
+        except Exception as e:
+            steps.append({"step": "Alertmanager", "status": "failed", "error": str(e)})
+
+        # Step 5: Render initial Tantor rules + alertmanager.yml from DB
+        try:
+            MonitoringDeployer._render_alerting_files(cluster_id, mon_host, db)
+            steps.append({"step": "Alert rules + receivers", "status": "success"})
+        except Exception as e:
+            steps.append({"step": "Alert rules + receivers", "status": "failed", "error": str(e)})
+
+        # Step 6: Provision dashboards
         try:
             time.sleep(5)  # Wait for Grafana to start
             MonitoringDeployer._provision_dashboards(mon_host, grafana_port, prometheus_port)
@@ -180,8 +198,18 @@ echo "JMX_DONE"
   scrape_interval: 15s
   evaluation_interval: 15s
 
+# Tantor-managed: Alertmanager runs on the same host as Prometheus.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:{settings.ALERTMANAGER_PORT}']
+
+# Tantor-managed: alert rules are written by alert_manager.render_prometheus_rules.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
 scrape_configs:
-  - job_name: 'kafka'
+  - job_name: 'kafka-jmx'
     static_configs:
       - targets: [{targets}]
 
@@ -203,7 +231,7 @@ if ! command -v prometheus &>/dev/null && [ ! -f /opt/prometheus/prometheus ]; t
 fi
 
 # Write config
-sudo mkdir -p /etc/prometheus
+sudo mkdir -p /etc/prometheus /etc/prometheus/rules
 sudo bash -c 'cat > /etc/prometheus/prometheus.yml << "PROMEOF"
 {prometheus_yml}
 PROMEOF'
@@ -216,7 +244,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/prometheus/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus --web.listen-address=:{port} --storage.tsdb.retention.time=180d
+ExecStart=/opt/prometheus/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus --web.listen-address=:{port} --storage.tsdb.retention.time=180d --web.enable-lifecycle
 Restart=always
 
 [Install]
@@ -393,3 +421,113 @@ echo "DASHBOARDS_OK"
             "grafana_port": config.grafana_port,
             "prometheus_port": config.prometheus_port,
         }
+
+    # ── Alertmanager ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _deploy_alertmanager(host: Host, port: int) -> None:
+        """Install Alertmanager on the monitoring host."""
+        logger.info("Deploying Alertmanager %s on %s:%d", ALERTMANAGER_VERSION, host.hostname, port)
+        commands = f"""
+if [ ! -f /opt/alertmanager/alertmanager ]; then
+    cd /tmp
+    curl -sL "https://github.com/prometheus/alertmanager/releases/download/v{ALERTMANAGER_VERSION}/alertmanager-{ALERTMANAGER_VERSION}.linux-amd64.tar.gz" -o alertmanager.tar.gz
+    tar xzf alertmanager.tar.gz
+    sudo mkdir -p /opt/alertmanager /var/lib/alertmanager /etc/alertmanager
+    sudo cp alertmanager-{ALERTMANAGER_VERSION}.linux-amd64/alertmanager /opt/alertmanager/
+    sudo cp alertmanager-{ALERTMANAGER_VERSION}.linux-amd64/amtool /opt/alertmanager/
+    rm -rf alertmanager.tar.gz alertmanager-{ALERTMANAGER_VERSION}.linux-amd64
+fi
+
+# Write a placeholder alertmanager.yml so Alertmanager can start before
+# Tantor renders the real one. _render_alerting_files runs right after.
+if [ ! -f /etc/alertmanager/alertmanager.yml ]; then
+    sudo bash -c 'cat > /etc/alertmanager/alertmanager.yml << "AMEOF"
+route:
+  receiver: tantor_default
+receivers:
+  - name: tantor_default
+AMEOF'
+fi
+
+sudo bash -c 'cat > /etc/systemd/system/alertmanager.service << "SVCEOF"
+[Unit]
+Description=Alertmanager
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/alertmanager/alertmanager --config.file=/etc/alertmanager/alertmanager.yml --storage.path=/var/lib/alertmanager --web.listen-address=:{port}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF'
+
+sudo systemctl daemon-reload
+sudo systemctl enable alertmanager
+sudo systemctl restart alertmanager
+sleep 2
+curl -sf http://localhost:{port}/-/healthy && echo "AM_OK" || echo "AM_FAIL"
+"""
+        _, stdout, stderr = MonitoringDeployer._ssh_exec(host, commands, timeout=180)
+        if "AM_OK" not in stdout:
+            raise RuntimeError(f"Alertmanager deploy failed: {stderr}")
+
+    @staticmethod
+    def _render_alerting_files(cluster_id: str, host: Host, db: Session) -> None:
+        """Render Tantor's rules + alertmanager.yml and push them to the monitoring host.
+
+        Both Prometheus and Alertmanager are reloaded via their HTTP APIs —
+        no service restart needed, so concurrent scrapes / alert evals keep flowing.
+        """
+        rules = db.query(AlertRule).filter(AlertRule.cluster_id == cluster_id).all()
+        channels = db.query(NotificationChannel).all()
+
+        rules_yml = alert_manager.render_prometheus_rules(rules)
+        am_yml = alert_manager.render_alertmanager_yaml(channels, alert_manager.tantor_webhook_url())
+
+        # Heredoc-safe: keep deterministic markers and avoid embedded EOFs.
+        push_cmd = f"""
+sudo mkdir -p /etc/prometheus/rules
+sudo bash -c 'cat > /etc/prometheus/rules/tantor.yml << "TANTORRULESEOF"
+{rules_yml}TANTORRULESEOF'
+
+sudo bash -c 'cat > /etc/alertmanager/alertmanager.yml << "TANTORAMEOF"
+{am_yml}TANTORAMEOF'
+
+# Validate before reloading; bail loudly so the operator sees the issue.
+sudo /opt/prometheus/promtool check rules /etc/prometheus/rules/tantor.yml >/tmp/rules_check 2>&1 \\
+  && echo "RULES_OK" \\
+  || (echo "RULES_INVALID"; cat /tmp/rules_check; exit 1)
+sudo /opt/alertmanager/amtool check-config /etc/alertmanager/alertmanager.yml >/tmp/am_check 2>&1 \\
+  && echo "AM_CONFIG_OK" \\
+  || (echo "AM_CONFIG_INVALID"; cat /tmp/am_check; exit 1)
+
+# Reload via HTTP API (no restart, no scrape gap).
+curl -sf -X POST http://localhost:{settings.PROMETHEUS_PORT}/-/reload && echo "PROM_RELOADED" || echo "PROM_RELOAD_FAILED"
+curl -sf -X POST http://localhost:{settings.ALERTMANAGER_PORT}/-/reload && echo "AM_RELOADED" || echo "AM_RELOAD_FAILED"
+"""
+        _, stdout, stderr = MonitoringDeployer._ssh_exec(host, push_cmd, timeout=60)
+        if "RULES_OK" not in stdout or "AM_CONFIG_OK" not in stdout:
+            raise RuntimeError(
+                f"Alerting config validation failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )
+        # Reload failures are best-effort: log but don't fail the call. The
+        # validated files are on disk; a daemon restart would pick them up.
+        if "PROM_RELOADED" not in stdout:
+            logger.warning("Prometheus did not acknowledge reload: %s", stdout)
+        if "AM_RELOADED" not in stdout:
+            logger.warning("Alertmanager did not acknowledge reload: %s", stdout)
+
+    @staticmethod
+    def reload_alerting(cluster_id: str, db: Session) -> dict:
+        """Public entrypoint used by the alerts API after rule/channel CRUD."""
+        config = db.query(MonitoringConfig).filter(MonitoringConfig.cluster_id == cluster_id).first()
+        if not config or not config.deployed or not config.monitoring_host_id:
+            return {"reloaded": False, "reason": "monitoring stack not deployed"}
+        host = db.query(Host).filter(Host.id == config.monitoring_host_id).first()
+        if not host:
+            return {"reloaded": False, "reason": "monitoring host not found"}
+        MonitoringDeployer._render_alerting_files(cluster_id, host, db)
+        return {"reloaded": True}
