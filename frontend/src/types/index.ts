@@ -62,6 +62,7 @@ export interface ClusterCreate {
   mode: 'kraft' | 'zookeeper';
   services: ServiceAssignment[];
   config: ClusterConfig;
+  environment?: string;
 }
 
 export interface Cluster {
@@ -74,6 +75,8 @@ export interface Cluster {
   created_at: string;
   // PR #3: external clusters share the same listing, distinguished by `kind`.
   kind?: 'managed' | 'external';
+  // QA #51: optional env tag (dev / qa / prod / etc).
+  environment?: string;
 }
 
 export interface ServiceInfo {

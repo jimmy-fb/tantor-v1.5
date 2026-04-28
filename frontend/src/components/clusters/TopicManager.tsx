@@ -42,11 +42,15 @@ export default function TopicManager({ clusterId }: Props) {
     fetchTopics();
   }, [fetchTopics]);
 
-  // Auto-refresh every 60 seconds (only when tab is visible)
+  // QA #3: visibility delay was 60s. Tighten to 10s when the tab is
+  // visible so new topics appear within a few seconds. We already
+  // re-fetch synchronously after create/delete (see handleCreate /
+  // handleDelete below), so this poll is just for changes happening
+  // out-of-band on other operators' UIs or via the kafka CLI.
   useEffect(() => {
     const interval = setInterval(() => {
       if (!document.hidden) fetchTopics();
-    }, 60000);
+    }, 10000);
     return () => clearInterval(interval);
   }, [fetchTopics]);
 

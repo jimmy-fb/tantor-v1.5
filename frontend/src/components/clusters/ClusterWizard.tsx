@@ -39,6 +39,8 @@ export default function ClusterWizard() {
   const [name, setName] = useState('');
   const [kafkaVersion, setKafkaVersion] = useState('');
   const [mode, setMode] = useState<'kraft' | 'zookeeper'>('kraft');
+  // QA #51: env tag — short label like "dev"/"qa"/"prod" or anything operator picks
+  const [environment, setEnvironment] = useState('');
 
   // Step 2: Role assignment — multi-role per host
   const [assignments, setAssignments] = useState<Record<string, string[]>>({});
@@ -167,6 +169,7 @@ export default function ClusterWizard() {
         mode,
         services: buildServices(),
         config,
+        environment: environment.trim().toLowerCase(),
       };
       const cluster = await createCluster(data);
       navigate(`/clusters/${cluster.id}`);
@@ -283,6 +286,30 @@ export default function ClusterWizard() {
                 )}
               </>
             )}
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Environment <span className="text-gray-400 text-xs">(optional)</span></label>
+            <div className="flex gap-2 flex-wrap">
+              {['dev', 'qa', 'staging', 'prod'].map((e) => (
+                <button
+                  key={e}
+                  type="button"
+                  onClick={() => setEnvironment(e === environment ? '' : e)}
+                  className={`px-3 py-1.5 text-sm rounded border ${
+                    environment === e ? 'bg-blue-50 border-blue-400 text-blue-700' : 'bg-white border-gray-300 text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  {e}
+                </button>
+              ))}
+              <input
+                value={environment}
+                onChange={(e) => setEnvironment(e.target.value)}
+                placeholder="custom tag (e.g. us-east-1)"
+                className="flex-1 min-w-[200px] px-3 py-1.5 text-sm border rounded"
+              />
+            </div>
+            <p className="text-xs text-gray-400 mt-1">Used for filtering on the Clusters list. Lowercased.</p>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">Consensus Mode</label>

@@ -32,6 +32,7 @@ class ClusterCreate(BaseModel):
     mode: str = "kraft"  # "kraft" (4.x supported) or "zookeeper" (3.x only)
     services: list[ServiceAssignment]
     config: ClusterConfig = ClusterConfig()
+    environment: str = ""
 
 
 class ClusterResponse(BaseModel):
@@ -48,8 +49,16 @@ class ClusterResponse(BaseModel):
     # it without round-tripping to /external-clusters. Secrets are NOT included.
     bootstrap_servers: str | None = None
     security_protocol: str | None = None
+    # Free-form env tag (dev / qa / prod / "us-east" / etc) — empty string = none.
+    environment: str = ""
 
     model_config = {"from_attributes": True}
+
+
+class ClusterUpdateRequest(BaseModel):
+    """Mutable cluster metadata. Cannot change kafka_version, mode, services here."""
+    name: str | None = None
+    environment: str | None = None
 
 
 class ServiceResponse(BaseModel):

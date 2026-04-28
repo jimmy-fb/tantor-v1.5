@@ -37,6 +37,10 @@ class Cluster(Base):
     # for production, only flip off for self-signed dev environments.
     ssl_verify: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
 
+    # Environment tag: dev / qa / staging / prod / "" (none). Free-form short
+    # label so customers can pick their own taxonomy (e.g. "us-east", "team-a").
+    environment: Mapped[str] = mapped_column(String(40), default="", server_default="")
+
     # ── TLS / mTLS for managed clusters ─────────────────────────────────
     # When ssl_enabled is true, brokers run a second listener on
     # config.ssl_listener_port using a Tantor-generated CA. mtls_required

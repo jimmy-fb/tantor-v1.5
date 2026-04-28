@@ -513,6 +513,10 @@ export const testExternalSaved = (id: string) =>
 export const externalListTopics = (id: string) =>
   api.get<Array<{ name: string; partitions: number; replication_factor: number }>>(`/external-clusters/${id}/topics`).then(r => r.data);
 
+// QA #51: cluster metadata edit (name + env tag)
+export const patchCluster = (id: string, body: { name?: string; environment?: string }) =>
+  api.patch<Cluster>(`/clusters/${id}`, body).then(r => r.data);
+
 // ── TLS / mTLS ──────────────────────────────────────
 export interface TLSState {
   ssl_enabled: boolean;

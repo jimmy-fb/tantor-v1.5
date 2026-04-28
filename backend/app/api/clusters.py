@@ -11,6 +11,7 @@ from app.models.host import Host
 from app.schemas.cluster import (
     ClusterCreate, ClusterResponse, ClusterDetailResponse,
     ServiceResponse, DeploymentTaskResponse, ServiceAssignment,
+    ClusterUpdateRequest,
 )
 from app.schemas.service import ServiceActionResponse
 from app.services.deployer import deploy_cluster, get_task, init_task
@@ -35,6 +36,7 @@ def create_cluster(data: ClusterCreate, db: Session = Depends(get_db), _: User =
         kafka_version=data.kafka_version,
         mode=data.mode,
         config_json=json.dumps(data.config.model_dump()),
+        environment=(data.environment or "").strip().lower(),
     )
     db.add(cluster)
     db.flush()
@@ -79,6 +81,30 @@ def delete_cluster(cluster_id: str, db: Session = Depends(get_db), _: User = Dep
     db.delete(cluster)
     db.commit()
     return {"detail": "Cluster deleted"}
+
+
+@router.patch("/{cluster_id}", response_model=ClusterResponse)
+def patch_cluster(
+    cluster_id: str,
+    data: ClusterUpdateRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Update mutable cluster metadata: name + environment tag.
+
+    kafka_version, mode, and service composition aren't mutable here —
+    they need a redeploy. This endpoint exists for renames + tagging.
+    """
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    if data.name is not None:
+        cluster.name = data.name.strip()
+    if data.environment is not None:
+        cluster.environment = data.environment.strip().lower()
+    db.commit()
+    db.refresh(cluster)
+    return cluster
 
 
 @router.post("/{cluster_id}/deploy", response_model=DeploymentTaskResponse)

@@ -30,6 +30,8 @@ _REQUIRED_COLUMNS: list[tuple[str, str, str, str | None]] = [
     ("clusters", "ssl_enabled", "BOOLEAN", "DEFAULT 0"),
     ("clusters", "mtls_required", "BOOLEAN", "DEFAULT 0"),
     ("clusters", "encrypted_tls_password", "TEXT", None),
+    # QA #51: environment tagging for cluster organization
+    ("clusters", "environment", "VARCHAR(40)", "DEFAULT ''"),
 ]
 
 
