@@ -178,6 +178,200 @@ def list_topics(cluster: Cluster) -> list[dict]:
             admin.close()
 
 
+def get_topic_detail(cluster: Cluster, topic_name: str) -> dict:
+    """Return the same shape kafka_admin._parse_topic_describe produces."""
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            descs = admin.describe_topics([topic_name])
+            if not descs:
+                raise ValueError(f"Topic not found: {topic_name}")
+            d = descs[0]
+            partitions_info = []
+            for p in d.get("partitions", []):
+                partitions_info.append({
+                    "partition": p.get("partition"),
+                    "leader": p.get("leader"),
+                    "replicas": p.get("replicas", []),
+                    "isr": p.get("isr", []),
+                })
+            # Topic configs (retention.ms, cleanup.policy, etc.) via separate call.
+            from kafka.admin import ConfigResource, ConfigResourceType
+            cr = ConfigResource(ConfigResourceType.TOPIC, topic_name)
+            cfg_map: dict[str, str] = {}
+            try:
+                cfg_resp = admin.describe_configs([cr])
+                # The shape of describe_configs varies; flatten defensively.
+                for resp in cfg_resp or []:
+                    resources = getattr(resp, "resources", None) or resp
+                    if isinstance(resources, list):
+                        for entry in resources:
+                            entries = entry[4] if isinstance(entry, tuple) and len(entry) > 4 else []
+                            for e in entries or []:
+                                if isinstance(e, tuple) and len(e) >= 2:
+                                    cfg_map[e[0]] = e[1]
+            except Exception:
+                pass
+            return {
+                "name": topic_name,
+                "partitions": len(partitions_info),
+                "replication_factor": len(partitions_info[0]["replicas"]) if partitions_info else 0,
+                "partitions_info": partitions_info,
+                "configs": cfg_map,
+            }
+        finally:
+            admin.close()
+
+
+def list_consumer_groups_with_lag(cluster: Cluster) -> list[dict]:
+    """Match the managed-cluster shape: id/state/members/topics/offsets/lag."""
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            groups = [g[0] for g in admin.list_consumer_groups()]
+            if not groups:
+                return []
+            # describe_consumer_groups returns ConsumerGroupResponse_v0/...
+            descriptions = admin.describe_consumer_groups(groups)
+            # Coordinator offsets give us per-partition committed offsets.
+            from kafka import KafkaConsumer
+            consumer_kw = _common_kwargs(cluster, secrets, ssl_paths)
+            consumer_kw.pop("client_id", None)
+            out = []
+            for desc in descriptions:
+                gid = desc.group
+                state = desc.state
+                members = []
+                topics: set[str] = set()
+                for m in desc.members:
+                    info = getattr(m, "member_metadata", None)
+                    member_topics: list[str] = []
+                    if info and hasattr(info, "subscription"):
+                        member_topics = list(info.subscription)
+                    elif info and hasattr(info, "topics"):
+                        member_topics = list(info.topics)
+                    topics.update(member_topics)
+                    members.append({
+                        "id": m.member_id,
+                        "client_id": m.client_id,
+                        "client_host": m.client_host,
+                        "topics": member_topics,
+                    })
+                # Committed offsets (best-effort).
+                offsets: list[dict] = []
+                try:
+                    offset_map = admin.list_consumer_group_offsets(gid)
+                    for tp, om in offset_map.items():
+                        offsets.append({
+                            "topic": tp.topic,
+                            "partition": tp.partition,
+                            "current_offset": om.offset,
+                        })
+                except Exception:
+                    pass
+                out.append({
+                    "group_id": gid,
+                    "state": state,
+                    "members": len(members),
+                    "topics": sorted(topics),
+                    "offsets": offsets,
+                    "member_details": members,
+                })
+            return out
+        finally:
+            admin.close()
+
+
+def get_consumer_group_detail(cluster: Cluster, group_id: str) -> dict:
+    matches = [g for g in list_consumer_groups_with_lag(cluster) if g["group_id"] == group_id]
+    if not matches:
+        raise ValueError(f"Consumer group not found: {group_id}")
+    return matches[0]
+
+
+def alter_topic_config(cluster: Cluster, topic_name: str, configs: dict) -> dict:
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    from kafka.admin import ConfigResource, ConfigResourceType
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            cr = ConfigResource(ConfigResourceType.TOPIC, topic_name, configs=configs)
+            admin.alter_configs([cr])
+            return {"topic": topic_name, "updated": True, "configs": configs}
+        finally:
+            admin.close()
+
+
+def increase_partitions(cluster: Cluster, topic_name: str, new_count: int) -> dict:
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    from kafka.admin import NewPartitions
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            admin.create_partitions({topic_name: NewPartitions(total_count=new_count)})
+            return {"topic": topic_name, "partitions": new_count, "updated": True}
+        finally:
+            admin.close()
+
+
+def validate_cluster(cluster: Cluster, create_test_topic: bool = True) -> dict:
+    """Mirrors kafka_admin.validate_cluster but using kafka-python."""
+    steps: list[dict] = []
+    test_topic = "__tantor_validation_test"
+    success_overall = True
+    try:
+        topics = list_topics(cluster)
+        steps.append({"step": "list_topics", "success": True,
+                      "message": f"Found {len(topics)} topic(s)", "data": [t["name"] for t in topics][:5]})
+    except Exception as e:
+        steps.append({"step": "list_topics", "success": False, "message": str(e), "data": None})
+        return {"steps": steps, "success": False}
+
+    if create_test_topic:
+        try:
+            create_topic(cluster, test_topic, 1, 1)
+            steps.append({"step": "create_test_topic", "success": True,
+                          "message": f"Created topic '{test_topic}'", "data": None})
+        except Exception as e:
+            msg = str(e)
+            if "already exists" in msg.lower() or "TopicAlreadyExistsError" in msg:
+                steps.append({"step": "create_test_topic", "success": True,
+                              "message": "Test topic already present (reusing)", "data": None})
+            else:
+                steps.append({"step": "create_test_topic", "success": False, "message": msg, "data": None})
+                return {"steps": steps, "success": False}
+    try:
+        produce_message(cluster, test_topic, "validation-key", '{"validation": true}')
+        steps.append({"step": "produce_message", "success": True, "message": "Message produced", "data": None})
+    except Exception as e:
+        steps.append({"step": "produce_message", "success": False, "message": str(e), "data": None})
+        return {"steps": steps, "success": False}
+
+    try:
+        msgs = consume_messages(cluster, test_topic, max_messages=5, timeout_ms=8000, from_beginning=True)
+        found = any('"validation"' in (m.get("value") or "") for m in msgs)
+        steps.append({"step": "consume_message",
+                      "success": True if found else False,
+                      "message": (f"Consumed {len(msgs)} message(s), validation message {'found' if found else 'NOT found'}"),
+                      "data": msgs})
+        if not found:
+            success_overall = False
+    except Exception as e:
+        steps.append({"step": "consume_message", "success": False, "message": str(e), "data": None})
+        success_overall = False
+
+    if create_test_topic:
+        try:
+            delete_topic(cluster, test_topic)
+            steps.append({"step": "cleanup", "success": True, "message": "Cleaned up test topic", "data": None})
+        except Exception as e:
+            steps.append({"step": "cleanup", "success": False, "message": str(e), "data": None})
+
+    return {"steps": steps, "success": success_overall}
+
+
 def list_consumer_groups(cluster: Cluster) -> list[dict]:
     secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
     with _ssl_files_for(secrets) as ssl_paths:

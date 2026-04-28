@@ -10,8 +10,28 @@ from app.models.host import Host
 from app.models.service import Service
 from app.models.kafka_user import KafkaUser
 from app.models.audit_log import AuditLog
+from app.services import external_admin
 from app.services.ssh_manager import SSHManager
 from app.services.crypto import encrypt
+
+
+def _is_external(cluster_id: str, db: Session) -> Cluster | None:
+    """Return the Cluster row only if it's externally-connected (kind=external).
+
+    Kept module-private so the dispatch points stay readable. Caller decides
+    what to do with `None` (proceed with managed SSH+CLI path).
+    """
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if not cluster:
+        raise ValueError("Cluster not found")
+    return cluster if (cluster.kind or "managed") == "external" else None
+
+
+def _external_only_unsupported(operation: str):
+    raise ValueError(
+        f"{operation} is not supported on externally-connected clusters yet — "
+        "the action requires SSH access to broker hosts that Tantor doesn't have."
+    )
 
 
 class KafkaAdmin:
@@ -46,6 +66,9 @@ class KafkaAdmin:
 
     @staticmethod
     def list_topics(cluster_id: str, db: Session) -> list[dict]:
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.list_topics(ext)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -62,6 +85,9 @@ class KafkaAdmin:
 
     @staticmethod
     def get_topic_detail(cluster_id: str, topic_name: str, db: Session) -> dict:
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.get_topic_detail(ext, topic_name)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -75,6 +101,9 @@ class KafkaAdmin:
 
     @staticmethod
     def create_topic(cluster_id: str, name: str, partitions: int, replication_factor: int, config: dict, db: Session) -> dict:
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.create_topic(ext, name, partitions, replication_factor)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -93,6 +122,9 @@ class KafkaAdmin:
 
     @staticmethod
     def delete_topic(cluster_id: str, name: str, db: Session) -> dict:
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.delete_topic(ext, name)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -108,6 +140,12 @@ class KafkaAdmin:
     @staticmethod
     def alter_topic_config(cluster_id: str, topic_name: str, configs: dict, db: Session) -> dict:
         """Alter topic-level configuration (e.g. retention.ms, cleanup.policy)."""
+        ext = _is_external(cluster_id, db)
+        if ext:
+            result = external_admin.alter_topic_config(ext, topic_name, configs)
+            KafkaAdmin._audit(db, cluster_id, "topic_config_altered", "topic", topic_name, str(configs))
+            db.commit()
+            return result
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -130,6 +168,12 @@ class KafkaAdmin:
     @staticmethod
     def increase_partitions(cluster_id: str, topic_name: str, new_count: int, db: Session) -> dict:
         """Increase the partition count for an existing topic."""
+        ext = _is_external(cluster_id, db)
+        if ext:
+            result = external_admin.increase_partitions(ext, topic_name, new_count)
+            KafkaAdmin._audit(db, cluster_id, "topic_partitions_increased", "topic", topic_name, f"to {new_count}")
+            db.commit()
+            return result
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -160,6 +204,9 @@ class KafkaAdmin:
 
     @staticmethod
     def list_consumer_groups(cluster_id: str, db: Session) -> list[dict]:
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.list_consumer_groups_with_lag(ext)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -223,6 +270,9 @@ class KafkaAdmin:
 
     @staticmethod
     def get_consumer_group_detail(cluster_id: str, group_id: str, db: Session) -> dict:
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.get_consumer_group_detail(ext, group_id)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -238,6 +288,9 @@ class KafkaAdmin:
 
     @staticmethod
     def produce_message(cluster_id: str, topic: str, key: str | None, value: str, db: Session) -> dict:
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.produce_message(ext, topic, key, value)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -264,6 +317,14 @@ class KafkaAdmin:
     # ── Consume ──────────────────────────────────────────
 
     @staticmethod
+    def consume_messages_dispatch_external(cluster_id, db, topic, max_messages, timeout_ms, from_beginning):
+        """Tiny shim because consume_messages takes many args; keeps the block tidy."""
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.consume_messages(ext, topic, max_messages, timeout_ms, from_beginning)
+        return None
+
+    @staticmethod
     def consume_messages(
         cluster_id: str, topic: str, db: Session,
         from_beginning: bool = False,
@@ -272,6 +333,11 @@ class KafkaAdmin:
         timeout_ms: int = 10000,
     ) -> list[dict]:
         """Consume messages from a topic and return with full metadata."""
+        ext_msgs = KafkaAdmin.consume_messages_dispatch_external(
+            cluster_id, db, topic, max_messages, timeout_ms, from_beginning,
+        )
+        if ext_msgs is not None:
+            return ext_msgs
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -372,6 +438,9 @@ class KafkaAdmin:
     @staticmethod
     def validate_cluster(cluster_id: str, db: Session, create_test_topic: bool = True) -> dict:
         """Run post-install validation: list topics, optionally create test topic, produce & consume."""
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.validate_cluster(ext, create_test_topic=create_test_topic)
         results: dict = {"steps": [], "success": True}
 
         # Step 1: List topics
@@ -603,6 +672,9 @@ class KafkaAdmin:
     @staticmethod
     def list_scram_users(cluster_id: str, db: Session) -> list[dict]:
         """List all SCRAM users configured in Kafka, enriched with local DB metadata."""
+        if _is_external(cluster_id, db):
+            # SCRAM admin via kafka-python is possible but not wired yet.
+            return []
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -754,6 +826,9 @@ class KafkaAdmin:
         resource_name: str | None = None,
     ) -> list[dict]:
         """List ACLs from Kafka, optionally filtered."""
+        if _is_external(cluster_id, db):
+            # ACL admin via kafka-python is possible but not wired yet.
+            return []
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -958,6 +1033,8 @@ class KafkaAdmin:
     @staticmethod
     def get_partition_distribution(cluster_id: str, db: Session) -> dict:
         """Describe all topics and build broker-to-partition distribution map."""
+        if _is_external(cluster_id, db):
+            _external_only_unsupported("Partition rebalance/reassignment")
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 

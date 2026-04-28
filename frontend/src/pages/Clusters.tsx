@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Network, Plus, Trash2 } from 'lucide-react';
+import { Network, Plus, Trash2, Plug } from 'lucide-react';
 import type { Cluster } from '../types';
 import { getClusters, deleteCluster } from '../lib/api';
 
@@ -43,14 +43,27 @@ export default function Clusters() {
         </div>
       ) : (
         <div className="space-y-3">
-          {clusters.map(cluster => (
+          {clusters.map(cluster => {
+            const isExternal = cluster.kind === 'external';
+            const Icon = isExternal ? Plug : Network;
+            return (
             <div key={cluster.id} className="flex items-center justify-between bg-white border rounded-xl p-5 shadow-sm">
               <Link to={`/clusters/${cluster.id}`} className="flex items-center gap-4 flex-1">
-                <Network size={20} className="text-gray-400" />
+                <Icon size={20} className={isExternal ? 'text-purple-500' : 'text-gray-400'} />
                 <div>
-                  <div className="font-semibold text-gray-900">{cluster.name}</div>
+                  <div className="font-semibold text-gray-900 flex items-center gap-2">
+                    {cluster.name}
+                    {isExternal && (
+                      <span className="px-2 py-0.5 rounded text-xs font-medium bg-purple-50 text-purple-700 border border-purple-200">
+                        external
+                      </span>
+                    )}
+                  </div>
                   <div className="text-sm text-gray-500">
-                    Kafka {cluster.kafka_version} / {cluster.mode.toUpperCase()}
+                    {isExternal
+                      ? <>Imported · Kafka {cluster.kafka_version === 'external' ? 'unknown' : cluster.kafka_version}</>
+                      : <>Kafka {cluster.kafka_version} / {cluster.mode.toUpperCase()}</>
+                    }
                     <span className="text-gray-300 mx-2">|</span>
                     Created {new Date(cluster.created_at).toLocaleDateString()}
                   </div>
@@ -59,6 +72,7 @@ export default function Clusters() {
               <div className="flex items-center gap-3">
                 <span className={`px-3 py-1 rounded-full text-xs font-medium ${
                   cluster.state === 'running' ? 'bg-green-100 text-green-700' :
+                  cluster.state === 'connected' ? 'bg-green-100 text-green-700' :
                   cluster.state === 'stopped' ? 'bg-gray-100 text-gray-600' :
                   cluster.state === 'deploying' ? 'bg-blue-100 text-blue-700' :
                   cluster.state === 'error' ? 'bg-red-100 text-red-700' :
@@ -74,7 +88,8 @@ export default function Clusters() {
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       )}
     </div>

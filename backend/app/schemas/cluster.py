@@ -39,6 +39,12 @@ class ClusterResponse(BaseModel):
     state: str
     config_json: str | None
     created_at: datetime
+    # `managed` (Tantor-deployed) or `external` (connected via bootstrap.servers).
+    kind: str = "managed"
+    # External clusters expose their connection info here so the UI can render
+    # it without round-tripping to /external-clusters. Secrets are NOT included.
+    bootstrap_servers: str | None = None
+    security_protocol: str | None = None
 
     model_config = {"from_attributes": True}
 

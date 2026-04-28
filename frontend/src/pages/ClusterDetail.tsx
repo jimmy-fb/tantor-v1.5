@@ -189,26 +189,31 @@ export default function ClusterDetail() {
   const isRunning = cluster.state === 'running';
   const hasConnect = services.some(s => s.role === 'kafka_connect');
   const hasKsqldb = services.some(s => s.role === 'ksqldb');
+  const isExternal = cluster.kind === 'external';
 
-  const tabs: Array<{ id: Tab; label: string; icon: React.ReactNode; requiresRunning?: boolean; requiresConnect?: boolean; requiresKsqldb?: boolean }> = [
+  const tabs: Array<{ id: Tab; label: string; icon: React.ReactNode; requiresRunning?: boolean; requiresConnect?: boolean; requiresKsqldb?: boolean; managedOnly?: boolean }> = [
     { id: 'overview', label: 'Overview', icon: <Monitor size={14} /> },
     { id: 'topics', label: 'Topics', icon: <List size={14} />, requiresRunning: true },
     { id: 'consume', label: 'Consume', icon: <Download size={14} />, requiresRunning: true },
     { id: 'produce', label: 'Produce', icon: <Send size={14} />, requiresRunning: true },
     { id: 'consumers', label: 'Groups', icon: <Users size={14} />, requiresRunning: true },
-    { id: 'connect', label: 'Connect', icon: <Plug size={14} />, requiresRunning: true, requiresConnect: true },
-    { id: 'ksqldb', label: 'ksqlDB', icon: <Database size={14} />, requiresRunning: true, requiresKsqldb: true },
-    { id: 'security', label: 'Security', icon: <Shield size={14} />, requiresRunning: true },
+    { id: 'connect', label: 'Connect', icon: <Plug size={14} />, requiresRunning: true, requiresConnect: true, managedOnly: true },
+    { id: 'ksqldb', label: 'ksqlDB', icon: <Database size={14} />, requiresRunning: true, requiresKsqldb: true, managedOnly: true },
+    { id: 'security', label: 'Security', icon: <Shield size={14} />, requiresRunning: true, managedOnly: true },
     { id: 'validate', label: 'Validate', icon: <ShieldCheck size={14} />, requiresRunning: true },
-    { id: 'config', label: 'Config', icon: <Settings size={14} />, requiresRunning: true },
-    { id: 'rebalance', label: 'Rebalance', icon: <Shuffle size={14} />, requiresRunning: true },
-    { id: 'restart', label: 'Restart', icon: <RotateCw size={14} />, requiresRunning: true },
-    { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={14} /> },
-    { id: 'service-logs', label: 'Service Logs', icon: <ScrollText size={14} />, requiresRunning: true },
+    { id: 'config', label: 'Config', icon: <Settings size={14} />, requiresRunning: true, managedOnly: true },
+    { id: 'rebalance', label: 'Rebalance', icon: <Shuffle size={14} />, requiresRunning: true, managedOnly: true },
+    { id: 'restart', label: 'Restart', icon: <RotateCw size={14} />, requiresRunning: true, managedOnly: true },
+    { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={14} />, managedOnly: true },
+    { id: 'service-logs', label: 'Service Logs', icon: <ScrollText size={14} />, requiresRunning: true, managedOnly: true },
   ];
 
+  // External clusters: treat 'connected' state as 'running' for tab visibility,
+  // and hide tabs that require SSH access to broker hosts (managedOnly).
+  const externalIsLive = isExternal && (cluster.state === 'connected' || cluster.state === 'running');
   const visibleTabs = tabs.filter(t => {
-    if (t.requiresRunning && !isRunning) return false;
+    if (t.managedOnly && isExternal) return false;
+    if (t.requiresRunning && !isRunning && !externalIsLive) return false;
     if (t.requiresConnect && !hasConnect) return false;
     if (t.requiresKsqldb && !hasKsqldb) return false;
     return true;
@@ -222,11 +227,21 @@ export default function ClusterDetail() {
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div>
-          <h1 className="text-2xl font-bold text-gray-900">{cluster.name}</h1>
+          <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
+            {cluster.name}
+            {isExternal && (
+              <span className="px-2 py-0.5 rounded text-xs font-medium bg-purple-50 text-purple-700 border border-purple-200">
+                external
+              </span>
+            )}
+          </h1>
           <p className="text-sm text-gray-500 mt-1">
-            Kafka {cluster.kafka_version} / {cluster.mode.toUpperCase()}
+            {isExternal
+              ? <>Imported cluster — managed via bootstrap servers</>
+              : <>Kafka {cluster.kafka_version} / {cluster.mode.toUpperCase()}</>
+            }
             <span className={`ml-3 px-2.5 py-0.5 rounded-full text-xs font-medium ${
-              cluster.state === 'running' ? 'bg-green-100 text-green-700' :
+              cluster.state === 'running' || cluster.state === 'connected' ? 'bg-green-100 text-green-700' :
               cluster.state === 'stopped' ? 'bg-gray-100 text-gray-600' :
               cluster.state === 'deploying' ? 'bg-blue-100 text-blue-700' :
               cluster.state === 'error' ? 'bg-red-100 text-red-700' :
@@ -237,7 +252,7 @@ export default function ClusterDetail() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {cluster.state === 'configured' && (
+          {cluster.state === 'configured' && !isExternal && (
             <button
               onClick={handleDeploy}
               disabled={actionLoading !== null}
@@ -247,7 +262,7 @@ export default function ClusterDetail() {
               Deploy
             </button>
           )}
-          {(cluster.state === 'running' || cluster.state === 'stopped' || cluster.state === 'error') && (
+          {!isExternal && (cluster.state === 'running' || cluster.state === 'stopped' || cluster.state === 'error') && (
             <>
               <button onClick={handleStart} disabled={actionLoading !== null}
                 className="flex items-center gap-2 px-3 py-2 bg-green-600 text-white text-sm rounded-lg hover:bg-green-700 disabled:opacity-50">
