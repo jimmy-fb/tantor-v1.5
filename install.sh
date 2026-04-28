@@ -45,19 +45,27 @@ NC='\033[0m'
 
 FORCE=false
 UNINSTALL=false
+PURGE=false
+REINSTALL=false
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # ─── Parse Arguments ───
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --force|-f)   FORCE=true; shift ;;
-        --uninstall)  UNINSTALL=true; shift ;;
+        --force|-f|--yes|-y)  FORCE=true; shift ;;
+        --uninstall)          UNINSTALL=true; shift ;;
+        # --purge implies --uninstall AND wipes /var/lib/tantor (DB + repos).
+        --purge)              UNINSTALL=true; PURGE=true; FORCE=true; shift ;;
+        # --reinstall = uninstall (preserve data) then run a fresh install.
+        --reinstall)          REINSTALL=true; FORCE=true; shift ;;
         --help|-h)
             echo "Usage: sudo ./install.sh [OPTIONS]"
             echo ""
             echo "Options:"
             echo "  --force       Skip confirmation prompts"
-            echo "  --uninstall   Remove Tantor installation"
+            echo "  --uninstall   Remove Tantor (preserves /var/lib/tantor)"
+            echo "  --purge       Uninstall AND wipe /var/lib/tantor (data, DB, repos)"
+            echo "  --reinstall   Uninstall + fresh install in one step (data preserved)"
             echo "  --help        Show this message"
             exit 0
             ;;
@@ -99,22 +107,54 @@ detect_os() {
 }
 
 # ─── Uninstall ───
-if [ "$UNINSTALL" = true ]; then
+do_uninstall() {
     echo -e "${YELLOW}▶ Uninstalling Tantor...${NC}"
-    systemctl stop tantor-backend 2>/dev/null || true
-    systemctl disable tantor-backend 2>/dev/null || true
+    # Stop ALL Tantor-managed services. Don't leave anything behind.
+    for unit in tantor-backend kafka schema-registry prometheus alertmanager grafana-server; do
+        if systemctl list-unit-files --no-legend --no-pager 2>/dev/null | grep -q "^$unit"; then
+            systemctl stop "$unit" 2>/dev/null || true
+            systemctl disable "$unit" 2>/dev/null || true
+        fi
+    done
     rm -f /etc/systemd/system/tantor-backend.service
+    rm -f /etc/systemd/system/kafka.service
+    rm -f /etc/systemd/system/schema-registry.service
+    rm -f /etc/systemd/system/prometheus.service
+    rm -f /etc/systemd/system/alertmanager.service
+    rm -rf /etc/systemd/system/tantor-backend.service.d
     rm -f /etc/nginx/sites-enabled/tantor.conf
     rm -f /etc/nginx/conf.d/tantor.conf
     systemctl daemon-reload 2>/dev/null || true
     systemctl restart nginx 2>/dev/null || true
     rm -rf "$TANTOR_HOME"
     rm -rf "$TANTOR_LOG"
+    rm -rf /opt/kafka /opt/apicurio /opt/prometheus /opt/alertmanager /opt/jmx_exporter
+    rm -rf /etc/kafka/ssl /etc/prometheus /etc/alertmanager
     rm -f /usr/local/bin/tantorctl
+    if [ "$PURGE" = true ]; then
+        echo -e "${YELLOW}  --purge requested: also wiping data at $TANTOR_DATA${NC}"
+        rm -rf "$TANTOR_DATA"
+        # Also remove the system user since we're nuking everything.
+        userdel -r "$TANTOR_USER" 2>/dev/null || true
+    fi
     echo -e "${GREEN}✓ Tantor removed${NC}"
-    echo -e "${YELLOW}  Data preserved at: $TANTOR_DATA${NC}"
-    echo "  To remove data: rm -rf $TANTOR_DATA"
+    if [ "$PURGE" != true ]; then
+        echo -e "${YELLOW}  Data preserved at: $TANTOR_DATA${NC}"
+        echo "  To wipe data on next run: sudo $0 --purge"
+    fi
+}
+
+if [ "$UNINSTALL" = true ]; then
+    do_uninstall
     exit 0
+fi
+
+# Reinstall: uninstall first, preserving data, then continue into install.
+if [ "$REINSTALL" = true ]; then
+    do_uninstall
+    echo ""
+    echo -e "${BLUE}▶ Continuing with fresh install...${NC}"
+    echo ""
 fi
 
 # ─── Banner ───
@@ -213,6 +253,17 @@ echo -e "${BLUE}▶ Step 2/9: Creating user and directories...${NC}"
 
 id "$TANTOR_USER" &>/dev/null || useradd -r -m -s /bin/bash "$TANTOR_USER"
 
+# (#42) Make sure parent dirs exist with traversable permissions BEFORE
+# creating Tantor's tree. On systems where /opt or /var/lib doesn't exist,
+# mkdir creates them with `umask 0077` (root-only), which makes the tantor
+# system user fail to traverse and the backend service crashes on boot.
+for parent in /opt /var/lib /var/log; do
+    if [ ! -d "$parent" ]; then
+        mkdir -p "$parent"
+    fi
+    chmod 755 "$parent"
+done
+
 mkdir -p \
     "$TANTOR_HOME/backend" \
     "$TANTOR_HOME/frontend/dist" \
@@ -222,11 +273,18 @@ mkdir -p \
     "$TANTOR_DATA/repo/ksqldb" \
     "$TANTOR_DATA/repo/connect-plugins" \
     "$TANTOR_DATA/repo/monitoring" \
+    "$TANTOR_DATA/repo/apicurio" \
     "$TANTOR_DATA/ansible_work" \
     "$TANTOR_DATA/ssh" \
     "$TANTOR_DATA/backups" \
+    "$TANTOR_DATA/certs" \
     "$TANTOR_LOG/backend" \
     "$TANTOR_LOG/nginx"
+
+# Set ownership + traversable permissions on the Tantor tree right after
+# creation so the service user can read/write before chown -R at the end.
+chown -R "$TANTOR_USER:$TANTOR_USER" "$TANTOR_HOME" "$TANTOR_DATA" "$TANTOR_LOG"
+chmod 755 "$TANTOR_HOME" "$TANTOR_DATA" "$TANTOR_LOG"
 
 # Grant tantor user passwordless sudo
 echo "${TANTOR_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/tantor
