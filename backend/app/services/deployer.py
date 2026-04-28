@@ -398,14 +398,17 @@ def _run_ansible_deployment(
     # Resolve Apicurio Registry binary if needed
     apicurio_tgz = ""
     apicurio_tgz_path = ""
-    apicurio_strip_components = 1
+    # Apicurio 3.x's `-all.tar.gz` extracts directly to `quarkus-app/` — no
+    # top-level versioned directory, so we don't strip any components.
+    apicurio_strip_components = 0
     if has_schema_registry:
         apicurio_repo = Path(settings.APICURIO_REPO_DIR)
         apicurio_repo.mkdir(parents=True, exist_ok=True)
-        # Look for any apicurio kafkasql tarball; we accept whichever version is present.
-        existing = sorted(apicurio_repo.glob("apicurio-registry-storage-kafkasql-*.tar.gz"))
+        # Accept any Apicurio app tarball already in the repo (operator may
+        # have dropped a different version for air-gapped installs).
+        existing = sorted(apicurio_repo.glob("apicurio-registry-app-*-all.tar.gz"))
         if not existing:
-            apicurio_tgz = f"apicurio-registry-storage-kafkasql-{settings.APICURIO_VERSION}.tar.gz"
+            apicurio_tgz = f"apicurio-registry-app-{settings.APICURIO_VERSION}-all.tar.gz"
             apicurio_tgz_path = str(apicurio_repo / apicurio_tgz)
             url = f"https://github.com/Apicurio/apicurio-registry/releases/download/{settings.APICURIO_VERSION}/{apicurio_tgz}"
             log(f"Apicurio binary not found locally. Downloading {apicurio_tgz}...")
@@ -415,7 +418,7 @@ def _run_ansible_deployment(
                 log(f"Downloaded {apicurio_tgz} ({Path(apicurio_tgz_path).stat().st_size // (1024*1024)} MB)")
             except Exception as dl_err:
                 log(f"ERROR: Failed to download Apicurio: {dl_err}")
-                log(f"Place an Apicurio kafkasql tarball at {apicurio_repo}/ and retry.")
+                log(f"Place an Apicurio app tarball at {apicurio_repo}/ and retry.")
                 _set_status(db, task_id, "error", error_message=f"Apicurio download failed: {dl_err}")
                 cluster.state = "error"
                 db.commit()

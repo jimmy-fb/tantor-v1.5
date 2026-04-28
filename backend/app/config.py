@@ -50,8 +50,12 @@ class Settings(BaseSettings):
     KSQLDB_INSTALL_DIR: str = "/opt/ksqldb"
     CONNECT_PLUGINS_DIR: str = str(_BASE_DIR / "repo" / "connect-plugins")
     VERSION_CATALOG_PATH: str = str(_BASE_DIR / "repo" / "version_catalog.json")
-    # Apicurio Schema Registry (Apache 2)
-    APICURIO_VERSION: str = "2.5.10.Final"
+    # Apicurio Schema Registry (Apache 2). 3.x release artifact is the
+    # `apicurio-registry-app-X-all.tar.gz` Quarkus uber-app — extracts
+    # directly to a `quarkus-app/` directory (no top-level versioned dir).
+    # Pinned to 3.1.7 — 3.2.x switched to Java 21 baseline, but Tantor's
+    # bundled JDK is 17. Stay on 3.1.x until we upgrade the runtime.
+    APICURIO_VERSION: str = "3.1.7"
     APICURIO_REPO_DIR: str = str(_BASE_DIR / "repo" / "apicurio")
     APICURIO_INSTALL_DIR: str = "/opt/apicurio"
 
