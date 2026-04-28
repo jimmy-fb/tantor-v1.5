@@ -425,6 +425,224 @@ def produce_message(cluster: Cluster, topic: str, key: str | None, value: str) -
             producer.close(timeout=5)
 
 
+def list_scram_users(cluster: Cluster) -> list[dict]:
+    """SCRAM admin: kafka-python(-ng) 2.2.3 doesn't expose
+    describe_user_scram_credentials yet, so the most honest answer for an
+    external cluster is `[]`. Once we move to confluent-kafka or kafka-python
+    grows the API, this becomes a real call. Tantor's audit log + DB-stored
+    credentials still record managed-cluster SCRAM users normally.
+    """
+    return []
+
+
+def _scram_unsupported() -> None:
+    raise ValueError(
+        "SCRAM user admin is not yet supported for externally-connected clusters: "
+        "kafka-python's AdminClient lacks alter_user_scram_credentials. Manage SCRAM "
+        "users directly on the source cluster via kafka-configs.sh, or convert this "
+        "to a managed cluster."
+    )
+
+
+def create_scram_user(cluster: Cluster, username: str, password: str, mechanism: str) -> dict:
+    _scram_unsupported()
+
+
+def delete_scram_user(cluster: Cluster, username: str) -> dict:
+    _scram_unsupported()
+
+
+# ── ACLs ──────────────────────────────────────────────────────────────────
+
+
+def _acl_resource_type(name: str | None):
+    from kafka.admin.acl_resource import ResourceType
+    if not name: return ResourceType.ANY
+    return {
+        "topic": ResourceType.TOPIC, "group": ResourceType.GROUP,
+        "cluster": ResourceType.CLUSTER, "transactional_id": ResourceType.TRANSACTIONAL_ID,
+        "delegation_token": ResourceType.DELEGATION_TOKEN,
+    }.get(name.lower(), ResourceType.ANY)
+
+
+def _acl_pattern(name: str | None):
+    from kafka.admin.acl_resource import ACLResourcePatternType
+    if not name: return ACLResourcePatternType.LITERAL
+    return {
+        "literal": ACLResourcePatternType.LITERAL,
+        "prefixed": ACLResourcePatternType.PREFIXED,
+    }.get(name.lower(), ACLResourcePatternType.LITERAL)
+
+
+def _acl_op(name: str | None):
+    from kafka.admin.acl_resource import ACLOperation
+    if not name: return ACLOperation.ANY
+    m = {
+        "all": ACLOperation.ALL, "read": ACLOperation.READ, "write": ACLOperation.WRITE,
+        "create": ACLOperation.CREATE, "delete": ACLOperation.DELETE, "alter": ACLOperation.ALTER,
+        "describe": ACLOperation.DESCRIBE, "cluster_action": ACLOperation.CLUSTER_ACTION,
+        "describe_configs": ACLOperation.DESCRIBE_CONFIGS, "alter_configs": ACLOperation.ALTER_CONFIGS,
+        "idempotent_write": ACLOperation.IDEMPOTENT_WRITE,
+    }
+    return m.get(name.lower(), ACLOperation.ANY)
+
+
+def _acl_perm(name: str | None):
+    from kafka.admin.acl_resource import ACLPermissionType
+    if not name: return ACLPermissionType.ANY
+    return {"allow": ACLPermissionType.ALLOW, "deny": ACLPermissionType.DENY}.get(name.lower(), ACLPermissionType.ANY)
+
+
+def list_acls(cluster: Cluster, principal: str | None = None,
+              resource_type: str | None = None, resource_name: str | None = None) -> list[dict]:
+    from kafka.admin.acl_resource import ACLFilter, ACLResourcePatternType, ResourcePatternFilter
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            # kafka-python validates resource_pattern with isinstance check —
+            # a duck-typed object raises IllegalArgumentError.
+            resource_pattern = ResourcePatternFilter(
+                resource_type=_acl_resource_type(resource_type),
+                resource_name=resource_name,
+                pattern_type=ACLResourcePatternType.ANY,
+            )
+            f = ACLFilter(
+                principal=principal, host="*",
+                operation=_acl_op(None), permission_type=_acl_perm(None),
+                resource_pattern=resource_pattern,
+            )
+            from kafka.admin.acl_resource import (
+                ACLOperation, ACLPermissionType, ACLResourcePatternType, ResourceType,
+            )
+            acls, _err = admin.describe_acls(f)
+            # Kafka returns numeric codes; convert to enum names so the
+            # response matches the SSH-CLI shape (READ/WRITE/Allow/etc).
+            def _name(enum_cls, val):
+                try: return enum_cls(int(val)).name
+                except (ValueError, TypeError): return str(val)
+            out = []
+            for acl in acls or []:
+                rp = getattr(acl, "resource_pattern", None)
+                out.append({
+                    "principal": getattr(acl, "principal", "?"),
+                    "host": getattr(acl, "host", "*"),
+                    "operation": _name(ACLOperation, getattr(acl, "operation", None)),
+                    "permission_type": _name(ACLPermissionType, getattr(acl, "permission_type", None)),
+                    "resource_type": _name(ResourceType, getattr(rp, "resource_type", None)),
+                    "resource_name": getattr(rp, "resource_name", "?"),
+                    "pattern_type": _name(ACLResourcePatternType, getattr(rp, "pattern_type", None)),
+                })
+            return out
+        finally:
+            admin.close()
+
+
+def create_acl(cluster: Cluster, acl_req: dict) -> dict:
+    from kafka.admin.acl_resource import ACL, ResourcePattern
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            resource = ResourcePattern(
+                resource_type=_acl_resource_type(acl_req.get("resource_type")),
+                resource_name=acl_req["resource_name"],
+                pattern_type=_acl_pattern(acl_req.get("pattern_type")),
+            )
+            acl = ACL(
+                principal=acl_req["principal"],
+                host=acl_req.get("host", "*"),
+                operation=_acl_op(acl_req["operation"]),
+                permission_type=_acl_perm(acl_req.get("permission_type", "allow")),
+                resource_pattern=resource,
+            )
+            admin.create_acls([acl])
+            return {"created": True, **acl_req}
+        finally:
+            admin.close()
+
+
+def delete_acl(cluster: Cluster, acl_req: dict) -> dict:
+    from kafka.admin.acl_resource import ACLFilter, ACLResourcePatternType, ResourcePatternFilter
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            resource_pattern = ResourcePatternFilter(
+                resource_type=_acl_resource_type(acl_req.get("resource_type")),
+                resource_name=acl_req.get("resource_name"),
+                pattern_type=ACLResourcePatternType.LITERAL,
+            )
+            f = ACLFilter(
+                principal=acl_req.get("principal"),
+                host=acl_req.get("host", "*"),
+                operation=_acl_op(acl_req.get("operation")),
+                permission_type=_acl_perm(acl_req.get("permission_type", "allow")),
+                resource_pattern=resource_pattern,
+            )
+            admin.delete_acls([f])
+            return {"deleted": True, **acl_req}
+        finally:
+            admin.close()
+
+
+# ── Broker config (describe + alter) ──────────────────────────────────────
+
+
+def describe_broker_configs(cluster: Cluster) -> list[dict]:
+    """Return per-broker configs in the same shape kafka_admin uses."""
+    from kafka.admin import ConfigResource, ConfigResourceType
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            cluster_meta = admin.describe_cluster()
+            broker_ids = [b["node_id"] for b in (cluster_meta.get("brokers") or [])]
+            if not broker_ids:
+                return []
+            resources = [ConfigResource(ConfigResourceType.BROKER, str(bid)) for bid in broker_ids]
+            cfg_resp = admin.describe_configs(resources)
+            out: list[dict] = []
+            for resp in cfg_resp or []:
+                # Each kafka-python response carries one or more (resource, configs) tuples.
+                for entry in getattr(resp, "resources", []) or []:
+                    err_code, _err_msg, _rt, broker_id_str, configs = (entry + (None,) * 5)[:5]
+                    flattened: list[dict] = []
+                    for cfg in configs or []:
+                        # cfg = (name, value, read_only, is_default, is_sensitive, ...)
+                        flattened.append({
+                            "name": cfg[0],
+                            "value": cfg[1] if not (len(cfg) > 4 and cfg[4]) else "***",
+                            "is_default": bool(cfg[3]) if len(cfg) > 3 else False,
+                            "is_sensitive": bool(cfg[4]) if len(cfg) > 4 else False,
+                            "is_read_only": bool(cfg[2]) if len(cfg) > 2 else False,
+                        })
+                    out.append({"broker_id": int(broker_id_str), "configs": flattened})
+            return out
+        finally:
+            admin.close()
+
+
+def alter_broker_config(cluster: Cluster, broker_id: int, configs: dict) -> dict:
+    """Apply config changes to a specific broker via incremental_alter_configs."""
+    from kafka.admin import ConfigResource, ConfigResourceType
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    with _ssl_files_for(secrets) as ssl_paths:
+        admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
+        try:
+            cr = ConfigResource(ConfigResourceType.BROKER, str(broker_id), configs=configs)
+            # incremental_alter_configs is preferred over alter_configs (which is
+            # destructive: it replaces the whole config). kafka-python falls
+            # back to alter_configs when the broker is too old.
+            try:
+                admin.incremental_alter_configs([cr])
+            except AttributeError:
+                admin.alter_configs([cr])
+            return {"broker_id": broker_id, "updated": True, "configs": configs}
+        finally:
+            admin.close()
+
+
 def consume_messages(cluster: Cluster, topic: str, max_messages: int = 10, timeout_ms: int = 5000, from_beginning: bool = True) -> list[dict]:
     secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
     with _ssl_files_for(secrets) as ssl_paths:

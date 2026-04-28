@@ -40,13 +40,27 @@ KAFKA_BROKER_CONFIGS = {
 
 
 class ConfigManager:
-    """Read and modify Kafka broker configurations via SSH."""
+    """Read and modify Kafka broker configurations via SSH (managed) or
+    kafka-python AdminClient (external)."""
 
     def get_broker_configs(self, cluster_id: str, db: Session) -> list[dict]:
         """Get current server.properties from all brokers in the cluster."""
         cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
         if not cluster:
             raise ValueError("Cluster not found")
+
+        if (cluster.kind or "managed") == "external":
+            from app.services import external_admin
+            return [
+                {
+                    "broker_id": entry["broker_id"],
+                    "host_ip": (cluster.bootstrap_servers or "").split(",")[0].strip(),
+                    "service_id": "",
+                    "configs": {c["name"]: c["value"] for c in entry["configs"] if c["value"] is not None},
+                    "raw": "",
+                }
+                for entry in external_admin.describe_broker_configs(cluster)
+            ]
 
         services = db.query(Service).filter(
             Service.cluster_id == cluster_id,
@@ -101,6 +115,24 @@ class ConfigManager:
         # Validate config key
         if config_key not in KAFKA_BROKER_CONFIGS and not config_key.startswith("listener.") and not config_key.startswith("ssl."):
             logger.warning(f"Unknown config key: {config_key}")
+
+        if (cluster.kind or "managed") == "external":
+            from app.services import external_admin
+            external_admin.alter_broker_config(cluster, broker_id, {config_key: config_value})
+            # Audit log + return shape kept identical to the SSH path so the
+            # frontend doesn't have to special-case external clusters.
+            from app.models.config_audit import ConfigAuditLog
+            audit = ConfigAuditLog(
+                cluster_id=cluster_id, broker_id=broker_id,
+                config_key=config_key, old_value=None, new_value=config_value,
+                changed_by=username, change_type="update",
+            )
+            db.add(audit)
+            db.commit()
+            return {
+                "broker_id": broker_id, "config_key": config_key, "new_value": config_value,
+                "old_value": None, "audit_id": audit.id, "changed_by": username,
+            }
 
         svc = db.query(Service).filter(
             Service.cluster_id == cluster_id,

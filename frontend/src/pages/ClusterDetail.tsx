@@ -200,9 +200,14 @@ export default function ClusterDetail() {
     { id: 'consumers', label: 'Groups', icon: <Users size={14} />, requiresRunning: true },
     { id: 'connect', label: 'Connect', icon: <Plug size={14} />, requiresRunning: true, requiresConnect: true, managedOnly: true },
     { id: 'ksqldb', label: 'ksqlDB', icon: <Database size={14} />, requiresRunning: true, requiresKsqldb: true, managedOnly: true },
-    { id: 'security', label: 'Security', icon: <Shield size={14} />, requiresRunning: true, managedOnly: true },
+    // SCRAM users + ACLs work via kafka-python on external clusters too
+    // (no SSH required); the TLS/mTLS sub-panel is hidden inside the
+    // SecurityManager component when cluster.kind=external.
+    { id: 'security', label: 'Security', icon: <Shield size={14} />, requiresRunning: true },
     { id: 'validate', label: 'Validate', icon: <ShieldCheck size={14} />, requiresRunning: true },
-    { id: 'config', label: 'Config', icon: <Settings size={14} />, requiresRunning: true, managedOnly: true },
+    // Broker config dispatches through kafka-python's describe/alter_configs
+    // for external clusters; the audit-log + rollback rows persist locally.
+    { id: 'config', label: 'Config', icon: <Settings size={14} />, requiresRunning: true },
     { id: 'rebalance', label: 'Rebalance', icon: <Shuffle size={14} />, requiresRunning: true, managedOnly: true },
     { id: 'restart', label: 'Restart', icon: <RotateCw size={14} />, requiresRunning: true, managedOnly: true },
     { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={14} />, managedOnly: true },
@@ -444,7 +449,7 @@ export default function ClusterDetail() {
       {activeTab === 'connect' && id && <ConnectManager clusterId={id} />}
       {activeTab === 'security' && id && (
         <div className="space-y-6">
-          <TLSPanel clusterId={id} clusterRunning={isRunning} />
+          {!isExternal && <TLSPanel clusterId={id} clusterRunning={isRunning} />}
           <SecurityManager clusterId={id} />
         </div>
       )}

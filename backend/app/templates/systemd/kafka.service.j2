@@ -9,7 +9,11 @@ User=kafka
 Group=kafka
 Environment="JAVA_HOME={{ java_home }}"
 Environment="KAFKA_HEAP_OPTS={{ heap_opts | default('-Xmx1G -Xms1G') }}"
-Environment="KAFKA_LOG4J_OPTS=-Dlog4j.configuration=file:{{ kafka_home }}/config/log4j.properties"
+# Kafka 4.x ships a log4j2 yaml (config/log4j2.yaml) — point at it
+# explicitly so an old log4j.properties left over from a 3.x install
+# doesn't get auto-detected and silently swallow broker logs via the
+# log4j-1.x bridge.
+Environment="KAFKA_LOG4J_OPTS=-Dlog4j2.configurationFile=file:{{ kafka_home }}/config/log4j2.yaml"
 Environment="LOG_DIR=/var/log/kafka"
 ExecStartPre=/bin/bash -c 'test -x {{ java_home }}/bin/java || (echo "JAVA_HOME invalid: {{ java_home }}" && exit 1)'
 ExecStart={{ kafka_home }}/bin/kafka-server-start.sh {{ config_path }}

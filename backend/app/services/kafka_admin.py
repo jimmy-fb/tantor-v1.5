@@ -672,9 +672,9 @@ class KafkaAdmin:
     @staticmethod
     def list_scram_users(cluster_id: str, db: Session) -> list[dict]:
         """List all SCRAM users configured in Kafka, enriched with local DB metadata."""
-        if _is_external(cluster_id, db):
-            # SCRAM admin via kafka-python is possible but not wired yet.
-            return []
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.list_scram_users(ext)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -709,7 +709,20 @@ class KafkaAdmin:
         """Create a SCRAM user in Kafka and store encrypted password locally."""
         if not password:
             password = secrets.token_urlsafe(24)
-
+        ext = _is_external(cluster_id, db)
+        if ext:
+            external_admin.create_scram_user(ext, username, password, mechanism)
+            kafka_user = KafkaUser(
+                cluster_id=cluster_id, username=username, mechanism=mechanism,
+                encrypted_password=encrypt(password),
+            )
+            db.add(kafka_user)
+            KafkaAdmin._audit(db, cluster_id, "user_created", "user", username, f"mechanism={mechanism}")
+            db.commit()
+            db.refresh(kafka_user)
+            return {
+                "id": kafka_user.id, "username": username, "mechanism": mechanism, "password": password,
+            }
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -749,6 +762,15 @@ class KafkaAdmin:
     @staticmethod
     def delete_scram_user(cluster_id: str, username: str, db: Session) -> dict:
         """Delete a SCRAM user from Kafka and remove from local DB."""
+        ext = _is_external(cluster_id, db)
+        if ext:
+            external_admin.delete_scram_user(ext, username)
+            db.query(KafkaUser).filter(
+                KafkaUser.cluster_id == cluster_id, KafkaUser.username == username,
+            ).delete()
+            KafkaAdmin._audit(db, cluster_id, "user_deleted", "user", username, "")
+            db.commit()
+            return {"username": username, "deleted": True}
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -779,6 +801,20 @@ class KafkaAdmin:
 
         if not password:
             password = secrets.token_urlsafe(24)
+        ext = _is_external(cluster_id, db)
+        if ext:
+            # Look up the existing mechanism from local DB so we don't change it.
+            existing = db.query(KafkaUser).filter(
+                KafkaUser.cluster_id == cluster_id, KafkaUser.username == username,
+            ).first()
+            mech = existing.mechanism if existing else "SCRAM-SHA-512"
+            external_admin.create_scram_user(ext, username, password, mech)
+            if existing:
+                existing.encrypted_password = encrypt(password)
+                existing.updated_at = datetime.now(timezone.utc)
+            KafkaAdmin._audit(db, cluster_id, "user_password_rotated", "user", username, "")
+            db.commit()
+            return {"username": username, "password": password, "rotated": True}
 
         local_user = db.query(KafkaUser).filter(
             KafkaUser.cluster_id == cluster_id,
@@ -826,9 +862,9 @@ class KafkaAdmin:
         resource_name: str | None = None,
     ) -> list[dict]:
         """List ACLs from Kafka, optionally filtered."""
-        if _is_external(cluster_id, db):
-            # ACL admin via kafka-python is possible but not wired yet.
-            return []
+        ext = _is_external(cluster_id, db)
+        if ext:
+            return external_admin.list_acls(ext, principal, resource_type, resource_name)
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -855,6 +891,28 @@ class KafkaAdmin:
     @staticmethod
     def create_acl(cluster_id: str, acl_req: dict, db: Session) -> dict:
         """Create one or more ACL entries in Kafka."""
+        ext = _is_external(cluster_id, db)
+        if ext:
+            # The managed CLI accepts a list of operations; loop them through
+            # the kafka-python single-ACL API so the user-facing shape stays
+            # the same regardless of cluster.kind.
+            results = []
+            for op in acl_req["operations"]:
+                req = dict(acl_req)
+                req["operation"] = op
+                results.append(external_admin.create_acl(ext, req))
+            for op in acl_req["operations"]:
+                KafkaAdmin._audit(
+                    db, cluster_id, "acl_created", "acl",
+                    f"{acl_req['principal']}::{acl_req['resource_type']}:{acl_req['resource_name']}::{op}",
+                    f"permission={acl_req.get('permission_type', 'Allow')}",
+                )
+            db.commit()
+            return {
+                "success": True,
+                "message": f"ACL(s) created via kafka-python AdminClient on external cluster",
+                "acls_added": len(results),
+            }
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
@@ -913,6 +971,23 @@ class KafkaAdmin:
     @staticmethod
     def delete_acl(cluster_id: str, acl_req: dict, db: Session) -> dict:
         """Delete ACL entries from Kafka."""
+        ext = _is_external(cluster_id, db)
+        if ext:
+            for op in acl_req["operations"]:
+                req = dict(acl_req)
+                req["operation"] = op
+                external_admin.delete_acl(ext, req)
+                KafkaAdmin._audit(
+                    db, cluster_id, "acl_deleted", "acl",
+                    f"{acl_req['principal']}::{acl_req['resource_type']}:{acl_req['resource_name']}::{op}",
+                    "",
+                )
+            db.commit()
+            return {
+                "success": True,
+                "message": "ACL(s) deleted via kafka-python AdminClient on external cluster",
+                "acls_deleted": len(acl_req["operations"]),
+            }
         host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
         kh = settings.KAFKA_INSTALL_DIR
 
