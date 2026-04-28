@@ -25,24 +25,49 @@ class ConfigGenerator:
         template = env.get_template("kraft_server.properties.j2")
         quorum_voters = ConfigGenerator._build_quorum_voters(all_services)
 
+        ssl_enabled = bool(cluster_config.get("ssl_enabled"))
+        mtls_required = bool(cluster_config.get("mtls_required"))
+        listener_port = cluster_config.get("listener_port", 9092)
+        controller_port = cluster_config.get("controller_port", 9093)
+        ssl_port = cluster_config.get("ssl_listener_port", 9096)
+
         if service["role"] == "broker_controller":
             process_roles = "broker,controller"
-            listeners = f"PLAINTEXT://:{cluster_config.get('listener_port', 9092)},CONTROLLER://:{cluster_config.get('controller_port', 9093)}"
-            advertised_listeners = f"PLAINTEXT://{service['ip_address']}:{cluster_config.get('listener_port', 9092)}"
+            listeners_list = [
+                f"PLAINTEXT://:{listener_port}",
+                f"CONTROLLER://:{controller_port}",
+            ]
+            adv_list = [f"PLAINTEXT://{service['ip_address']}:{listener_port}"]
         else:
             process_roles = "broker"
-            listeners = f"PLAINTEXT://:{cluster_config.get('listener_port', 9092)}"
-            advertised_listeners = f"PLAINTEXT://{service['ip_address']}:{cluster_config.get('listener_port', 9092)}"
+            listeners_list = [f"PLAINTEXT://:{listener_port}"]
+            adv_list = [f"PLAINTEXT://{service['ip_address']}:{listener_port}"]
+
+        protocol_map = ["CONTROLLER:PLAINTEXT", "PLAINTEXT:PLAINTEXT"]
+        if ssl_enabled:
+            listeners_list.append(f"SSL://:{ssl_port}")
+            adv_list.append(f"SSL://{service['ip_address']}:{ssl_port}")
+            protocol_map.append("SSL:SSL")
 
         return template.render(
             node_id=service["node_id"],
             process_roles=process_roles,
             quorum_voters=quorum_voters,
-            listeners=listeners,
-            advertised_listeners=advertised_listeners,
+            listeners=",".join(listeners_list),
+            advertised_listeners=",".join(adv_list),
+            listener_security_protocol_map=",".join(protocol_map),
             log_dirs=cluster_config.get("log_dirs", "/var/lib/kafka/data"),
             num_partitions=cluster_config.get("num_partitions", 3),
             replication_factor=cluster_config.get("replication_factor", 3),
+            ssl_enabled=ssl_enabled,
+            mtls_required=mtls_required,
+            ssl_keystore_location="/etc/kafka/ssl/broker.p12",
+            # PEM truststore — see cert_manager._make_truststore_pem for why.
+            ssl_truststore_location="/etc/kafka/ssl/truststore.pem",
+            # The placeholder is replaced at deploy time with the cluster's
+            # Fernet-decrypted password so the property file on disk has the
+            # real value (Kafka can't read env vars from server.properties).
+            ssl_keystore_password=cluster_config.get("_ssl_keystore_password", ""),
         )
 
     @staticmethod

@@ -13,6 +13,7 @@ from app.models.cluster import Cluster
 from app.models.deployment_task import DeploymentTask
 from app.models.host import Host
 from app.models.service import Service
+from app.services import cert_manager
 from app.services.ansible_runner import ansible_runner
 from app.services.config_generator import config_generator
 from app.services.crypto import decrypt
@@ -311,8 +312,22 @@ def _run_ansible_deployment(
             "node_id": svc.node_id,
         })
 
-    # Generate Ansible inventory
-    inv_path = ansible_runner.generate_inventory(work_dir, svc_dicts)
+    # ── TLS keystores (only when ssl_enabled) ────────────────────────
+    # Must run BEFORE generate_inventory so per-broker keystore paths land
+    # in inventory.yml as Ansible host vars.
+    tls_keystores: dict[str, dict] = {}
+    if cluster.ssl_enabled:
+        log(f"TLS enabled — minting CA + broker keystores for cluster {cluster.id}")
+        tls_keystores = cert_manager.materialize_broker_keystores(cluster, db, all_service_infos)
+        cluster_config["_ssl_keystore_password"] = cert_manager.get_tls_password(cluster) or ""
+        cluster_config["ssl_enabled"] = True
+        cluster_config["mtls_required"] = bool(cluster.mtls_required)
+        log(f"Generated {len(tls_keystores)} broker keystore(s)")
+
+    # Generate Ansible inventory (with TLS keystore paths if SSL is enabled)
+    inv_path = ansible_runner.generate_inventory(
+        work_dir, svc_dicts, tls_keystores=tls_keystores or None,
+    )
     ansible_runner.generate_ansible_cfg(work_dir)
     log("Generated Ansible inventory and config")
 
@@ -452,6 +467,8 @@ def _run_ansible_deployment(
         "ksqldb_install_dir": settings.KSQLDB_INSTALL_DIR,
         "ksqldb_binary_filename": ksqldb_tgz,
         "ksqldb_binary_local_path": ksqldb_tgz_path,
+        "ssl_enabled": bool(cluster.ssl_enabled),
+        "tls_keystores": tls_keystores,
     })
     log("Generated Ansible playbook")
 

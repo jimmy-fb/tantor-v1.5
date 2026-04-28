@@ -17,5 +17,9 @@ all:
           ansible_become: true
           node_id: {{ svc.node_id }}
           service_role: "{{ svc.role }}"
+{% if svc.broker_keystore_src is defined %}
+          broker_keystore_src: "{{ svc.broker_keystore_src }}"
+          broker_truststore_src: "{{ svc.broker_truststore_src }}"
+{% endif %}
 {% endfor %}
 {% endfor %}

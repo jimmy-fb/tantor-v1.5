@@ -10,7 +10,29 @@ listeners={{ listeners }}
 advertised.listeners={{ advertised_listeners }}
 controller.listener.names=CONTROLLER
 inter.broker.listener.name=PLAINTEXT
-listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+listener.security.protocol.map={{ listener_security_protocol_map | default("CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT") }}
+
+{% if ssl_enabled %}
+# Tantor-managed TLS. Keystore is PKCS12 (cert + key + chain), truststore
+# is plain PEM (single CA cert) — Java's PKCS12 truststore semantics don't
+# round-trip cleanly through the Python `cryptography` lib.
+ssl.keystore.type=PKCS12
+ssl.keystore.location={{ ssl_keystore_location }}
+ssl.keystore.password={{ ssl_keystore_password }}
+ssl.key.password={{ ssl_keystore_password }}
+ssl.truststore.type=PEM
+ssl.truststore.location={{ ssl_truststore_location }}
+{% if mtls_required %}
+# mTLS: every client must present a cert signed by the cluster CA.
+ssl.client.auth=required
+{% endif %}
+# Map every cert DN to the ANONYMOUS principal so SSL/mTLS clients hit
+# the same `super.users=User:ANONYMOUS` row Tantor sets up out of the
+# box and `allow.everyone.if.no.acl.found=true` continues to apply.
+# Tighten this rule (e.g. `RULE:^CN=(.*?),.*$/$1/`) once you start
+# enforcing per-principal ACLs on the cluster.
+ssl.principal.mapping.rules=RULE:^.*$/ANONYMOUS/,DEFAULT
+{% endif %}
 
 log.dirs={{ log_dirs }}
 

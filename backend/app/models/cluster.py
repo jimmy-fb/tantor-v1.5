@@ -36,3 +36,14 @@ class Cluster(Base):
     # Verify server certificate. False bypasses validation (INSECURE) — leave on
     # for production, only flip off for self-signed dev environments.
     ssl_verify: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+
+    # ── TLS / mTLS for managed clusters ─────────────────────────────────
+    # When ssl_enabled is true, brokers run a second listener on
+    # config.ssl_listener_port using a Tantor-generated CA. mtls_required
+    # turns on `ssl.client.auth=required` so producers/consumers must
+    # present a client cert signed by the same CA.
+    ssl_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    mtls_required: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # Fernet-encrypted; same password used for keystore + truststore on every
+    # broker so we don't have to thread per-broker passwords through Ansible.
+    encrypted_tls_password: Mapped[str | None] = mapped_column(Text, nullable=True)

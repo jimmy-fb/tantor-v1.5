@@ -171,13 +171,40 @@
   become: true
   serial: 1
   tasks:
+{% if ssl_enabled %}
+    # ── TLS keystore + truststore (per-host paths come from inventory) ──
+    - name: Ensure SSL directory exists
+      file:
+        path: /etc/kafka/ssl
+        state: directory
+        owner: kafka
+        group: kafka
+        mode: "0750"
+
+    - name: Upload broker keystore
+      copy:
+        src: "{{ '{{' }} broker_keystore_src {{ '}}' }}"
+        dest: /etc/kafka/ssl/broker.p12
+        owner: kafka
+        group: kafka
+        mode: "0640"
+
+    - name: Upload truststore (PEM)
+      copy:
+        src: "{{ '{{' }} broker_truststore_src {{ '}}' }}"
+        dest: /etc/kafka/ssl/truststore.pem
+        owner: kafka
+        group: kafka
+        mode: "0644"
+{% endif %}
+
     - name: Upload broker configuration
       copy:
         src: "{{ configs_dir }}/{{ '{{' }} ansible_host {{ '}}' }}_{{ '{{' }} node_id {{ '}}' }}_server.properties"
         dest: "{{ kafka_install_dir }}/config/server.properties"
         owner: kafka
         group: kafka
-        mode: "0644"
+        mode: "0640"
 
     # ── Validate node_id vs meta.properties ────────────────────────
     - name: Check if meta.properties exists

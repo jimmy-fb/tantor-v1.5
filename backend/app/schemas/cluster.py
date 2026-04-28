@@ -19,6 +19,9 @@ class ClusterConfig(BaseModel):
     connect_port: int = 8083
     connect_rest_port: int = 8083
     schema_registry_port: int = 8085
+    # SSL listener runs alongside PLAINTEXT when ssl_enabled is on. Default
+    # avoids 9094 (Alertmanager) and 9095 (commonly used by Kafka REST).
+    ssl_listener_port: int = 9096
 
 
 class ClusterCreate(BaseModel):

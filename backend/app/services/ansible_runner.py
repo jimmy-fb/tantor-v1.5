@@ -25,13 +25,18 @@ class AnsibleRunner:
         return work_dir
 
     @staticmethod
-    def generate_inventory(work_dir: Path, services: list[dict]) -> Path:
+    def generate_inventory(work_dir: Path, services: list[dict], tls_keystores: dict | None = None) -> Path:
         """
         Generate inventory.yml grouping hosts by role.
 
         Each service dict must have:
           ip_address, port, username, auth_type, credential (decrypted),
           role, node_id
+
+        When `tls_keystores` is provided (keyed by `<ip>_<node_id>`), each
+        broker host gets `broker_keystore_src` / `broker_truststore_src`
+        ansible vars pointing at the keystore PKCS12 paths on the Tantor
+        controller — the playbook uses them in copy: src.
         """
         template = ansible_env.get_template("inventory.yml.j2")
 
@@ -50,6 +55,11 @@ class AnsibleRunner:
                 key_path.write_text(svc["credential"])
                 key_path.chmod(0o600)
                 svc["key_file"] = str(key_path)
+            if tls_keystores:
+                ks = tls_keystores.get(f"{svc['ip_address']}_{svc['node_id']}")
+                if ks:
+                    svc["broker_keystore_src"] = ks["keystore"]
+                    svc["broker_truststore_src"] = ks["truststore"]
 
         content = template.render(groups=groups)
         inv_path = work_dir / "inventory.yml"

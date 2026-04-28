@@ -26,6 +26,10 @@ _REQUIRED_COLUMNS: list[tuple[str, str, str, str | None]] = [
     ("clusters", "sasl_mechanism", "VARCHAR(40)", None),
     ("clusters", "encrypted_connection_secrets", "TEXT", None),
     ("clusters", "ssl_verify", "BOOLEAN", "DEFAULT 1"),
+    # PR #4: TLS / mTLS for managed clusters
+    ("clusters", "ssl_enabled", "BOOLEAN", "DEFAULT 0"),
+    ("clusters", "mtls_required", "BOOLEAN", "DEFAULT 0"),
+    ("clusters", "encrypted_tls_password", "TEXT", None),
 ]
 
 

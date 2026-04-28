@@ -512,3 +512,38 @@ export const testExternalSaved = (id: string) =>
   api.post<ExternalConnectionTestResult>(`/external-clusters/${id}/test`).then(r => r.data);
 export const externalListTopics = (id: string) =>
   api.get<Array<{ name: string; partitions: number; replication_factor: number }>>(`/external-clusters/${id}/topics`).then(r => r.data);
+
+// ── TLS / mTLS ──────────────────────────────────────
+export interface TLSState {
+  ssl_enabled: boolean;
+  mtls_required: boolean;
+  ca_present: boolean;
+  ssl_listener_port: number;
+}
+export interface ClientCertSummary {
+  common_name: string;
+  issued_at: string;
+  expires_at: string;
+  serial_number: string;
+}
+export interface ClientCertBundle {
+  common_name: string;
+  ca_pem: string;
+  cert_pem: string;
+  key_pem: string;
+  p12_password: string;
+  issued_at: string;
+  expires_at: string;
+}
+export const getTlsState = (clusterId: string) =>
+  api.get<TLSState>(`/clusters/${clusterId}/security/tls`).then(r => r.data);
+export const setTlsState = (clusterId: string, body: { ssl_enabled: boolean; mtls_required: boolean }) =>
+  api.post<TLSState>(`/clusters/${clusterId}/security/tls`, body).then(r => r.data);
+export const downloadCaCertUrl = (clusterId: string) =>
+  `/api/clusters/${clusterId}/security/tls/ca`;
+export const listClientCerts = (clusterId: string) =>
+  api.get<ClientCertSummary[]>(`/clusters/${clusterId}/security/tls/clients`).then(r => r.data);
+export const issueClientCert = (clusterId: string, common_name: string, ttl_days = 365) =>
+  api.post<ClientCertBundle>(`/clusters/${clusterId}/security/tls/clients`, { common_name, ttl_days }).then(r => r.data);
+export const revokeClientCert = (clusterId: string, common_name: string) =>
+  api.delete(`/clusters/${clusterId}/security/tls/clients/${encodeURIComponent(common_name)}`).then(r => r.data);

@@ -17,6 +17,7 @@ import ProduceMessage from '../components/clusters/ProduceMessage';
 import ConsumeMessages from '../components/clusters/ConsumeMessages';
 import ConnectManager from '../components/clusters/ConnectManager';
 import SecurityManager from '../components/clusters/SecurityManager';
+import TLSPanel from '../components/clusters/TLSPanel';
 import KsqlManager from '../components/clusters/KsqlManager';
 import ServiceLogs from '../components/clusters/ServiceLogs';
 import BrokerConfigManager from '../components/clusters/BrokerConfigManager';
@@ -441,7 +442,12 @@ export default function ClusterDetail() {
       {activeTab === 'produce' && id && <ProduceMessage clusterId={id} />}
       {activeTab === 'consumers' && id && <ConsumerGroups clusterId={id} />}
       {activeTab === 'connect' && id && <ConnectManager clusterId={id} />}
-      {activeTab === 'security' && id && <SecurityManager clusterId={id} />}
+      {activeTab === 'security' && id && (
+        <div className="space-y-6">
+          <TLSPanel clusterId={id} clusterRunning={isRunning} />
+          <SecurityManager clusterId={id} />
+        </div>
+      )}
       {activeTab === 'ksqldb' && id && <KsqlManager clusterId={id} />}
       {activeTab === 'config' && id && <BrokerConfigManager clusterId={id} />}
       {activeTab === 'restart' && id && <RollingRestart clusterId={id} />}
