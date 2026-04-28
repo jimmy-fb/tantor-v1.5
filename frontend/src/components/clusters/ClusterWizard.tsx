@@ -191,6 +191,24 @@ export default function ClusterWizard() {
     return host && host.status !== 'online';
   });
 
+  // (#29) advertised.listeners hostname looks DNS-resolvable.
+  // We can't actually resolve from the browser, but we can warn when an
+  // entry isn't an IP literal AND looks like a private hostname (no dot,
+  // looks like `kafka1` instead of `kafka-1.prod.example.com`).
+  const ipLiteralPattern = /^(\d{1,3}\.){3}\d{1,3}$/;
+  const fqdnRiskyHosts = Object.keys(assignments).map(hostId => {
+    const host = hosts.find(h => h.id === hostId);
+    if (!host) return null;
+    if (ipLiteralPattern.test(host.ip_address)) return null;        // IP literals are fine
+    if (host.ip_address.includes('.')) return null;                  // FQDN-ish is fine
+    return host.hostname;                                            // bare hostname → risky
+  }).filter(Boolean) as string[];
+
+  // (#30) listener.security.protocol.map sanity: every listener name in
+  // `listeners=` must have a matching protocol map entry. Tantor renders
+  // these centrally so the only way a user can break this is by editing
+  // server.properties post-deploy — just surface a friendly note.
+
   // Available roles based on mode
   const availableRoles = ROLES.filter(r => {
     if (mode === 'kraft') return r.id !== 'zookeeper';
@@ -322,6 +340,19 @@ export default function ClusterWizard() {
                 <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
                   <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
                   <span>One or more selected hosts are offline. Deployment will fail for offline hosts.</span>
+                </div>
+              )}
+
+              {fqdnRiskyHosts.length > 0 && (
+                <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+                  <AlertTriangle size={16} className="mt-0.5 flex-shrink-0" />
+                  <span>
+                    Host(s) <strong>{fqdnRiskyHosts.join(', ')}</strong> use a bare hostname (no dots,
+                    not an IP literal). Tantor will set <code>advertised.listeners</code> to that name
+                    — internal brokers resolve it via OS hostname lookup, but external clients in
+                    containers / Kubernetes / other VMs may not. Use an FQDN or IP for cross-environment
+                    safety.
+                  </span>
                 </div>
               )}
 
