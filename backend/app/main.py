@@ -11,6 +11,7 @@ from app.api import (
     hosts, clusters, ws, versions, topics, kafka_connect, security, ksqldb,
     auth, logs, monitoring, broker_config, rolling_restart,
     upgrades, security_scan, cluster_linking, rebalance, ldap, activity, alerts,
+    schema_registry, external_clusters,
 )
 from app.models.kafka_user import KafkaUser  # noqa: F401 - ensure table creation
 from app.models.audit_log import AuditLog  # noqa: F401 - ensure table creation
@@ -102,6 +103,8 @@ app.include_router(activity.router)
 app.include_router(alerts.cluster_router)
 app.include_router(alerts.channel_router)
 app.include_router(alerts.webhook_router)
+app.include_router(schema_registry.router)
+app.include_router(external_clusters.router)
 
 
 @app.get("/api/health")

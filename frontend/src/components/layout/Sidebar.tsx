@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Server, Network, Plus, Package, Users, BarChart3, LogOut, User, Shield, Link2, KeyRound, Activity, Bell } from 'lucide-react';
+import { LayoutDashboard, Server, Network, Plus, Package, Users, BarChart3, LogOut, User, Shield, Link2, KeyRound, Activity, Bell, Database, Plug } from 'lucide-react';
 import { isAdmin, getUsername, clearTokens } from '../../lib/auth';
 import { getHealthInfo } from '../../lib/api';
 
@@ -24,7 +24,9 @@ export default function Sidebar() {
     { to: '/hosts', icon: Server, label: 'Hosts' },
     { to: '/clusters', icon: Network, label: 'Clusters' },
     { to: '/clusters/new', icon: Plus, label: 'New Cluster', adminOnly: true },
+    { to: '/external-clusters', icon: Plug, label: 'External Clusters' },
     { to: '/versions', icon: Package, label: 'Kafka Versions' },
+    { to: '/schema-registry', icon: Database, label: 'Schema Registry' },
     { to: '/monitoring', icon: BarChart3, label: 'Monitoring' },
 
     { to: '/security-scan', icon: Shield, label: 'Security Scan' },

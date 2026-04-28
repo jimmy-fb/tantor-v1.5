@@ -86,6 +86,8 @@ def start_deployment(cluster_id: str, background_tasks: BackgroundTasks, db: Ses
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
+    if cluster.kind == "external":
+        raise HTTPException(status_code=400, detail="Deploy is not supported for externally-connected clusters")
     if cluster.state == "deploying":
         raise HTTPException(status_code=400, detail="Deployment already in progress")
 
@@ -145,6 +147,8 @@ def start_cluster(cluster_id: str, db: Session = Depends(get_db), _: User = Depe
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
+    if cluster.kind == "external":
+        raise HTTPException(status_code=400, detail="start/stop are not supported for externally-connected clusters")
     results = cluster_manager.start_cluster(cluster_id, db)
     return [ServiceActionResponse(**r) for r in results]
 
@@ -154,6 +158,8 @@ def stop_cluster(cluster_id: str, db: Session = Depends(get_db), _: User = Depen
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
+    if cluster.kind == "external":
+        raise HTTPException(status_code=400, detail="start/stop are not supported for externally-connected clusters")
     results = cluster_manager.stop_cluster(cluster_id, db)
     return [ServiceActionResponse(**r) for r in results]
 

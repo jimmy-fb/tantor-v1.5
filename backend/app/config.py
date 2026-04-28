@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     KSQLDB_INSTALL_DIR: str = "/opt/ksqldb"
     CONNECT_PLUGINS_DIR: str = str(_BASE_DIR / "repo" / "connect-plugins")
     VERSION_CATALOG_PATH: str = str(_BASE_DIR / "repo" / "version_catalog.json")
+    # Apicurio Schema Registry (Apache 2)
+    APICURIO_VERSION: str = "2.5.10.Final"
+    APICURIO_REPO_DIR: str = str(_BASE_DIR / "repo" / "apicurio")
+    APICURIO_INSTALL_DIR: str = "/opt/apicurio"
 
     # Monitoring
     PROMETHEUS_PORT: int = 9090

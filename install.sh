@@ -31,7 +31,7 @@ TANTOR_HOME="/opt/tantor"
 TANTOR_DATA="/var/lib/tantor"
 TANTOR_LOG="/var/log/tantor"
 TANTOR_USER="tantor"
-KAFKA_VERSION="3.7.0"
+KAFKA_VERSION="4.1.0"
 KAFKA_SCALA="2.13"
 KAFKA_TGZ="kafka_${KAFKA_SCALA}-${KAFKA_VERSION}.tgz"
 
@@ -436,7 +436,45 @@ chown -R "${TANTOR_USER}:${TANTOR_USER}" /home/${TANTOR_USER}
 chmod 700 /home/${TANTOR_USER}/.ssh
 chmod 600 /home/${TANTOR_USER}/.ssh/id_rsa 2>/dev/null || true
 
-echo -e "${GREEN}✓ Nginx, systemd, and SSH configured${NC}"
+# Centralized-server mode: authorize tantor's pubkey for root@localhost so
+# Tantor can SSH-deploy Kafka onto its own host without operator intervention.
+mkdir -p /root/.ssh
+touch /root/.ssh/authorized_keys
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+TANTOR_PUBKEY=$(cat /home/${TANTOR_USER}/.ssh/id_rsa.pub)
+if ! grep -qF "${TANTOR_PUBKEY}" /root/.ssh/authorized_keys 2>/dev/null; then
+    echo "${TANTOR_PUBKEY}" >> /root/.ssh/authorized_keys
+fi
+
+# Auto-register localhost as a Host so the operator can deploy a cluster
+# in one click. Stores the encrypted private key directly in the DB so the
+# usual Tantor host-deploy code path works against this VM.
+"$TANTOR_HOME/venv/bin/python3" - <<PYEOF || echo "  (localhost auto-register skipped)"
+import os, sys, uuid
+sys.path.insert(0, "/opt/tantor/backend")
+os.environ.setdefault("DATABASE_URL", "sqlite:////var/lib/tantor/db/tantor.db")
+from app.database import Base, engine, SessionLocal
+from app.models.host import Host
+from app.services.crypto import encrypt
+Base.metadata.create_all(bind=engine)
+db = SessionLocal()
+try:
+    if not db.query(Host).filter(Host.hostname == "localhost").first():
+        with open("/home/${TANTOR_USER}/.ssh/id_rsa") as f:
+            key_pem = f.read()
+        host = Host(
+            id=str(uuid.uuid4()), hostname="localhost", ip_address="127.0.0.1",
+            ssh_port=22, username="root", auth_type="key",
+            encrypted_credential=encrypt(key_pem), os_info="local", status="online",
+        )
+        db.add(host); db.commit()
+        print(f"  Localhost registered as host id={host.id}")
+finally:
+    db.close()
+PYEOF
+
+echo -e "${GREEN}✓ Nginx, systemd, SSH, and localhost host configured${NC}"
 
 # ─── Step 9: Start Services ───
 echo -e "${BLUE}▶ Step 9/9: Starting services...${NC}"

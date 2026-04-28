@@ -416,3 +416,99 @@ export const deleteNotificationChannel = (id: string) =>
   api.delete(`/notification-channels/${id}`).then(r => r.data);
 export const testNotificationChannel = (id: string, body: { severity?: Severity; summary?: string; description?: string } = {}) =>
   api.post<{ success: boolean; message: string }>(`/notification-channels/${id}/test`, body).then(r => r.data);
+
+// ── Schema Registry ─────────────────────────────────
+export type SchemaType = 'AVRO' | 'JSON' | 'PROTOBUF';
+export type CompatibilityLevel =
+  | 'BACKWARD' | 'BACKWARD_TRANSITIVE'
+  | 'FORWARD' | 'FORWARD_TRANSITIVE'
+  | 'FULL' | 'FULL_TRANSITIVE'
+  | 'NONE';
+export interface SchemaVersion {
+  subject: string;
+  version: number;
+  id: number;
+  schema_text: string;
+  schema_type: SchemaType | null;
+}
+export interface RegistryHealth { reachable: boolean; url: string | null; subject_count: number | null }
+export const getRegistryHealth = (clusterId: string) =>
+  api.get<RegistryHealth>(`/clusters/${clusterId}/schema-registry/health`).then(r => r.data);
+export const getSubjects = (clusterId: string) =>
+  api.get<string[]>(`/clusters/${clusterId}/schema-registry/subjects`).then(r => r.data);
+export const getVersions = (clusterId: string, subject: string) =>
+  api.get<number[]>(`/clusters/${clusterId}/schema-registry/subjects/${encodeURIComponent(subject)}/versions`).then(r => r.data);
+export const getSchemaVersion = (clusterId: string, subject: string, version: number | 'latest') =>
+  api.get<SchemaVersion>(`/clusters/${clusterId}/schema-registry/subjects/${encodeURIComponent(subject)}/versions/${version}`).then(r => r.data);
+export const registerSchema = (clusterId: string, subject: string, schema_text: string, schema_type: SchemaType = 'AVRO') =>
+  api.post<{ id: number }>(`/clusters/${clusterId}/schema-registry/subjects/${encodeURIComponent(subject)}/versions`, { schema_text, schema_type }).then(r => r.data);
+export const deleteSubject = (clusterId: string, subject: string) =>
+  api.delete<number[]>(`/clusters/${clusterId}/schema-registry/subjects/${encodeURIComponent(subject)}`).then(r => r.data);
+export const getGlobalCompat = (clusterId: string) =>
+  api.get<{ compatibility: CompatibilityLevel }>(`/clusters/${clusterId}/schema-registry/config`).then(r => r.data);
+export const setGlobalCompat = (clusterId: string, compatibility: CompatibilityLevel) =>
+  api.put<{ compatibility: CompatibilityLevel }>(`/clusters/${clusterId}/schema-registry/config`, { compatibility }).then(r => r.data);
+
+// ── External clusters ───────────────────────────────
+export type SecurityProtocol = 'PLAINTEXT' | 'SSL' | 'SASL_PLAINTEXT' | 'SASL_SSL';
+export type SaslMechanism = 'PLAIN' | 'SCRAM-SHA-256' | 'SCRAM-SHA-512' | 'OAUTHBEARER' | 'GSSAPI';
+export interface ExternalConnectionSecrets {
+  sasl_username?: string;
+  sasl_password?: string;
+  ssl_ca_pem?: string;
+  ssl_cert_pem?: string;
+  ssl_key_pem?: string;
+}
+export interface ExternalCluster {
+  id: string;
+  name: string;
+  kind: 'external';
+  state: string;
+  bootstrap_servers: string | null;
+  security_protocol: SecurityProtocol;
+  sasl_mechanism: SaslMechanism | null;
+  sasl_username: string | null;
+  sasl_password_set: boolean;
+  ssl_ca_set: boolean;
+  ssl_cert_set: boolean;
+  ssl_key_set: boolean;
+  ssl_verify: boolean;
+}
+export interface ExternalConnectionTestResult {
+  success: boolean;
+  message: string;
+  broker_count: number | null;
+  controller_id: number | null;
+  cluster_id: string | null;
+}
+export const listExternalClusters = () =>
+  api.get<ExternalCluster[]>('/external-clusters').then(r => r.data);
+export const createExternalCluster = (data: {
+  name: string;
+  bootstrap_servers: string;
+  security_protocol: SecurityProtocol;
+  sasl_mechanism?: SaslMechanism | null;
+  ssl_verify: boolean;
+  secrets: ExternalConnectionSecrets;
+}) => api.post<ExternalCluster>('/external-clusters', data).then(r => r.data);
+export const updateExternalCluster = (id: string, data: Partial<{
+  name: string;
+  bootstrap_servers: string;
+  security_protocol: SecurityProtocol;
+  sasl_mechanism: SaslMechanism | null;
+  ssl_verify: boolean;
+  secrets: ExternalConnectionSecrets;
+}>) => api.put<ExternalCluster>(`/external-clusters/${id}`, data).then(r => r.data);
+export const deleteExternalCluster = (id: string) =>
+  api.delete(`/external-clusters/${id}`).then(r => r.data);
+export const testExternalUnsaved = (data: {
+  bootstrap_servers: string;
+  security_protocol: SecurityProtocol;
+  sasl_mechanism?: SaslMechanism | null;
+  ssl_verify: boolean;
+  secrets: ExternalConnectionSecrets;
+}) => api.post<ExternalConnectionTestResult>('/external-clusters/test-connection', data).then(r => r.data);
+export const testExternalSaved = (id: string) =>
+  api.post<ExternalConnectionTestResult>(`/external-clusters/${id}/test`).then(r => r.data);
+export const externalListTopics = (id: string) =>
+  api.get<Array<{ name: string; partitions: number; replication_factor: number }>>(`/external-clusters/${id}/topics`).then(r => r.data);

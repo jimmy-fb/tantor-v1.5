@@ -478,3 +478,74 @@
         enabled: true
         state: started
 {% endif %}
+
+{% if has_schema_registry %}
+- name: Install and start Apicurio Schema Registry
+  hosts: schema_registrys
+  become: true
+  tasks:
+    - name: Create apicurio user
+      user:
+        name: apicurio
+        system: true
+        home: "{{ apicurio_install_dir }}"
+        shell: /bin/false
+        create_home: false
+
+    - name: Create Apicurio install directory
+      file:
+        path: "{{ apicurio_install_dir }}"
+        state: directory
+        owner: apicurio
+        group: apicurio
+        mode: "0755"
+
+    - name: Copy Apicurio binary to host
+      copy:
+        src: "{{ apicurio_binary_local_path }}"
+        dest: /tmp/{{ apicurio_binary_filename }}
+        mode: "0644"
+
+    - name: Extract Apicurio (strip {{ apicurio_strip_components }} component(s))
+      unarchive:
+        src: /tmp/{{ apicurio_binary_filename }}
+        dest: "{{ apicurio_install_dir }}"
+        remote_src: yes
+        extra_opts:
+          - "--strip-components={{ apicurio_strip_components }}"
+        owner: apicurio
+        group: apicurio
+
+    - name: Place application.properties
+      copy:
+        src: "{{ configs_dir }}/{{ '{{' }} ansible_host {{ '}}' }}_{{ '{{' }} node_id {{ '}}' }}_apicurio.properties"
+        dest: "{{ apicurio_install_dir }}/application.properties"
+        owner: apicurio
+        group: apicurio
+        mode: "0644"
+
+    - name: Install schema-registry systemd unit
+      copy:
+        src: "{{ systemd_dir }}/{{ '{{' }} ansible_host {{ '}}' }}_{{ '{{' }} node_id {{ '}}' }}_schema-registry.service"
+        dest: /etc/systemd/system/schema-registry.service
+        mode: "0644"
+
+    - name: Reload and start Schema Registry
+      systemd:
+        name: schema-registry
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Wait for Schema Registry to be reachable
+      wait_for:
+        port: {{ cluster_config.get('schema_registry_port', 8085) }}
+        host: "{{ '{{' }} ansible_host {{ '}}' }}"
+        timeout: 90
+        delay: 5
+
+    - name: Clean up tarball
+      file:
+        path: /tmp/{{ apicurio_binary_filename }}
+        state: absent
+{% endif %}

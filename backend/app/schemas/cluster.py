@@ -18,12 +18,15 @@ class ClusterConfig(BaseModel):
     ksqldb_port: int = 8088
     connect_port: int = 8083
     connect_rest_port: int = 8083
+    schema_registry_port: int = 8085
 
 
 class ClusterCreate(BaseModel):
     name: str
-    kafka_version: str = "3.7.0"
-    mode: str = "kraft"  # "kraft" or "zookeeper"
+    # Kafka 4.x is KRaft-only. Tantor still accepts the `zookeeper` mode for
+    # legacy 3.x deployments but new installs default to 4.1.
+    kafka_version: str = "4.1.0"
+    mode: str = "kraft"  # "kraft" (4.x supported) or "zookeeper" (3.x only)
     services: list[ServiceAssignment]
     config: ClusterConfig = ClusterConfig()
 

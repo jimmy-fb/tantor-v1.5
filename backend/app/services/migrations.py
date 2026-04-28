@@ -19,6 +19,13 @@ _REQUIRED_COLUMNS: list[tuple[str, str, str, str | None]] = [
     # PR #1: harden LDAPS — server-cert validation toggle + optional CA PEM
     ("ldap_configs", "tls_validate_cert", "BOOLEAN", "DEFAULT 1"),
     ("ldap_configs", "tls_ca_cert", "TEXT", None),
+    # PR #3: external cluster connect (managed vs external + auth blob)
+    ("clusters", "kind", "VARCHAR(20)", "DEFAULT 'managed'"),
+    ("clusters", "bootstrap_servers", "TEXT", None),
+    ("clusters", "security_protocol", "VARCHAR(30)", None),
+    ("clusters", "sasl_mechanism", "VARCHAR(40)", None),
+    ("clusters", "encrypted_connection_secrets", "TEXT", None),
+    ("clusters", "ssl_verify", "BOOLEAN", "DEFAULT 1"),
 ]
 
 

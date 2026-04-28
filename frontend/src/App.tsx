@@ -16,6 +16,8 @@ import ClusterLinking from './pages/ClusterLinking';
 import LdapSettings from './pages/LdapSettings';
 import Activity from './pages/Activity';
 import Alerts from './pages/Alerts';
+import SchemaRegistry from './pages/SchemaRegistry';
+import ExternalClusters from './pages/ExternalClusters';
 
 export default function App() {
   return (
@@ -38,6 +40,8 @@ export default function App() {
             <Route path="/ldap-settings" element={<LdapSettings />} />
             <Route path="/activity" element={<Activity />} />
             <Route path="/alerts" element={<Alerts />} />
+            <Route path="/schema-registry" element={<SchemaRegistry />} />
+            <Route path="/external-clusters" element={<ExternalClusters />} />
           </Route>
         </Route>
       </Routes>

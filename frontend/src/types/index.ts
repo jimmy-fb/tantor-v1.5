@@ -72,6 +72,8 @@ export interface Cluster {
   state: string;
   config_json: string | null;
   created_at: string;
+  // PR #3: external clusters share the same listing, distinguished by `kind`.
+  kind?: 'managed' | 'external';
 }
 
 export interface ServiceInfo {

@@ -1,0 +1,24 @@
+# Tantor-generated Apicurio Registry configuration
+# Storage backend: kafkasql (Apicurio persists schemas in a Kafka topic on this cluster)
+
+quarkus.http.port={{ schema_registry_port }}
+quarkus.http.host=0.0.0.0
+
+# Storage
+apicurio.storage.kind=kafkasql
+apicurio.storage.kafkasql.bootstrap.servers={{ bootstrap_servers }}
+apicurio.storage.kafkasql.topic=apicurio-registry-kafkasql-journal
+
+# Confluent Schema Registry compatibility (clients targeting Confluent SR
+# point at this URL with /apis/ccompat/v7 prefix and just work).
+apicurio.ccompat.legacy-id-mode.enabled=false
+apicurio.ccompat.use-canonical-hash=false
+
+# Auth: anonymous read+write for the bootstrap install. Lock down by adding
+# OIDC config when ready.
+apicurio.auth.enabled=false
+
+# Sensible defaults for self-hosted single-node deployments.
+quarkus.log.level=INFO
+quarkus.http.cors=true
+quarkus.http.cors.origins=*

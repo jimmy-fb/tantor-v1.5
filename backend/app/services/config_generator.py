@@ -103,6 +103,25 @@ class ConfigGenerator:
         )
 
     @staticmethod
+    def generate_schema_registry_config(service: dict, broker_services: list[dict], cluster_config: dict) -> str:
+        """Generate Apicurio Registry application.properties.
+
+        Storage backend is `kafkasql` — Apicurio persists schemas in a Kafka
+        topic on the same cluster, so the registry has no separate database.
+        ccompat-v7 is enabled so kafka-avro-serializer / Confluent SerDes
+        clients can talk to it like Confluent Schema Registry.
+        """
+        template = env.get_template("schema_registry.properties.j2")
+        bootstrap_servers = ",".join(
+            f"{s['ip_address']}:{cluster_config.get('listener_port', 9092)}"
+            for s in broker_services
+        )
+        return template.render(
+            bootstrap_servers=bootstrap_servers,
+            schema_registry_port=cluster_config.get("schema_registry_port", 8085),
+        )
+
+    @staticmethod
     def generate_systemd_unit(
         service_type: str,
         config_path: str,
@@ -147,6 +166,8 @@ class ConfigGenerator:
             return ConfigGenerator.generate_ksqldb_config(service, broker_services, cluster_config)
         elif role == "kafka_connect":
             return ConfigGenerator.generate_connect_config(service, broker_services, cluster_config)
+        elif role == "schema_registry":
+            return ConfigGenerator.generate_schema_registry_config(service, broker_services, cluster_config)
         else:
             raise ValueError(f"Unknown service role: {role}")
 

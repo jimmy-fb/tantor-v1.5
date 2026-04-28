@@ -346,6 +346,9 @@ def _run_ansible_deployment(
         elif role == "zookeeper":
             config_name = f"{ip}_{nid}_zookeeper.properties"
             remote_config = f"{settings.KAFKA_INSTALL_DIR}/config/zookeeper.properties"
+        elif role == "schema_registry":
+            config_name = f"{ip}_{nid}_apicurio.properties"
+            remote_config = f"{settings.APICURIO_INSTALL_DIR}/application.properties"
         else:
             config_name = f"{ip}_{nid}_server.properties"
             remote_config = f"{settings.KAFKA_INSTALL_DIR}/config/server.properties"
@@ -358,6 +361,7 @@ def _run_ansible_deployment(
             "controller": "kafka-kraft-controller",
             "ksqldb": "ksqldb", "kafka_connect": "kafka-connect",
             "zookeeper": "kafka",
+            "schema_registry": "schema-registry",
         }
         service_type = service_type_map.get(role, "kafka")
         unit_content = config_generator.generate_systemd_unit(
@@ -376,6 +380,7 @@ def _run_ansible_deployment(
     has_controllers = "controller" in roles_present
     has_ksqldb = "ksqldb" in roles_present
     has_connect = "kafka_connect" in roles_present
+    has_schema_registry = "schema_registry" in roles_present
 
     # Resolve ksqlDB binary if needed
     ksqldb_tgz = ""
@@ -389,6 +394,36 @@ def _run_ansible_deployment(
             log(f"Using ksqlDB binary: {ksqldb_tgz} ({ksqldb_files[-1].stat().st_size // (1024*1024)} MB)")
         else:
             log("WARNING: No ksqlDB binary found in repo. ksqlDB deployment may fail.")
+
+    # Resolve Apicurio Registry binary if needed
+    apicurio_tgz = ""
+    apicurio_tgz_path = ""
+    apicurio_strip_components = 1
+    if has_schema_registry:
+        apicurio_repo = Path(settings.APICURIO_REPO_DIR)
+        apicurio_repo.mkdir(parents=True, exist_ok=True)
+        # Look for any apicurio kafkasql tarball; we accept whichever version is present.
+        existing = sorted(apicurio_repo.glob("apicurio-registry-storage-kafkasql-*.tar.gz"))
+        if not existing:
+            apicurio_tgz = f"apicurio-registry-storage-kafkasql-{settings.APICURIO_VERSION}.tar.gz"
+            apicurio_tgz_path = str(apicurio_repo / apicurio_tgz)
+            url = f"https://github.com/Apicurio/apicurio-registry/releases/download/{settings.APICURIO_VERSION}/{apicurio_tgz}"
+            log(f"Apicurio binary not found locally. Downloading {apicurio_tgz}...")
+            import urllib.request
+            try:
+                urllib.request.urlretrieve(url, apicurio_tgz_path)
+                log(f"Downloaded {apicurio_tgz} ({Path(apicurio_tgz_path).stat().st_size // (1024*1024)} MB)")
+            except Exception as dl_err:
+                log(f"ERROR: Failed to download Apicurio: {dl_err}")
+                log(f"Place an Apicurio kafkasql tarball at {apicurio_repo}/ and retry.")
+                _set_status(db, task_id, "error", error_message=f"Apicurio download failed: {dl_err}")
+                cluster.state = "error"
+                db.commit()
+                return
+        else:
+            apicurio_tgz_path = str(existing[-1])
+            apicurio_tgz = existing[-1].name
+            log(f"Using Apicurio binary: {apicurio_tgz} ({existing[-1].stat().st_size // (1024*1024)} MB)")
 
     # Generate playbook
     playbook_path = ansible_runner.generate_playbook(work_dir, "deploy_kafka.yml.j2", {
@@ -406,6 +441,11 @@ def _run_ansible_deployment(
         "has_controllers": has_controllers,
         "has_ksqldb": has_ksqldb,
         "has_connect": has_connect,
+        "has_schema_registry": has_schema_registry,
+        "apicurio_install_dir": settings.APICURIO_INSTALL_DIR,
+        "apicurio_binary_filename": apicurio_tgz,
+        "apicurio_binary_local_path": apicurio_tgz_path,
+        "apicurio_strip_components": apicurio_strip_components,
         "ksqldb_install_dir": settings.KSQLDB_INSTALL_DIR,
         "ksqldb_binary_filename": ksqldb_tgz,
         "ksqldb_binary_local_path": ksqldb_tgz_path,

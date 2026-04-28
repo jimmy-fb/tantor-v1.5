@@ -77,7 +77,7 @@ cp -r frontend/dist/* "$PAYLOAD_DIR/frontend/dist/"
 cp install.sh "$PAYLOAD_DIR/"
 
 # Optionally bundle Kafka binary
-KAFKA_VERSION="3.7.0"
+KAFKA_VERSION="4.1.0"
 KAFKA_TGZ="kafka_2.13-${KAFKA_VERSION}.tgz"
 if [ "$WITH_KAFKA" = true ]; then
     # Look for Kafka binary in common locations

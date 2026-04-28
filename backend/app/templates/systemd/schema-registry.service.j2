@@ -1,0 +1,20 @@
+[Unit]
+Description=Apicurio Schema Registry (Tantor-managed)
+After=network.target kafka.service
+Wants=kafka.service
+
+[Service]
+Type=simple
+User=apicurio
+Group=apicurio
+Environment="JAVA_HOME={{ java_home }}"
+Environment="QUARKUS_CONFIG_LOCATIONS={{ config_path }}"
+{% if heap_opts %}Environment="JAVA_OPTS={{ heap_opts }}"
+{% endif %}
+ExecStart={{ java_home }}/bin/java $JAVA_OPTS -jar /opt/apicurio/quarkus-app/quarkus-run.jar
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
