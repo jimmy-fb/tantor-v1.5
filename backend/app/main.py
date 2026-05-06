@@ -11,7 +11,7 @@ from app.api import (
     hosts, clusters, ws, versions, topics, kafka_connect, security, ksqldb,
     auth, logs, monitoring, broker_config, rolling_restart,
     upgrades, security_scan, cluster_linking, rebalance, ldap, activity, alerts,
-    schema_registry, external_clusters, security_tls,
+    schema_registry, external_clusters, security_tls, federation,
 )
 from app.models.kafka_user import KafkaUser  # noqa: F401 - ensure table creation
 from app.models.audit_log import AuditLog  # noqa: F401 - ensure table creation
@@ -29,7 +29,7 @@ from app.models.alert_incident import AlertIncident  # noqa: F401 - ensure table
 from app.services.auth_service import AuthService
 from app.services.migrations import apply_runtime_migrations
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.4.0"
 
 # Configure logging
 logging.basicConfig(
@@ -106,6 +106,7 @@ app.include_router(alerts.webhook_router)
 app.include_router(schema_registry.router)
 app.include_router(external_clusters.router)
 app.include_router(security_tls.router)
+app.include_router(federation.router)
 
 
 @app.get("/api/health")

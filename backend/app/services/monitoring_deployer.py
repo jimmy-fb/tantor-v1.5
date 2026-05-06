@@ -31,8 +31,18 @@ class MonitoringDeployer:
 
     @staticmethod
     def deploy_monitoring_stack(cluster_id: str, monitoring_host_id: str,
-                                grafana_port: int, prometheus_port: int, db: Session) -> dict:
-        """Deploy Prometheus + Grafana on a host, JMX exporter on all brokers."""
+                                grafana_port: int, prometheus_port: int, db: Session,
+                                external_jmx_endpoints: list[str] | None = None) -> dict:
+        """Deploy Prometheus + Grafana on a host, JMX exporter on all brokers.
+
+        For managed clusters: Tantor SSHes to each broker host and installs JMX
+        exporter, then points Prometheus at the broker IPs.
+
+        For external clusters (cluster.kind == "external") Tantor doesn't own
+        the brokers, so the JMX-exporter-per-broker step is skipped. Instead
+        the caller passes `external_jmx_endpoints` (list of "host:port" the
+        customer's brokers expose) and Prometheus scrapes those directly.
+        """
         cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
         if not cluster:
             raise ValueError("Cluster not found")
@@ -41,6 +51,7 @@ class MonitoringDeployer:
         if not mon_host:
             raise ValueError("Monitoring host not found")
 
+        is_external = (cluster.kind or "managed") == "external"
         services = db.query(Service).filter(Service.cluster_id == cluster_id).all()
         broker_hosts = []
         for svc in services:
@@ -51,17 +62,41 @@ class MonitoringDeployer:
 
         steps = []
 
-        # Step 1: Deploy JMX exporter on each broker
-        for host in broker_hosts:
+        # Step 1: Deploy JMX exporter on each broker (managed clusters only)
+        if not is_external:
+            from app.services import cluster_paths
+            kafka_unit = cluster_paths.unit_name(cluster)
+            # Per-cluster JMX exporter port. Derived from listener_port so two
+            # clusters on the same host don't both try to bind 7071. Default
+            # cluster (9092) → 7071; second (9192) → 7171; etc.
+            import json as _json
             try:
-                MonitoringDeployer._deploy_jmx_exporter(host)
-                steps.append({"step": f"JMX exporter on {host.hostname}", "status": "success"})
-            except Exception as e:
-                steps.append({"step": f"JMX exporter on {host.hostname}", "status": "failed", "error": str(e)})
+                cfg = _json.loads(cluster.config_json or "{}")
+            except Exception:
+                cfg = {}
+            listener = int(cfg.get("listener_port", 9092))
+            jmx_port = JMX_EXPORTER_PORT + (listener - 9092)
+            for host in broker_hosts:
+                try:
+                    MonitoringDeployer._deploy_jmx_exporter(host, kafka_unit=kafka_unit, jmx_port=jmx_port)
+                    steps.append({"step": f"JMX exporter on {host.hostname} (port {jmx_port})", "status": "success"})
+                except Exception as e:
+                    steps.append({"step": f"JMX exporter on {host.hostname}", "status": "failed", "error": str(e)})
+        else:
+            steps.append({
+                "step": "JMX exporter (external — must be exposed by customer)",
+                "status": "skipped",
+            })
 
-        # Step 2: Deploy Prometheus
+        # Step 2: Deploy Prometheus — for external clusters use the operator-supplied
+        # JMX endpoints as scrape targets instead of broker hosts we own.
         try:
-            MonitoringDeployer._deploy_prometheus(mon_host, broker_hosts, prometheus_port)
+            if is_external:
+                MonitoringDeployer._deploy_prometheus_external(
+                    mon_host, external_jmx_endpoints or [], prometheus_port,
+                )
+            else:
+                MonitoringDeployer._deploy_prometheus(mon_host, broker_hosts, prometheus_port, jmx_port=jmx_port)
             steps.append({"step": "Prometheus", "status": "success"})
         except Exception as e:
             steps.append({"step": "Prometheus", "status": "failed", "error": str(e)})
@@ -126,7 +161,7 @@ class MonitoringDeployer:
             return SSHManager.exec_command(client, command, timeout=timeout)
 
     @staticmethod
-    def _deploy_jmx_exporter(host: Host):
+    def _deploy_jmx_exporter(host: Host, kafka_unit: str = "kafka.service", jmx_port: int = JMX_EXPORTER_PORT):
         """Deploy JMX Prometheus exporter on a Kafka broker."""
         logger.info(f"Deploying JMX exporter on {host.hostname}")
 
@@ -134,6 +169,17 @@ class MonitoringDeployer:
 lowercaseOutputName: true
 lowercaseOutputLabelNames: true
 rules:
+  # Per-topic broker metrics. Kafka publishes the same metric NAMES at two
+  # MBean granularities — cluster-wide (no `topic=` in the MBean) and per-
+  # topic (with `topic=`). This more-specific rule MUST come first so the
+  # per-topic samples carry a `topic` label; otherwise everything collapses
+  # to the cluster-wide version and the per-topic dashboard panels stay
+  # empty.
+  - pattern: kafka.server<type=BrokerTopicMetrics, name=(.+), topic=(.+)><>(\w+)
+    name: kafka_server_brokertopicmetrics_$1_$3
+    labels:
+      topic: "$2"
+    type: GAUGE
   - pattern: kafka.server<type=BrokerTopicMetrics, name=(.+)><>(\w+)
     name: kafka_server_brokertopicmetrics_$1_$2
     type: GAUGE
@@ -174,24 +220,58 @@ if [ ! -f /opt/jmx_exporter/jmx_prometheus_javaagent.jar ]; then
     sudo curl -sL "{jmx_jar_url}" -o /opt/jmx_exporter/jmx_prometheus_javaagent.jar
 fi
 
-# Add JMX exporter to Kafka service environment
-if ! grep -q "jmx_prometheus_javaagent" /etc/systemd/system/kafka.service 2>/dev/null; then
-    sudo sed -i '/\\[Service\\]/a Environment="KAFKA_OPTS=-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent.jar={JMX_EXPORTER_PORT}:/opt/jmx_exporter/kafka.yml"' /etc/systemd/system/kafka.service
+# Add JMX exporter to this cluster's Kafka systemd unit (per-cluster, APB v1.2.0 #5).
+# JMX port is also per-cluster so two clusters on the same host don't both
+# try to bind 7071 — the JVM panics if you do.
+if ! grep -q "jmx_prometheus_javaagent" /etc/systemd/system/{kafka_unit} 2>/dev/null; then
+    sudo sed -i '/\\[Service\\]/a Environment="KAFKA_OPTS=-javaagent:/opt/jmx_exporter/jmx_prometheus_javaagent.jar={jmx_port}:/opt/jmx_exporter/kafka.yml"' /etc/systemd/system/{kafka_unit}
     sudo systemctl daemon-reload
-    sudo systemctl restart kafka
+    sudo systemctl restart {kafka_unit}
 fi
+
+# APB v1.2.0 #9: Capacity forecast was always empty because node_exporter
+# (the source of node_filesystem_*_bytes metrics) was never deployed —
+# Prometheus's scrape config referenced :9100 but nothing was listening.
+# Install node_exporter alongside JMX so disk metrics flow through.
+if [ ! -f /opt/node_exporter/node_exporter ]; then
+    cd /tmp
+    NEV="{settings.NODE_EXPORTER_VERSION}"
+    sudo curl -sL "https://github.com/prometheus/node_exporter/releases/download/v$NEV/node_exporter-$NEV.linux-amd64.tar.gz" -o node_exporter.tar.gz
+    sudo tar xzf node_exporter.tar.gz
+    sudo mkdir -p /opt/node_exporter
+    sudo cp node_exporter-$NEV.linux-amd64/node_exporter /opt/node_exporter/
+    sudo rm -rf node_exporter.tar.gz node_exporter-$NEV.linux-amd64
+fi
+if [ ! -f /etc/systemd/system/node_exporter.service ]; then
+    sudo bash -c 'cat > /etc/systemd/system/node_exporter.service << "NEEOF"
+[Unit]
+Description=Prometheus node_exporter
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/node_exporter/node_exporter --web.listen-address=:9100
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+NEEOF'
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now node_exporter
+fi
+
 echo "JMX_DONE"
 """
-        exit_code, stdout, stderr = MonitoringDeployer._ssh_exec(host, commands, timeout=120)
+        exit_code, stdout, stderr = MonitoringDeployer._ssh_exec(host, commands, timeout=180)
         if "JMX_DONE" not in stdout:
-            raise RuntimeError(f"JMX exporter deploy failed: {stderr}")
+            raise RuntimeError(f"JMX/node exporter deploy failed: {stderr}")
 
     @staticmethod
-    def _deploy_prometheus(host: Host, broker_hosts: list, port: int):
+    def _deploy_prometheus(host: Host, broker_hosts: list, port: int, jmx_port: int = JMX_EXPORTER_PORT):
         """Deploy Prometheus on the monitoring host."""
         logger.info(f"Deploying Prometheus on {host.hostname}")
 
-        targets = ", ".join([f'"{h.ip_address}:{JMX_EXPORTER_PORT}"' for h in broker_hosts])
+        targets = ", ".join([f'"{h.ip_address}:{jmx_port}"' for h in broker_hosts])
         node_targets = ", ".join([f'"{h.ip_address}:9100"' for h in broker_hosts])
 
         prometheus_yml = f"""global:
@@ -237,6 +317,78 @@ sudo bash -c 'cat > /etc/prometheus/prometheus.yml << "PROMEOF"
 PROMEOF'
 
 # Create systemd service
+sudo bash -c 'cat > /etc/systemd/system/prometheus.service << "SVCEOF"
+[Unit]
+Description=Prometheus
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/opt/prometheus/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/var/lib/prometheus --web.listen-address=:{port} --storage.tsdb.retention.time=180d --web.enable-lifecycle
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF'
+
+sudo systemctl daemon-reload
+sudo systemctl enable prometheus
+sudo systemctl restart prometheus
+sleep 2
+curl -sf http://localhost:{port}/-/healthy && echo "PROM_OK" || echo "PROM_FAIL"
+"""
+        exit_code, stdout, stderr = MonitoringDeployer._ssh_exec(host, commands, timeout=180)
+        if "PROM_OK" not in stdout:
+            raise RuntimeError(f"Prometheus deploy failed: {stderr}")
+
+    @staticmethod
+    def _deploy_prometheus_external(host: Host, jmx_endpoints: list[str], port: int):
+        """Variant of _deploy_prometheus for external clusters.
+
+        Tantor doesn't own the brokers, so it can't push JMX exporter to them.
+        The customer must expose JMX (or JMX exporter) themselves; the
+        endpoints they give us go straight into the kafka-jmx scrape job.
+        """
+        logger.info(f"Deploying Prometheus on {host.hostname} for external cluster")
+
+        # Tolerate missing endpoints — the operator can start with just rules
+        # and add scrape targets later by re-running the monitoring deploy.
+        targets = ", ".join([f'"{ep.strip()}"' for ep in jmx_endpoints if ep.strip()]) or '""'
+        prometheus_yml = f"""global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Tantor-managed: Alertmanager runs on the same host as Prometheus.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:{settings.ALERTMANAGER_PORT}']
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: 'kafka-jmx'
+    static_configs:
+      - targets: [{targets}]
+"""
+
+        commands = f"""
+if ! command -v prometheus &>/dev/null && [ ! -f /opt/prometheus/prometheus ]; then
+    cd /tmp
+    curl -sL "https://github.com/prometheus/prometheus/releases/download/v{PROMETHEUS_VERSION}/prometheus-{PROMETHEUS_VERSION}.linux-amd64.tar.gz" -o prometheus.tar.gz
+    tar xzf prometheus.tar.gz
+    sudo mkdir -p /opt/prometheus /var/lib/prometheus
+    sudo cp prometheus-{PROMETHEUS_VERSION}.linux-amd64/prometheus /opt/prometheus/
+    sudo cp prometheus-{PROMETHEUS_VERSION}.linux-amd64/promtool /opt/prometheus/
+    rm -rf prometheus.tar.gz prometheus-{PROMETHEUS_VERSION}.linux-amd64
+fi
+
+sudo mkdir -p /etc/prometheus /etc/prometheus/rules
+sudo bash -c 'cat > /etc/prometheus/prometheus.yml << "PROMEOF"
+{prometheus_yml}
+PROMEOF'
+
 sudo bash -c 'cat > /etc/systemd/system/prometheus.service << "SVCEOF"
 [Unit]
 Description=Prometheus
@@ -310,11 +462,24 @@ if command -v setsebool &>/dev/null; then
     sudo setsebool -P httpd_can_network_connect 1 2>/dev/null || true
 fi
 
+# Ensure data dirs exist with grafana ownership — `--purge` may have wiped them
+# and the deb's postinst doesn't always recreate on a re-deploy.
+sudo mkdir -p /var/lib/grafana /var/lib/grafana/plugins /var/lib/grafana/dashboards /var/log/grafana
+sudo chown -R grafana:grafana /var/lib/grafana /var/log/grafana 2>/dev/null || true
+
 sudo systemctl daemon-reload
 sudo systemctl enable grafana-server
 sudo systemctl restart grafana-server
-sleep 3
-curl -sf http://localhost:{grafana_port}/api/health && echo "GRAFANA_OK" || echo "GRAFANA_FAIL"
+# Grafana boot can take 5-10s, especially on cold installs; poll up to 30s.
+GRAFANA_OK=0
+for i in 1 2 3 4 5 6; do
+    if curl -sf http://localhost:{grafana_port}/api/health >/dev/null 2>&1; then
+        GRAFANA_OK=1
+        break
+    fi
+    sleep 5
+done
+[ "$GRAFANA_OK" = "1" ] && echo "GRAFANA_OK" || echo "GRAFANA_FAIL"
 """
         exit_code, stdout, stderr = MonitoringDeployer._ssh_exec(host, commands, timeout=180)
         if "GRAFANA_OK" not in stdout:
@@ -390,6 +555,96 @@ curl -sf http://localhost:{grafana_port}/api/health && echo "GRAFANA_OK" || echo
             "overwrite": True,
         })
 
+        # APB-requested per-topic dashboard. Uses a Grafana variable `topic`
+        # populated from `label_values(...)` on the JMX-exporter rewrite rule
+        # that exposes a `topic` label on broker-topic metrics. Operators get
+        # throughput, lag and partition count in one place per topic.
+        topic_dashboard_json = json.dumps({
+            "dashboard": {
+                "title": "Kafka — Topic Performance",
+                "tags": ["kafka", "topic"],
+                "timezone": "browser",
+                "templating": {
+                    "list": [
+                        {
+                            "name": "topic",
+                            "type": "query",
+                            "datasource": "Prometheus",
+                            "query": "label_values(kafka_server_brokertopicmetrics_messagesinpersec_count{topic!=\"\"}, topic)",
+                            "refresh": 2,
+                            "includeAll": False,
+                            "multi": False,
+                        }
+                    ]
+                },
+                "panels": [
+                    {
+                        "title": "Messages In/sec — $topic",
+                        "type": "timeseries",
+                        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+                        "targets": [{
+                            "expr": "sum by (topic) (rate(kafka_server_brokertopicmetrics_messagesinpersec_count{topic=~\"$topic\"}[5m]))",
+                            "legendFormat": "{{topic}}"
+                        }],
+                        "datasource": "Prometheus",
+                    },
+                    {
+                        "title": "Bytes In/sec — $topic",
+                        "type": "timeseries",
+                        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+                        "targets": [{
+                            "expr": "sum by (topic) (rate(kafka_server_brokertopicmetrics_bytesinpersec_count{topic=~\"$topic\"}[5m]))",
+                            "legendFormat": "{{topic}}"
+                        }],
+                        "datasource": "Prometheus",
+                    },
+                    {
+                        "title": "Bytes Out/sec — $topic",
+                        "type": "timeseries",
+                        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+                        "targets": [{
+                            "expr": "sum by (topic) (rate(kafka_server_brokertopicmetrics_bytesoutpersec_count{topic=~\"$topic\"}[5m]))",
+                            "legendFormat": "{{topic}}"
+                        }],
+                        "datasource": "Prometheus",
+                    },
+                    {
+                        "title": "Consumer Lag — $topic (per group)",
+                        "type": "timeseries",
+                        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+                        "targets": [{
+                            "expr": "sum by (consumergroup, topic) (kafka_consumergroup_lag{topic=~\"$topic\"})",
+                            "legendFormat": "{{consumergroup}}"
+                        }],
+                        "datasource": "Prometheus",
+                    },
+                    {
+                        "title": "Log Size (bytes) — $topic",
+                        "type": "timeseries",
+                        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+                        "targets": [{
+                            "expr": "sum by (topic) (kafka_log_size{topic=~\"$topic\"})",
+                            "legendFormat": "{{topic}}"
+                        }],
+                        "datasource": "Prometheus",
+                    },
+                    {
+                        "title": "Partition count — $topic",
+                        "type": "stat",
+                        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+                        "targets": [{
+                            "expr": "count by (topic) (kafka_log_size{topic=~\"$topic\"})",
+                            "legendFormat": "{{topic}}"
+                        }],
+                        "datasource": "Prometheus",
+                    },
+                ],
+                "time": {"from": "now-1h", "to": "now"},
+                "refresh": "30s",
+            },
+            "overwrite": True,
+        })
+
         commands = f"""
 # Add Prometheus data source
 curl -sf -X POST http://admin:admin@localhost:{grafana_port}/api/datasources \
@@ -400,6 +655,11 @@ curl -sf -X POST http://admin:admin@localhost:{grafana_port}/api/datasources \
 curl -sf -X POST http://admin:admin@localhost:{grafana_port}/api/dashboards/db \
   -H "Content-Type: application/json" \
   -d '{dashboard_json}' 2>/dev/null
+
+# Create per-topic performance dashboard
+curl -sf -X POST http://admin:admin@localhost:{grafana_port}/api/dashboards/db \
+  -H "Content-Type: application/json" \
+  -d '{topic_dashboard_json}' 2>/dev/null
 
 echo "DASHBOARDS_OK"
 """

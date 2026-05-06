@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.audit_log import AuditLog
+from app.models.cluster import Cluster
 from app.schemas.security import (
     KafkaUserCreate,
     KafkaUserResponse,
@@ -18,6 +19,7 @@ from app.schemas.security import (
     AuditLogEntry,
 )
 from app.services.kafka_admin import kafka_admin
+from app.services import cert_manager
 from app.api.deps import require_admin, require_monitor_or_above
 from app.models.user import User
 
@@ -35,19 +37,19 @@ def list_users(cluster_id: str, db: Session = Depends(get_db), _: User = Depends
 
 
 @router.post("/users", response_model=KafkaUserCreatedResponse)
-def create_user(cluster_id: str, data: KafkaUserCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_user(cluster_id: str, data: KafkaUserCreate, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
     try:
         return kafka_admin.create_scram_user(
-            cluster_id, data.username, data.password, data.mechanism, db,
+            cluster_id, data.username, data.password, data.mechanism, db, actor=current_user,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/users/{username}", response_model=KafkaUserDeleteResponse)
-def delete_user(cluster_id: str, username: str, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_user(cluster_id: str, username: str, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
     try:
-        return kafka_admin.delete_scram_user(cluster_id, username, db)
+        return kafka_admin.delete_scram_user(cluster_id, username, db, actor=current_user)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -55,10 +57,10 @@ def delete_user(cluster_id: str, username: str, db: Session = Depends(get_db), _
 @router.post("/users/{username}/rotate", response_model=KafkaUserRotateResponse)
 def rotate_user_password(
     cluster_id: str, username: str, data: KafkaUserRotateRequest, db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     try:
-        return kafka_admin.rotate_scram_password(cluster_id, username, data.password, db)
+        return kafka_admin.rotate_scram_password(cluster_id, username, data.password, db, actor=current_user)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -85,17 +87,17 @@ def list_acls(
 
 
 @router.post("/acls", response_model=AclCreateResponse)
-def create_acl(cluster_id: str, data: AclCreateRequest, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def create_acl(cluster_id: str, data: AclCreateRequest, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
     try:
-        return kafka_admin.create_acl(cluster_id, data.model_dump(), db)
+        return kafka_admin.create_acl(cluster_id, data.model_dump(), db, actor=current_user)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.delete("/acls", response_model=AclDeleteResponse)
-def delete_acl(cluster_id: str, data: AclDeleteRequest, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def delete_acl(cluster_id: str, data: AclDeleteRequest, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
     try:
-        return kafka_admin.delete_acl(cluster_id, data.model_dump(), db)
+        return kafka_admin.delete_acl(cluster_id, data.model_dump(), db, actor=current_user)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -134,3 +136,49 @@ def get_audit_log(
         query = query.filter(AuditLog.action == action)
     logs = query.order_by(AuditLog.created_at.desc()).offset(offset).limit(limit).all()
     return logs
+
+
+# ── Certificates (APB v1.4.0 #8) ──────────────────────
+
+
+@router.get("/certificates")
+def list_certificates(
+    cluster_id: str, db: Session = Depends(get_db),
+    _: User = Depends(require_monitor_or_above),
+):
+    """List the cluster's stored certificate material."""
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    return cert_manager.list_cluster_certificates(cluster)
+
+
+@router.post("/certificates/ca")
+def upload_certificate_ca(
+    cluster_id: str,
+    ca_cert: UploadFile = File(..., description="CA certificate (PEM)"),
+    ca_key: UploadFile | None = File(None, description="CA private key (PEM, optional)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Replace the cluster's CA with operator-supplied PEM material.
+
+    APB v1.4.0 #8 — operators bring their own CA so broker certs chain
+    up to a trust anchor their downstream clients already accept.
+    """
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    try:
+        cert_pem = ca_cert.file.read()
+        key_pem = ca_key.file.read() if ca_key else None
+        result = cert_manager.upload_cluster_ca(cluster, cert_pem, key_pem)
+        # Audit row so the activity feed shows who uploaded the CA.
+        kafka_admin._audit(
+            db, cluster_id, "ca_uploaded", "certificate", "cluster_ca",
+            details=result.get("subject"), actor=current_user,
+        )
+        db.commit()
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))

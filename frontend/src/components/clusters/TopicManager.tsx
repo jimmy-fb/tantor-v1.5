@@ -15,6 +15,7 @@ export default function TopicManager({ clusterId }: Props) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [expandedDetail, setExpandedDetail] = useState<TopicDetail | null>(null);
   const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [search, setSearch] = useState('');
 
@@ -70,19 +71,32 @@ export default function TopicManager({ clusterId }: Props) {
   };
 
   const handleCreate = async () => {
-    if (!newName.trim()) return;
+    const name = newName.trim();
+    if (!name) return;
     setCreating(true);
+    setCreateError(null);
     try {
       await createTopic(clusterId, {
-        name: newName.trim(),
+        name,
         partitions: newPartitions,
         replication_factor: newRF,
       });
+      // Optimistic insert + immediate refetch + retry once after 1.5s.
+      // Kafka's create_topics is synchronous on the broker but admin clients
+      // sometimes show stale metadata for a beat; the retry handles that.
+      setTopics(prev => prev.some(t => t.name === name)
+        ? prev
+        : [...prev, { name, partitions: newPartitions, replication_factor: newRF }],
+      );
       setNewName('');
       setNewPartitions(3);
       setNewRF(1);
       setShowCreate(false);
       fetchTopics();
+      setTimeout(() => fetchTopics(), 1500);
+    } catch (e: unknown) {
+      const apiErr = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setCreateError(apiErr || (e instanceof Error ? e.message : 'Topic creation failed'));
     } finally {
       setCreating(false);
     }
@@ -175,6 +189,11 @@ export default function TopicManager({ clusterId }: Props) {
               />
             </div>
           </div>
+          {createError && (
+            <div className="mt-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded p-2 px-3">
+              {createError}
+            </div>
+          )}
           <div className="flex gap-2 mt-3">
             <button
               onClick={handleCreate}

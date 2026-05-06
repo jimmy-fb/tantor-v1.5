@@ -73,6 +73,81 @@ def _write_secure(path: Path, data: bytes) -> None:
 # ── CA ─────────────────────────────────────────────────────────────────────
 
 
+# ── User-uploaded CA / certs (APB v1.4.0 #8) ───────────────────────────────
+
+
+def list_cluster_certificates(cluster: Cluster) -> dict:
+    """Inventory of cert files stored for this cluster.
+
+    Returns {ca: {present, fingerprint, not_after}, broker_certs: [...]}.
+    Used by the cluster Security tab so operators can see what Tantor
+    is currently using to mint broker keystores.
+    """
+    cdir = _cluster_dir(cluster.id)
+    out: dict = {"cluster_id": cluster.id, "ca": {"present": False}, "broker_certs": []}
+
+    ca_path = cdir / "ca.crt"
+    if ca_path.exists():
+        try:
+            cert_data = ca_path.read_bytes()
+            cert = x509.load_pem_x509_certificate(cert_data)
+            out["ca"] = {
+                "present": True,
+                "subject": cert.subject.rfc4514_string(),
+                "fingerprint_sha256": cert.fingerprint(hashes.SHA256()).hex(),
+                "not_before": cert.not_valid_before_utc.isoformat(),
+                "not_after": cert.not_valid_after_utc.isoformat(),
+                "uploaded": (cdir / "ca.upload.marker").exists(),
+            }
+        except Exception as e:
+            out["ca"] = {"present": True, "error": str(e)}
+
+    # broker certs are minted on-the-fly into pkcs12 files
+    for f in cdir.glob("broker-*.p12"):
+        out["broker_certs"].append({
+            "filename": f.name,
+            "size_bytes": f.stat().st_size,
+        })
+
+    return out
+
+
+def upload_cluster_ca(cluster: Cluster, ca_cert_pem: bytes, ca_key_pem: bytes | None) -> dict:
+    """Replace the cluster's CA with operator-supplied PEM material.
+
+    APB v1.4.0 #8 — instead of using Tantor's auto-generated CA the
+    operator can upload their own CA cert + key, and Tantor will sign
+    broker certs with it. If only the cert is supplied (no key) we
+    keep it as a truststore-only CA; broker keystores will still be
+    issued by the auto-generated internal CA.
+    """
+    # Validate the cert parses
+    try:
+        cert = x509.load_pem_x509_certificate(ca_cert_pem)
+    except Exception as e:
+        raise ValueError(f"Invalid CA certificate PEM: {e}")
+    if ca_key_pem:
+        try:
+            serialization.load_pem_private_key(ca_key_pem, password=None)
+        except Exception as e:
+            raise ValueError(f"Invalid CA private key PEM: {e}")
+
+    cdir = _cluster_dir(cluster.id)
+    (cdir / "ca.crt").write_bytes(ca_cert_pem)
+    if ca_key_pem:
+        _write_secure(cdir / "ca.key", ca_key_pem)
+    # Drop a marker so list_cluster_certificates can label this as
+    # operator-supplied vs Tantor-issued.
+    (cdir / "ca.upload.marker").write_text(
+        f"uploaded by user; subject={cert.subject.rfc4514_string()}\n"
+    )
+    return {
+        "uploaded": True,
+        "subject": cert.subject.rfc4514_string(),
+        "has_key": bool(ca_key_pem),
+    }
+
+
 def ensure_cluster_ca(cluster: Cluster) -> tuple[bytes, bytes]:
     """Return (ca_cert_pem, ca_key_pem). Generate + persist on first call."""
     cdir = _cluster_dir(cluster.id)

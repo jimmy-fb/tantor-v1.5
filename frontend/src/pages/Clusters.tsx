@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { Network, Plus, Trash2, Plug, Search, Filter, RotateCw } from 'lucide-react';
+import { Link, useNavigate } from 'react-router-dom';
+import { Network, Plus, Trash2, Plug, Search, Filter, RotateCw, Zap, Loader2 } from 'lucide-react';
+import axios from 'axios';
+import { getAccessToken } from '../lib/auth';
 import type { Cluster } from '../types';
 import { getClusters, deleteCluster, deployCluster } from '../lib/api';
 
@@ -22,11 +24,35 @@ function envBadge(env?: string) {
 }
 
 export default function Clusters() {
+  const navigate = useNavigate();
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [search, setSearch] = useState('');
   const [envFilter, setEnvFilter] = useState<string>('');
   const [kindFilter, setKindFilter] = useState<'all' | 'managed' | 'external'>('all');
   const [retrying, setRetrying] = useState<string | null>(null);
+  const [quickDeploying, setQuickDeploying] = useState(false);
+  const [quickDeployError, setQuickDeployError] = useState('');
+
+  // APB v1.4.0 #6 — one-click deploy: spins up a cluster on every
+  // registered host with sane defaults and skips the wizard entirely.
+  const handleQuickDeploy = async () => {
+    if (!confirm('Quick-deploy a Kafka cluster on all registered hosts using the latest available version?')) return;
+    setQuickDeploying(true);
+    setQuickDeployError('');
+    try {
+      const token = getAccessToken();
+      const { data } = await axios.post(
+        '/api/clusters/quick-deploy', { environment: 'dev' },
+        { headers: token ? { Authorization: `Bearer ${token}` } : {} }
+      );
+      navigate(`/clusters/${data.cluster_id}`);
+    } catch (err: unknown) {
+      const ax = err as { response?: { data?: { detail?: string } } };
+      setQuickDeployError(ax.response?.data?.detail || 'Quick-deploy failed');
+    } finally {
+      setQuickDeploying(false);
+    }
+  };
 
   const fetchClusters = () => {
     getClusters().then(setClusters);
@@ -34,6 +60,13 @@ export default function Clusters() {
 
   useEffect(() => {
     fetchClusters();
+    // APB issue #5: UI was getting stale and required manual reload.
+    // Poll the list every 15s so cluster state changes (deploy → running,
+    // restart, error) show up without the operator hitting refresh.
+    const i = setInterval(() => {
+      if (!document.hidden) fetchClusters();
+    }, 15000);
+    return () => clearInterval(i);
   }, []);
 
   const handleDelete = async (id: string) => {
@@ -84,13 +117,30 @@ export default function Clusters() {
           <h1 className="text-2xl font-bold text-gray-900">Clusters</h1>
           <p className="text-sm text-gray-500 mt-1">Your Kafka cluster deployments</p>
         </div>
-        <Link
-          to="/clusters/new"
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700"
-        >
-          <Plus size={16} /> New Cluster
-        </Link>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleQuickDeploy}
+            disabled={quickDeploying}
+            className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white text-sm rounded-lg hover:bg-emerald-700 disabled:opacity-50"
+            title="Spin up a cluster on every registered host using sane defaults"
+          >
+            {quickDeploying ? <Loader2 size={16} className="animate-spin" /> : <Zap size={16} />}
+            Quick Deploy
+          </button>
+          <Link
+            to="/clusters/new"
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700"
+          >
+            <Plus size={16} /> New Cluster
+          </Link>
+        </div>
       </div>
+
+      {quickDeployError && (
+        <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4 text-sm text-red-700">
+          {quickDeployError}
+        </div>
+      )}
 
       {clusters.length > 0 && (
         <div className="bg-white border rounded-xl p-3 mb-4 flex flex-wrap gap-3 items-center">

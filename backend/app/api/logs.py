@@ -48,14 +48,34 @@ def get_service_logs(
     hosts = {h.id: h for h in db.query(Host).all()}
     results = []
 
+    # APB v1.2.0 #5: pass per-cluster systemd unit + install dir so the
+    # log fetch hits "kafka-prod-XYZ.service" / "/opt/kafka-prod-XYZ/logs"
+    # not the legacy "kafka.service" / "/opt/kafka/logs".
+    from app.services import cluster_paths
+    unit_for_role = (
+        cluster_paths.unit_name(cluster)
+        if (cluster.kind or "managed") == "managed"
+        else None
+    )
+    install_dir_for_role = (
+        cluster_paths.install_dir(cluster)
+        if (cluster.kind or "managed") == "managed"
+        else None
+    )
+
     for svc in services:
         host = hosts.get(svc.host_id)
         if not host:
             continue
+        # Only override for kafka roles — ksqlDB and Connect have their own
+        # unit names that aren't per-cluster yet.
+        is_kafka_role = svc.role in ("broker", "broker_controller", "controller", "zookeeper")
         log_data = log_manager.get_logs(
             host, svc.role,
             lines=lines, since=since,
             priority=priority, grep_filter=grep,
+            unit_override=unit_for_role if is_kafka_role else None,
+            kafka_install_dir=install_dir_for_role if is_kafka_role else None,
         )
         log_data["service_id"] = svc.id
         results.append(log_data)
@@ -99,6 +119,20 @@ async def tail_service_logs(websocket: WebSocket, cluster_id: str, service_id: s
             auth_type=host.auth_type, encrypted_credential=host.encrypted_credential,
         )
         role = svc.role
+        # Resolve per-cluster unit/install dir before closing the DB session.
+        from app.services import cluster_paths
+        cluster_row = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+        is_kafka_role = role in ("broker", "broker_controller", "controller", "zookeeper")
+        unit_override = (
+            cluster_paths.unit_name(cluster_row)
+            if (cluster_row and (cluster_row.kind or "managed") == "managed" and is_kafka_role)
+            else None
+        )
+        kafka_install_dir = (
+            cluster_paths.install_dir(cluster_row)
+            if (cluster_row and (cluster_row.kind or "managed") == "managed" and is_kafka_role)
+            else None
+        )
     finally:
         db.close()
 
@@ -111,7 +145,11 @@ async def tail_service_logs(websocket: WebSocket, cluster_id: str, service_id: s
 
     def tail_thread():
         try:
-            for line in log_manager.tail_logs(host_copy, role):
+            for line in log_manager.tail_logs(
+                host_copy, role,
+                unit_override=unit_override,
+                kafka_install_dir=kafka_install_dir,
+            ):
                 if stop_event.is_set():
                     break
                 with log_lock:

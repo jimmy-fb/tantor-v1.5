@@ -18,6 +18,7 @@ import Activity from './pages/Activity';
 import Alerts from './pages/Alerts';
 import SchemaRegistry from './pages/SchemaRegistry';
 import ExternalClusters from './pages/ExternalClusters';
+import Federation from './pages/Federation';
 
 export default function App() {
   return (
@@ -42,6 +43,7 @@ export default function App() {
             <Route path="/alerts" element={<Alerts />} />
             <Route path="/schema-registry" element={<SchemaRegistry />} />
             <Route path="/external-clusters" element={<ExternalClusters />} />
+            <Route path="/federation" element={<Federation />} />
           </Route>
         </Route>
       </Routes>

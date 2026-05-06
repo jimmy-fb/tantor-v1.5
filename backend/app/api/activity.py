@@ -72,7 +72,7 @@ def list_activity(
                     cluster_name=cluster_names.get(row.cluster_id),
                     action=row.action,
                     resource=f"{row.resource_type}:{row.resource_name}",
-                    actor=None,  # AuditLog doesn't currently capture actor
+                    actor=row.actor_username,  # APB v1.4.0 #13
                     details=row.details,
                     occurred_at=_to_utc(row.created_at),
                 )

@@ -71,3 +71,4 @@ class ExternalConnectionTestResponse(BaseModel):
     broker_count: int | None = None
     controller_id: int | None = None
     cluster_id: str | None = None
+    kafka_version: str | None = None

@@ -70,12 +70,17 @@ class AuthService:
         # Determine role from group membership
         role = LdapService.determine_role(result.get("groups", []), ldap_config)
 
-        # Find or create local user record
+        # Find or create local user record. APB v1.4.0 #11 — store the
+        # LDAP DN so the User Management page can hide the password
+        # change UI and label the row with its source.
+        ldap_dn = result.get("dn")
         user = db.query(User).filter(User.username == username).first()
         if user:
             # Update role from LDAP groups and mark as LDAP user
             user.role = role
             user.auth_source = "ldap"
+            if ldap_dn:
+                user.ldap_dn = ldap_dn
             user.last_login = datetime.now(timezone.utc)
             db.commit()
             return user
@@ -86,6 +91,7 @@ class AuthService:
                 hashed_password="LDAP_AUTH",  # placeholder, not used for LDAP users
                 role=role,
                 auth_source="ldap",
+                ldap_dn=ldap_dn,
                 last_login=datetime.now(timezone.utc),
             )
             db.add(user)

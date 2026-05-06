@@ -39,60 +39,59 @@ class SSHManager:
         """
         key = _pool_key(ip_address, port, username)
 
+        # Step 1: try to grab a live pooled connection. If the keepalive
+        # ping fails the connection is dead — drop it and fall through to
+        # the "create new" path. CRITICAL: any exception raised here must
+        # come from the keepalive itself, NOT from the caller's `with`
+        # block. Previously we wrapped `yield client` in the same try and
+        # any caller-side exception got swallowed, causing the generator
+        # to yield twice → "generator didn't stop after throw()" surfaced
+        # to the user every time a config change failed.
+        client: paramiko.SSHClient | None = None
         with _pool_lock:
             _cleanup_pool()
             if key in _pool:
-                client, _ = _pool[key]
-                # Verify connection is still alive
+                pooled, _ = _pool[key]
                 try:
-                    client.get_transport().send_ignore()
-                    _pool[key] = (client, time.time())
-                    yield client
-                    return
+                    pooled.get_transport().send_ignore()
+                    _pool[key] = (pooled, time.time())
+                    client = pooled
                 except Exception:
-                    # Connection died, remove and reconnect
                     try:
-                        client.close()
+                        pooled.close()
                     except Exception:
                         pass
                     del _pool[key]
+                    client = None
 
-        # Create new connection outside lock (SSH handshake is slow)
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        credential = decrypt(encrypted_credential)
-
-        try:
-            if auth_type == "password":
-                client.connect(
-                    hostname=ip_address,
-                    port=port,
-                    username=username,
-                    password=credential,
-                    timeout=15,
-                    look_for_keys=False,
-                    allow_agent=False,
-                )
-            else:
-                pkey = paramiko.RSAKey.from_private_key(io.StringIO(credential))
-                client.connect(
-                    hostname=ip_address,
-                    port=port,
-                    username=username,
-                    pkey=pkey,
-                    timeout=15,
-                    look_for_keys=False,
-                    allow_agent=False,
-                )
-
-            # Store in pool
+        # Step 2: open a fresh connection if we don't have a live pooled one
+        if client is None:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            credential = decrypt(encrypted_credential)
+            try:
+                if auth_type == "password":
+                    client.connect(
+                        hostname=ip_address, port=port, username=username,
+                        password=credential, timeout=15,
+                        look_for_keys=False, allow_agent=False,
+                    )
+                else:
+                    pkey = paramiko.RSAKey.from_private_key(io.StringIO(credential))
+                    client.connect(
+                        hostname=ip_address, port=port, username=username,
+                        pkey=pkey, timeout=15,
+                        look_for_keys=False, allow_agent=False,
+                    )
+            except Exception:
+                client.close()
+                raise
             with _pool_lock:
                 _pool[key] = (client, time.time())
 
-            yield client
-        except Exception:
-            client.close()
-            raise
+        # Step 3: hand the live client to the caller. Any exception they
+        # raise propagates out untouched — we never yield twice.
+        yield client
 
     @staticmethod
     def exec_command(client: paramiko.SSHClient, command: str, timeout: int = 30) -> tuple[int, str, str]:

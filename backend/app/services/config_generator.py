@@ -154,12 +154,15 @@ class ConfigGenerator:
         ksqldb_home: str = "/opt/ksqldb",
         heap_opts: str = "",
         java_home: str = "",
+        unit_name: str | None = None,
+        kafka_log_dir: str = "/var/log/kafka",
     ) -> str:
         """Generate a systemd unit file for a Kafka service.
 
-        java_home is discovered at deploy time by the Ansible playbook.
-        We use a placeholder that gets replaced during deployment, or
-        a safe fallback that works on most systems.
+        unit_name is currently only used as a description hint inside the
+        rendered unit (the actual systemd filename comes from
+        deployer.py's `dest:` in the playbook). java_home is discovered at
+        deploy time by the Ansible playbook with a safe fallback.
         """
         if not java_home:
             # Use a safe default that works on both Debian and RHEL
@@ -172,6 +175,8 @@ class ConfigGenerator:
             config_path=config_path,
             java_home=java_home,
             heap_opts=heap_opts,
+            unit_name=unit_name or "kafka.service",
+            kafka_log_dir=kafka_log_dir,
         )
 
     @staticmethod

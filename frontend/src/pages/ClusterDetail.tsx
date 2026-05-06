@@ -4,12 +4,12 @@ import {
   Play, Square, RefreshCw, Rocket, Loader2,
   List, Users, Send, Plug, Monitor, ScrollText, Download, Shield,
   ShieldCheck, PlusCircle, Trash2, AlertTriangle, CheckCircle, XCircle, Database,
-  Settings, RotateCw, ArrowUpCircle, Shuffle,
+  Settings, RotateCw, ArrowUpCircle, Shuffle, TrendingUp,
 } from 'lucide-react';
 import type { ClusterDetail as ClusterDetailType, ServiceStatus, ValidationStep, Host } from '../types';
 import {
   getCluster, deployCluster, startCluster, stopCluster, getClusterStatus,
-  validateCluster, getHosts, addServices, removeService,
+  validateCluster, getHosts, addServices, removeService, listDeploymentTasks,
 } from '../lib/api';
 import TopicManager from '../components/clusters/TopicManager';
 import ConsumerGroups from '../components/clusters/ConsumerGroups';
@@ -19,11 +19,16 @@ import ConnectManager from '../components/clusters/ConnectManager';
 import SecurityManager from '../components/clusters/SecurityManager';
 import TLSPanel from '../components/clusters/TLSPanel';
 import KsqlManager from '../components/clusters/KsqlManager';
+import ClusterSchemaRegistry from '../components/clusters/ClusterSchemaRegistry';
 import ServiceLogs from '../components/clusters/ServiceLogs';
 import BrokerConfigManager from '../components/clusters/BrokerConfigManager';
 import RollingRestart from '../components/clusters/RollingRestart';
 import UpgradeManager from '../components/clusters/UpgradeManager';
 import PartitionRebalance from '../components/clusters/PartitionRebalance';
+import { DeployProgress } from '../components/clusters/DeployProgress';
+import CapacityForecast from '../components/clusters/CapacityForecast';
+import ClusterMonitoring from '../components/clusters/ClusterMonitoring';
+import ExternalLifecycle from '../components/clusters/ExternalLifecycle';
 
 const ROLE_LABELS: Record<string, string> = {
   broker: 'Broker',
@@ -51,7 +56,7 @@ const ROLES = [
   { id: 'kafka_connect', label: 'Kafka Connect' },
 ];
 
-type Tab = 'overview' | 'topics' | 'consumers' | 'produce' | 'consume' | 'connect' | 'security' | 'ksqldb' | 'validate' | 'service-logs' | 'config' | 'restart' | 'upgrade' | 'rebalance';
+type Tab = 'overview' | 'topics' | 'consumers' | 'produce' | 'consume' | 'connect' | 'security' | 'ksqldb' | 'validate' | 'service-logs' | 'config' | 'restart' | 'upgrade' | 'rebalance' | 'capacity' | 'monitoring' | 'lifecycle' | 'schema-registry';
 
 export default function ClusterDetail() {
   const { id } = useParams<{ id: string }>();
@@ -83,13 +88,36 @@ export default function ClusterDetail() {
 
   useEffect(() => {
     fetchDetail();
+    // APB issue #5: cluster detail header (state badge, version, services)
+    // was stale until manual reload. Poll every 15s while the page is
+    // visible so the operator never sees an out-of-date status.
+    const interval = setInterval(() => {
+      if (!document.hidden) fetchDetail();
+    }, 15000);
+    return () => clearInterval(interval);
   }, [id]);
+
+  const [activeDeployTaskId, setActiveDeployTaskId] = useState<string | null>(null);
+
+  // On page load, if the cluster is mid-deploy or in an error state, surface
+  // the most recent deploy task so the user can read the log without having
+  // to know the task_id.
+  useEffect(() => {
+    if (!id || !detail) return;
+    const s = (detail.cluster.state || '').toLowerCase();
+    if (s !== 'deploying' && s !== 'error') return;
+    if (activeDeployTaskId) return;
+    listDeploymentTasks(id).then(tasks => {
+      if (tasks && tasks.length > 0) setActiveDeployTaskId(tasks[0].task_id);
+    }).catch(() => { /* best-effort */ });
+  }, [id, detail, activeDeployTaskId]);
 
   const handleDeploy = async () => {
     if (!id) return;
     setActionLoading('deploy');
     try {
-      await deployCluster(id);
+      const task = await deployCluster(id);
+      setActiveDeployTaskId(task.task_id);
       fetchDetail();
     } finally {
       setActionLoading(null);
@@ -192,7 +220,7 @@ export default function ClusterDetail() {
   const hasKsqldb = services.some(s => s.role === 'ksqldb');
   const isExternal = cluster.kind === 'external';
 
-  const tabs: Array<{ id: Tab; label: string; icon: React.ReactNode; requiresRunning?: boolean; requiresConnect?: boolean; requiresKsqldb?: boolean; managedOnly?: boolean }> = [
+  const tabs: Array<{ id: Tab; label: string; icon: React.ReactNode; requiresRunning?: boolean; requiresConnect?: boolean; requiresKsqldb?: boolean; managedOnly?: boolean; externalOnly?: boolean }> = [
     { id: 'overview', label: 'Overview', icon: <Monitor size={14} /> },
     { id: 'topics', label: 'Topics', icon: <List size={14} />, requiresRunning: true },
     { id: 'consume', label: 'Consume', icon: <Download size={14} />, requiresRunning: true },
@@ -200,6 +228,8 @@ export default function ClusterDetail() {
     { id: 'consumers', label: 'Groups', icon: <Users size={14} />, requiresRunning: true },
     { id: 'connect', label: 'Connect', icon: <Plug size={14} />, requiresRunning: true, requiresConnect: true, managedOnly: true },
     { id: 'ksqldb', label: 'ksqlDB', icon: <Database size={14} />, requiresRunning: true, requiresKsqldb: true, managedOnly: true },
+    // APB v1.4.0 #2 — Schema Registry per-cluster: deploy / browse subjects / register schemas.
+    { id: 'schema-registry', label: 'Schema Registry', icon: <Database size={14} />, requiresRunning: true, managedOnly: true },
     // SCRAM users + ACLs work via kafka-python on external clusters too
     // (no SSH required); the TLS/mTLS sub-panel is hidden inside the
     // SecurityManager component when cluster.kind=external.
@@ -211,6 +241,9 @@ export default function ClusterDetail() {
     { id: 'rebalance', label: 'Rebalance', icon: <Shuffle size={14} />, requiresRunning: true, managedOnly: true },
     { id: 'restart', label: 'Restart', icon: <RotateCw size={14} />, requiresRunning: true, managedOnly: true },
     { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={14} />, managedOnly: true },
+    { id: 'monitoring', label: 'Monitoring', icon: <Monitor size={14} /> },
+    { id: 'lifecycle', label: 'Lifecycle', icon: <Play size={14} />, externalOnly: true },
+    { id: 'capacity', label: 'Capacity', icon: <TrendingUp size={14} />, requiresRunning: true },
     { id: 'service-logs', label: 'Service Logs', icon: <ScrollText size={14} />, requiresRunning: true, managedOnly: true },
   ];
 
@@ -219,6 +252,7 @@ export default function ClusterDetail() {
   const externalIsLive = isExternal && (cluster.state === 'connected' || cluster.state === 'running');
   const visibleTabs = tabs.filter(t => {
     if (t.managedOnly && isExternal) return false;
+    if (t.externalOnly && !isExternal) return false;
     if (t.requiresRunning && !isRunning && !externalIsLive) return false;
     if (t.requiresConnect && !hasConnect) return false;
     if (t.requiresKsqldb && !hasKsqldb) return false;
@@ -243,7 +277,7 @@ export default function ClusterDetail() {
           </h1>
           <p className="text-sm text-gray-500 mt-1">
             {isExternal
-              ? <>Imported cluster — managed via bootstrap servers</>
+              ? <>Imported cluster — Kafka {cluster.kafka_version === 'external' ? 'unknown' : cluster.kafka_version} · via bootstrap servers</>
               : <>Kafka {cluster.kafka_version} / {cluster.mode.toUpperCase()}</>
             }
             <span className={`ml-3 px-2.5 py-0.5 rounded-full text-xs font-medium ${
@@ -286,6 +320,17 @@ export default function ClusterDetail() {
           )}
         </div>
       </div>
+
+      {/* Deploy progress + log viewer — visible while a deploy is running and
+          stays visible after a failure so the operator can read the full
+          ansible log without leaving the page. */}
+      {id && activeDeployTaskId && (
+        <DeployProgress
+          clusterId={id}
+          taskId={activeDeployTaskId}
+          onFinished={() => fetchDetail()}
+        />
+      )}
 
       {/* Tab bar */}
       <div className="flex border-b mb-6 overflow-x-auto">
@@ -450,14 +495,20 @@ export default function ClusterDetail() {
       {activeTab === 'security' && id && (
         <div className="space-y-6">
           {!isExternal && <TLSPanel clusterId={id} clusterRunning={isRunning} />}
-          <SecurityManager clusterId={id} />
+          <SecurityManager clusterId={id} isExternal={isExternal} />
         </div>
       )}
       {activeTab === 'ksqldb' && id && <KsqlManager clusterId={id} />}
+      {activeTab === 'schema-registry' && id && (
+        <ClusterSchemaRegistry clusterId={id} clusterHostIds={Array.from(clusterHostIds)} />
+      )}
       {activeTab === 'config' && id && <BrokerConfigManager clusterId={id} />}
       {activeTab === 'restart' && id && <RollingRestart clusterId={id} />}
       {activeTab === 'rebalance' && id && <PartitionRebalance clusterId={id} />}
       {activeTab === 'upgrade' && id && <UpgradeManager clusterId={id} currentVersion={cluster.kafka_version} />}
+      {activeTab === 'capacity' && id && <CapacityForecast clusterId={id} />}
+      {activeTab === 'monitoring' && id && <ClusterMonitoring clusterId={id} isExternal={isExternal} />}
+      {activeTab === 'lifecycle' && id && isExternal && <ExternalLifecycle clusterId={id} />}
 
       {activeTab === 'validate' && id && (
         <div>

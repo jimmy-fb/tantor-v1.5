@@ -73,10 +73,14 @@ class ConfigManager:
             if not host:
                 continue
             try:
+                from app.services import cluster_paths
                 with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                    config_path = f"{settings.KAFKA_INSTALL_DIR}/config/server.properties"
+                    config_path = f"{cluster_paths.install_dir(cluster)}/config/server.properties"
+                    # Kafka's server.properties is owned kafka:kafka mode 640
+                    # — the SSH user (ec2-user / tantor) can't read it without
+                    # sudo. Use `sudo -n` so we never block on a password prompt.
                     exit_code, stdout, stderr = SSHManager.exec_command(
-                        client, f"cat {config_path}", timeout=15
+                        client, f"sudo -n cat {config_path}", timeout=15
                     )
                     if exit_code == 0:
                         configs = self._parse_properties(stdout)
@@ -121,7 +125,9 @@ class ConfigManager:
             external_admin.alter_broker_config(cluster, broker_id, {config_key: config_value})
             # Audit log + return shape kept identical to the SSH path so the
             # frontend doesn't have to special-case external clusters.
-            from app.models.config_audit import ConfigAuditLog
+            # NOTE: ConfigAuditLog is already imported at module scope. Don't
+            # re-import here — Python would scope the name to this function
+            # only, breaking the managed-path branch below with UnboundLocalError.
             audit = ConfigAuditLog(
                 cluster_id=cluster_id, broker_id=broker_id,
                 config_key=config_key, old_value=None, new_value=config_value,
@@ -146,11 +152,12 @@ class ConfigManager:
         if not host:
             raise ValueError("Host not found")
 
-        config_path = f"{settings.KAFKA_INSTALL_DIR}/config/server.properties"
+        from app.services import cluster_paths
+        config_path = f"{cluster_paths.install_dir(cluster)}/config/server.properties"
 
         with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-            # Read current config
-            exit_code, stdout, stderr = SSHManager.exec_command(client, f"cat {config_path}", timeout=15)
+            # Read current config (sudo — file is owned by kafka:kafka mode 640)
+            exit_code, stdout, stderr = SSHManager.exec_command(client, f"sudo -n cat {config_path}", timeout=15)
             if exit_code != 0:
                 raise RuntimeError(f"Failed to read config: {stderr}")
 
@@ -173,8 +180,19 @@ class ConfigManager:
 
             new_content = "\n".join(new_lines) + "\n"
 
-            # Write back via SFTP
-            SSHManager.upload_content(client, new_content, config_path)
+            # Write back. SFTP can't write a file the SSH user doesn't own,
+            # so we stage in /tmp via SFTP then `sudo install` to the kafka
+            # location preserving the kafka:kafka ownership and 640 mode.
+            import uuid as _uuid
+            tmp_path = f"/tmp/tantor-{_uuid.uuid4().hex}.properties"
+            SSHManager.upload_content(client, new_content, tmp_path)
+            install_cmd = (
+                f"sudo -n install -o kafka -g kafka -m 640 {tmp_path} {config_path} "
+                f"&& sudo -n rm -f {tmp_path}"
+            )
+            rc, out, err = SSHManager.exec_command(client, install_cmd, timeout=15)
+            if rc != 0:
+                raise RuntimeError(f"Failed to write config (sudo install): {err or out}")
 
             # Audit log
             audit = ConfigAuditLog(
@@ -197,6 +215,60 @@ class ConfigManager:
                 "new_value": config_value,
                 "requires_restart": not KAFKA_BROKER_CONFIGS.get(config_key, {}).get("dynamic", False),
             }
+
+    def bulk_update_broker_config(
+        self, cluster_id: str, config_key: str, config_value: str,
+        username: str, db: Session,
+    ) -> dict:
+        """Apply a single config change to every broker in the cluster.
+
+        APB v1.4.0 #16. We loop the per-broker update so a failure on one
+        broker doesn't roll back already-succeeded brokers — the customer
+        operationally needs partial-success visibility (the UI can
+        highlight failed brokers and let them retry).
+        """
+        cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+        if not cluster:
+            raise ValueError("Cluster not found")
+
+        # External clusters: prefer kafka-python's incremental-alter to
+        # batch all brokers in a single Admin API call when possible.
+        if (cluster.kind or "managed") == "external":
+            from app.services import external_admin
+            services = []
+            try:
+                # describe_cluster gives synthetic broker rows for external
+                describe = external_admin.describe_cluster(cluster)
+                services = [{"node_id": b["broker_id"]} for b in describe.get("brokers", [])]
+            except Exception as e:
+                logger.warning("Failed to enumerate external brokers: %s", e)
+        else:
+            services = db.query(Service).filter(
+                Service.cluster_id == cluster_id,
+                Service.role.in_(["broker", "broker_controller"])
+            ).all()
+
+        results: list[dict] = []
+        success_count = 0
+        for svc in services:
+            broker_id = svc["node_id"] if isinstance(svc, dict) else svc.node_id
+            try:
+                r = self.update_broker_config(
+                    cluster_id, broker_id, config_key, config_value, username, db,
+                )
+                results.append({"broker_id": broker_id, "ok": True, "result": r})
+                success_count += 1
+            except (ValueError, RuntimeError) as e:
+                results.append({"broker_id": broker_id, "ok": False, "error": str(e)})
+
+        return {
+            "cluster_id": cluster_id,
+            "config_key": config_key,
+            "config_value": config_value,
+            "broker_count": len(results),
+            "success_count": success_count,
+            "results": results,
+        }
 
     def rollback_config(self, audit_id: str, username: str, db: Session) -> dict:
         """Rollback a config change by its audit log ID."""

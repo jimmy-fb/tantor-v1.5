@@ -1,9 +1,13 @@
 # Tantor — Client Handover
 
-**Build:** `tantor-installer-1.0.0.bin` (420 KB, generated `2026-04-28`)
+**Build:** `tantor-installer-1.0.0.bin` (424 KB, generated `2026-04-28`)
 **Branch:** `feat/qa-handover-sweep`
 **Default Kafka:** 4.1.0 (KRaft only)
 **Default Schema Registry:** Apicurio 3.1.7 (Apache 2)
+
+**Smoke-tested fresh on AWS (2026-04-28):**
+- Ubuntu 22.04 t3.xlarge → install + cluster create + deploy + 5/5 produce-consume validate → green
+- Rocky Linux 9.7 t3.xlarge → install + cluster create + deploy + 5/5 produce-consume validate → green
 
 ---
 
@@ -155,6 +159,12 @@ After install: open `http://<server-ip>` → login `admin` / `admin`. The instal
 ```
 
 ---
+
+## After `--reinstall`
+
+`--reinstall` reinstalls **Tantor itself** but does not auto-redeploy your Kafka clusters. The cluster rows are preserved, but the Kafka systemd unit and `/opt/kafka` are removed by the uninstall step. After `--reinstall`, click **Redeploy** on each cluster from the Clusters page (or hit `POST /api/clusters/{id}/deploy`) to bring brokers back online.
+
+`/var/lib/tantor/secrets/` (Fernet + JWT keys) is preserved across `--reinstall`, so existing host SSH credentials and TLS keystore passwords keep decrypting correctly. Only `--purge` wipes secrets along with the data dir.
 
 ## Known limitations
 

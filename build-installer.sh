@@ -20,7 +20,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.0.0"
+VERSION="1.4.0"
 WITH_KAFKA=false
 OUTPUT="tantor-installer-${VERSION}.bin"
 
@@ -49,9 +49,15 @@ cd "$SCRIPT_DIR/frontend"
 if [ ! -d node_modules ]; then
     npm ci --prefer-offline 2>/dev/null || npm install
 fi
-npm run build 2>&1 | tail -3
-if [ ! -f dist/index.html ]; then
-    echo -e "${RED}Frontend build failed — dist/index.html not found${NC}"
+# Pipefail-aware: previously `npm run build 2>&1 | tail -3` swallowed the
+# exit code, so a tsc failure would silently package the previous dist/.
+# Capture the exit code via PIPESTATUS and bail loudly.
+set -o pipefail
+npm run build 2>&1 | tail -10
+BUILD_RC=${PIPESTATUS[0]}
+set +o pipefail
+if [ "$BUILD_RC" != "0" ] || [ ! -f dist/index.html ]; then
+    echo -e "${RED}Frontend build failed (exit $BUILD_RC) — dist/index.html may be stale${NC}"
     exit 1
 fi
 echo -e "${GREEN}✓ Frontend built${NC}"
@@ -153,7 +159,7 @@ cat > "$INSTALLER" << 'HEADER_EOF'
 set -e
 
 ARCHIVE_LINE=$(awk '/^__ARCHIVE_BELOW__$/{print NR + 1; exit 0;}' "$0")
-VERSION="1.0.0"
+VERSION="1.4.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

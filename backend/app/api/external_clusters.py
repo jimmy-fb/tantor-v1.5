@@ -12,9 +12,13 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+import json
+
+from pydantic import BaseModel
 from app.api.deps import require_admin, require_monitor_or_above
 from app.database import get_db
 from app.models.cluster import Cluster
+from app.models.host import Host
 from app.models.user import User
 from app.schemas.external_cluster import (
     ExternalClusterCreate,
@@ -24,6 +28,8 @@ from app.schemas.external_cluster import (
     ExternalConnectionTestResponse,
 )
 from app.services import external_admin
+from app.services.crypto import decrypt
+from app.services.ssh_manager import SSHManager
 
 logger = logging.getLogger("tantor.external_clusters")
 
@@ -75,7 +81,7 @@ def create_external(
     secrets_dict = data.secrets.model_dump(exclude_none=True) if data.secrets else {}
     cluster = Cluster(
         name=data.name,
-        kafka_version="external",  # we don't deploy or upgrade these — version isn't ours to track
+        kafka_version="external",  # placeholder, replaced below if probe succeeds
         mode="kraft",
         kind="external",
         state="connected",
@@ -85,6 +91,15 @@ def create_external(
         ssl_verify=data.ssl_verify,
         encrypted_connection_secrets=external_admin.encrypt_secrets(secrets_dict) if secrets_dict else None,
     )
+    # Probe the cluster on add so we can store the real broker version
+    # instead of leaving the listing showing "external" / "unknown".
+    # Best-effort — connection failures don't block the create.
+    try:
+        probe = external_admin.test_connection(cluster)
+        if probe.get("success") and probe.get("kafka_version"):
+            cluster.kafka_version = probe["kafka_version"]
+    except Exception:
+        pass
     db.add(cluster)
     db.commit()
     db.refresh(cluster)
@@ -172,6 +187,11 @@ def test_connection_saved(
     if not cluster:
         raise HTTPException(status_code=404, detail="External cluster not found")
     result = external_admin.test_connection(cluster)
+    # If we successfully detected a real broker version, store it so the
+    # cluster listing shows "4.1.0" instead of "unknown" / "external".
+    if result.get("success") and result.get("kafka_version"):
+        cluster.kafka_version = result["kafka_version"]
+        db.commit()
     return ExternalConnectionTestResponse(**result)
 
 
@@ -290,3 +310,139 @@ def consume(
         raise HTTPException(status_code=422, detail=f"Missing field: {e}")
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+
+
+# ── SSH-based lifecycle for externally-managed clusters (APB v1.3) ──────────
+# An external cluster is one Tantor didn't deploy, so by default we can't
+# start/restart it — we don't know where the brokers run or what the systemd
+# unit is called. The operator can opt in by registering broker hosts (which
+# already have SSH credentials in Tantor's Host table) and the systemd unit
+# name. After that, /start, /stop, /restart issue `systemctl <action> <unit>`
+# on each host. We never touch Kafka data — this is just a remote button.
+
+
+class BrokerHostEntry(BaseModel):
+    host_id: str
+    kafka_unit: str = "kafka.service"
+
+
+class BrokerHostsRequest(BaseModel):
+    hosts: list[BrokerHostEntry]
+
+
+def _read_external_broker_hosts(cluster: Cluster) -> list[dict]:
+    if not cluster.external_broker_hosts_json:
+        return []
+    try:
+        return json.loads(cluster.external_broker_hosts_json)
+    except Exception:
+        return []
+
+
+@router.get("/{cluster_id}/broker-hosts")
+def list_broker_hosts(
+    cluster_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_monitor_or_above),
+):
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id, Cluster.kind == "external").first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="External cluster not found")
+    entries = _read_external_broker_hosts(cluster)
+    enriched = []
+    for e in entries:
+        h = db.query(Host).filter(Host.id == e["host_id"]).first()
+        enriched.append({
+            "host_id": e["host_id"],
+            "kafka_unit": e.get("kafka_unit", "kafka.service"),
+            "hostname": h.hostname if h else None,
+            "ip_address": h.ip_address if h else None,
+            "online": h.status == "online" if h else False,
+        })
+    return enriched
+
+
+@router.put("/{cluster_id}/broker-hosts")
+def set_broker_hosts(
+    cluster_id: str,
+    body: BrokerHostsRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id, Cluster.kind == "external").first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="External cluster not found")
+    # Validate every referenced host exists.
+    bad = []
+    for entry in body.hosts:
+        h = db.query(Host).filter(Host.id == entry.host_id).first()
+        if not h:
+            bad.append(entry.host_id)
+    if bad:
+        raise HTTPException(status_code=400, detail=f"Unknown host_id(s): {bad}")
+    cluster.external_broker_hosts_json = json.dumps(
+        [{"host_id": e.host_id, "kafka_unit": e.kafka_unit} for e in body.hosts]
+    )
+    db.commit()
+    return list_broker_hosts(cluster_id, db, _)
+
+
+def _systemctl_each(cluster_id: str, action: str, db: Session) -> list[dict]:
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id, Cluster.kind == "external").first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="External cluster not found")
+    entries = _read_external_broker_hosts(cluster)
+    if not entries:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "No broker hosts registered for this external cluster. "
+                "Configure them in the Lifecycle tab first."
+            ),
+        )
+    results = []
+    for e in entries:
+        host = db.query(Host).filter(Host.id == e["host_id"]).first()
+        if not host:
+            results.append({"host_id": e["host_id"], "ok": False, "message": "host record missing"})
+            continue
+        unit = e.get("kafka_unit", "kafka.service")
+        cmd = f"sudo systemctl {action} {unit}"
+        try:
+            with SSHManager.connect(
+                host.ip_address, host.ssh_port, host.username,
+                host.auth_type, host.encrypted_credential,
+            ) as client:
+                rc, stdout, stderr = SSHManager.exec_command(client, cmd, timeout=30)
+            results.append({
+                "host_id": e["host_id"],
+                "hostname": host.hostname,
+                "kafka_unit": unit,
+                "exit_code": rc,
+                "ok": rc == 0,
+                "message": (stdout or stderr or "").strip()[:300],
+            })
+        except Exception as ex:
+            results.append({
+                "host_id": e["host_id"],
+                "hostname": host.hostname,
+                "kafka_unit": unit,
+                "ok": False,
+                "message": f"ssh failed: {type(ex).__name__}: {ex}",
+            })
+    return results
+
+
+@router.post("/{cluster_id}/start")
+def start_external(cluster_id: str, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+    return {"results": _systemctl_each(cluster_id, "start", db)}
+
+
+@router.post("/{cluster_id}/stop")
+def stop_external(cluster_id: str, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+    return {"results": _systemctl_each(cluster_id, "stop", db)}
+
+
+@router.post("/{cluster_id}/restart")
+def restart_external(cluster_id: str, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+    return {"results": _systemctl_each(cluster_id, "restart", db)}

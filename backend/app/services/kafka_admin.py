@@ -1,6 +1,7 @@
 import json
 import re
 import secrets
+from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
@@ -13,6 +14,9 @@ from app.models.audit_log import AuditLog
 from app.services import external_admin
 from app.services.ssh_manager import SSHManager
 from app.services.crypto import encrypt
+
+if TYPE_CHECKING:
+    from app.models.user import User
 
 
 def _is_external(cluster_id: str, db: Session) -> Cluster | None:
@@ -39,23 +43,38 @@ class KafkaAdmin:
 
     @staticmethod
     def _get_broker(cluster_id: str, db: Session) -> tuple[Host, str]:
-        """Find a running broker and return (host, bootstrap_servers)."""
+        """Find a running broker and return (host, bootstrap_servers).
+
+        Kept for backward compat — new code should use _get_broker_with_paths
+        so it picks up the per-cluster Kafka install dir (APB v1.2.0 #5).
+        """
+        host, bootstrap, _ = KafkaAdmin._get_broker_with_paths(cluster_id, db)
+        return host, bootstrap
+
+    @staticmethod
+    def _get_broker_with_paths(cluster_id: str, db: Session) -> tuple[Host, str, str]:
+        """(host, bootstrap, kafka_install_dir) — single DB walk per call.
+
+        Per-cluster install dir prevents /opt/kafka collisions when two
+        Tantor-managed clusters run on the same broker host. Falls back to
+        the global default for clusters created before that field existed.
+        """
+        from app.services import cluster_paths
         svc = db.query(Service).filter(
             Service.cluster_id == cluster_id,
             Service.role.in_(["broker", "broker_controller"]),
         ).first()
         if not svc:
             raise ValueError("No broker found in cluster")
-
         host = db.query(Host).filter(Host.id == svc.host_id).first()
         if not host:
             raise ValueError("Broker host not found")
-
         cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
         config = json.loads(cluster.config_json) if cluster and cluster.config_json else {}
         port = config.get("listener_port", 9092)
         bootstrap = f"{host.ip_address}:{port}"
-        return host, bootstrap
+        kafka_dir = cluster_paths.install_dir(cluster) if cluster else cluster_paths.DEFAULT_INSTALL_DIR
+        return host, bootstrap, kafka_dir
 
     @staticmethod
     def _run_kafka_cmd(host: Host, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
@@ -69,8 +88,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.list_topics(ext)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         # Single SSH call to describe ALL topics at once (avoids N+1 SSH connections)
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
@@ -88,8 +106,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.get_topic_detail(ext, topic_name)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
             host, f"{kh}/bin/kafka-topics.sh --bootstrap-server {bootstrap} --describe --topic {topic_name}"
@@ -104,8 +121,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.create_topic(ext, name, partitions, replication_factor)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         cmd = (
             f"{kh}/bin/kafka-topics.sh --bootstrap-server {bootstrap} "
@@ -125,8 +141,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.delete_topic(ext, name)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
             host, f"{kh}/bin/kafka-topics.sh --bootstrap-server {bootstrap} --delete --topic {name}"
@@ -138,16 +153,16 @@ class KafkaAdmin:
     # ── Topic Settings ───────────────────────────────────
 
     @staticmethod
-    def alter_topic_config(cluster_id: str, topic_name: str, configs: dict, db: Session) -> dict:
+    def alter_topic_config(cluster_id: str, topic_name: str, configs: dict, db: Session,
+                            actor: "User | None" = None) -> dict:
         """Alter topic-level configuration (e.g. retention.ms, cleanup.policy)."""
         ext = _is_external(cluster_id, db)
         if ext:
             result = external_admin.alter_topic_config(ext, topic_name, configs)
-            KafkaAdmin._audit(db, cluster_id, "topic_config_altered", "topic", topic_name, str(configs))
+            KafkaAdmin._audit(db, cluster_id, "topic_config_altered", "topic", topic_name, str(configs), actor=actor)
             db.commit()
             return result
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         config_str = ",".join(f"{k}={v}" for k, v in configs.items())
         cmd = (
@@ -160,22 +175,22 @@ class KafkaAdmin:
         if exit_code != 0:
             raise ValueError(f"Failed to alter topic config: {stderr}")
 
-        KafkaAdmin._audit(db, cluster_id, "topic_config_altered", "topic", topic_name, str(configs))
+        KafkaAdmin._audit(db, cluster_id, "topic_config_altered", "topic", topic_name, str(configs), actor=actor)
         db.commit()
 
         return {"topic": topic_name, "updated": True, "configs": configs}
 
     @staticmethod
-    def increase_partitions(cluster_id: str, topic_name: str, new_count: int, db: Session) -> dict:
+    def increase_partitions(cluster_id: str, topic_name: str, new_count: int, db: Session,
+                              actor: "User | None" = None) -> dict:
         """Increase the partition count for an existing topic."""
         ext = _is_external(cluster_id, db)
         if ext:
             result = external_admin.increase_partitions(ext, topic_name, new_count)
-            KafkaAdmin._audit(db, cluster_id, "topic_partitions_increased", "topic", topic_name, f"to {new_count}")
+            KafkaAdmin._audit(db, cluster_id, "topic_partitions_increased", "topic", topic_name, f"to {new_count}", actor=actor)
             db.commit()
             return result
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         # Validate new_count > current partitions
         detail = KafkaAdmin.get_topic_detail(cluster_id, topic_name, db)
@@ -195,7 +210,7 @@ class KafkaAdmin:
             raise ValueError(f"Failed to increase partitions: {stderr}")
 
         KafkaAdmin._audit(db, cluster_id, "topic_partitions_increased", "topic", topic_name,
-                          f"from {current} to {new_count}")
+                          f"from {current} to {new_count}", actor=actor)
         db.commit()
 
         return {"topic": topic_name, "partitions": new_count, "updated": True}
@@ -207,8 +222,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.list_consumer_groups_with_lag(ext)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         # First get the list of groups
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
@@ -217,7 +231,34 @@ class KafkaAdmin:
         if exit_code != 0:
             raise ValueError(f"Failed to list consumer groups: {stderr}")
 
-        groups = [g.strip() for g in stdout.splitlines() if g.strip()]
+        # APB issue v1.2.0 #4 — kafka-consumer-groups.sh occasionally interleaves
+        # log lines, warnings, or "Error:" stderr into stdout. Without filtering,
+        # these end up in the UI as if they were group IDs (e.g. "[2024-01-05
+        # 10:00:00,123] WARN..." appears as a group). Restrict to lines that
+        # look like real Kafka group IDs: non-empty, no whitespace, ASCII
+        # printable, ≤ 256 chars (Kafka's max).
+        import re as _re
+        _GROUP_ID_PATTERN = _re.compile(r'^[A-Za-z0-9._\-]+$')
+        groups = []
+        for raw in stdout.splitlines():
+            g = raw.strip()
+            if not g:
+                continue
+            # Skip obvious noise
+            low = g.lower()
+            if (
+                g.startswith("[") or g.startswith("WARN") or g.startswith("INFO")
+                or g.startswith("ERROR") or g.startswith("Error:") or low.startswith("exception")
+                or "log4j" in low or " is deprecated " in low
+                or g.startswith("(") or " " in g
+            ):
+                continue
+            if len(g) > 256:
+                continue
+            # Final strict pattern check
+            if not _GROUP_ID_PATTERN.match(g):
+                continue
+            groups.append(g)
         if not groups:
             return []
 
@@ -273,8 +314,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.get_consumer_group_detail(ext, group_id)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
             host, f"{kh}/bin/kafka-consumer-groups.sh --bootstrap-server {bootstrap} --describe --group {group_id}"
@@ -291,8 +331,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.produce_message(ext, topic, key, value)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         # Escape value for shell
         safe_value = value.replace("'", "'\\''")
@@ -338,8 +377,7 @@ class KafkaAdmin:
         )
         if ext_msgs is not None:
             return ext_msgs
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         cmd_parts = [
             f"{kh}/bin/kafka-console-consumer.sh",
@@ -675,8 +713,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.list_scram_users(ext)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
             host,
@@ -705,7 +742,8 @@ class KafkaAdmin:
         return result
 
     @staticmethod
-    def create_scram_user(cluster_id: str, username: str, password: str | None, mechanism: str, db: Session) -> dict:
+    def create_scram_user(cluster_id: str, username: str, password: str | None, mechanism: str, db: Session,
+                            actor: "User | None" = None) -> dict:
         """Create a SCRAM user in Kafka and store encrypted password locally."""
         if not password:
             password = secrets.token_urlsafe(24)
@@ -717,14 +755,13 @@ class KafkaAdmin:
                 encrypted_password=encrypt(password),
             )
             db.add(kafka_user)
-            KafkaAdmin._audit(db, cluster_id, "user_created", "user", username, f"mechanism={mechanism}")
+            KafkaAdmin._audit(db, cluster_id, "user_created", "user", username, f"mechanism={mechanism}", actor=actor)
             db.commit()
             db.refresh(kafka_user)
             return {
                 "id": kafka_user.id, "username": username, "mechanism": mechanism, "password": password,
             }
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         safe_password = password.replace("'", "'\\''")
 
@@ -760,7 +797,8 @@ class KafkaAdmin:
         }
 
     @staticmethod
-    def delete_scram_user(cluster_id: str, username: str, db: Session) -> dict:
+    def delete_scram_user(cluster_id: str, username: str, db: Session,
+                            actor: "User | None" = None) -> dict:
         """Delete a SCRAM user from Kafka and remove from local DB."""
         ext = _is_external(cluster_id, db)
         if ext:
@@ -768,11 +806,10 @@ class KafkaAdmin:
             db.query(KafkaUser).filter(
                 KafkaUser.cluster_id == cluster_id, KafkaUser.username == username,
             ).delete()
-            KafkaAdmin._audit(db, cluster_id, "user_deleted", "user", username, "")
+            KafkaAdmin._audit(db, cluster_id, "user_deleted", "user", username, "", actor=actor)
             db.commit()
             return {"username": username, "deleted": True}
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         # Try both mechanisms to ensure full removal
         for mech in ["SCRAM-SHA-256", "SCRAM-SHA-512"]:
@@ -789,13 +826,14 @@ class KafkaAdmin:
             KafkaUser.username == username,
         ).delete()
 
-        KafkaAdmin._audit(db, cluster_id, "user_deleted", "user", username)
+        KafkaAdmin._audit(db, cluster_id, "user_deleted", "user", username, actor=actor)
         db.commit()
 
         return {"username": username, "deleted": True, "message": f"User '{username}' deleted"}
 
     @staticmethod
-    def rotate_scram_password(cluster_id: str, username: str, password: str | None, db: Session) -> dict:
+    def rotate_scram_password(cluster_id: str, username: str, password: str | None, db: Session,
+                                actor: "User | None" = None) -> dict:
         """Rotate the password for an existing SCRAM user."""
         from datetime import datetime, timezone
 
@@ -812,7 +850,7 @@ class KafkaAdmin:
             if existing:
                 existing.encrypted_password = encrypt(password)
                 existing.updated_at = datetime.now(timezone.utc)
-            KafkaAdmin._audit(db, cluster_id, "user_password_rotated", "user", username, "")
+            KafkaAdmin._audit(db, cluster_id, "user_password_rotated", "user", username, "", actor=actor)
             db.commit()
             return {"username": username, "password": password, "rotated": True}
 
@@ -823,8 +861,7 @@ class KafkaAdmin:
 
         mechanism = local_user.mechanism if local_user else "SCRAM-SHA-256"
 
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
         safe_password = password.replace("'", "'\\''")
 
         cmd = (
@@ -842,7 +879,7 @@ class KafkaAdmin:
             local_user.encrypted_password = encrypt(password)
             local_user.updated_at = datetime.now(timezone.utc)
 
-        KafkaAdmin._audit(db, cluster_id, "user_password_rotated", "user", username)
+        KafkaAdmin._audit(db, cluster_id, "user_password_rotated", "user", username, actor=actor)
         db.commit()
 
         return {
@@ -865,8 +902,7 @@ class KafkaAdmin:
         ext = _is_external(cluster_id, db)
         if ext:
             return external_admin.list_acls(ext, principal, resource_type, resource_name)
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         cmd = f"{kh}/bin/kafka-acls.sh --bootstrap-server {bootstrap} --list"
         if principal:
@@ -889,7 +925,8 @@ class KafkaAdmin:
         return KafkaAdmin._parse_acl_list(stdout)
 
     @staticmethod
-    def create_acl(cluster_id: str, acl_req: dict, db: Session) -> dict:
+    def create_acl(cluster_id: str, acl_req: dict, db: Session,
+                    actor: "User | None" = None) -> dict:
         """Create one or more ACL entries in Kafka."""
         ext = _is_external(cluster_id, db)
         if ext:
@@ -906,6 +943,7 @@ class KafkaAdmin:
                     db, cluster_id, "acl_created", "acl",
                     f"{acl_req['principal']}::{acl_req['resource_type']}:{acl_req['resource_name']}::{op}",
                     f"permission={acl_req.get('permission_type', 'Allow')}",
+                    actor=actor,
                 )
             db.commit()
             return {
@@ -913,8 +951,7 @@ class KafkaAdmin:
                 "message": f"ACL(s) created via kafka-python AdminClient on external cluster",
                 "acls_added": len(results),
             }
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         principal = acl_req["principal"]
         resource_type = acl_req["resource_type"].lower()
@@ -963,13 +1000,14 @@ class KafkaAdmin:
             "pattern_type": pattern_type,
             "permission_type": permission_type,
         })
-        KafkaAdmin._audit(db, cluster_id, "acl_created", "acl", f"{principal}:{resource_name}", details)
+        KafkaAdmin._audit(db, cluster_id, "acl_created", "acl", f"{principal}:{resource_name}", details, actor=actor)
         db.commit()
 
         return {"success": True, "message": stdout.strip() or "ACL(s) created", "acls_added": len(operations)}
 
     @staticmethod
-    def delete_acl(cluster_id: str, acl_req: dict, db: Session) -> dict:
+    def delete_acl(cluster_id: str, acl_req: dict, db: Session,
+                    actor: "User | None" = None) -> dict:
         """Delete ACL entries from Kafka."""
         ext = _is_external(cluster_id, db)
         if ext:
@@ -981,6 +1019,7 @@ class KafkaAdmin:
                     db, cluster_id, "acl_deleted", "acl",
                     f"{acl_req['principal']}::{acl_req['resource_type']}:{acl_req['resource_name']}::{op}",
                     "",
+                    actor=actor,
                 )
             db.commit()
             return {
@@ -988,8 +1027,7 @@ class KafkaAdmin:
                 "message": "ACL(s) deleted via kafka-python AdminClient on external cluster",
                 "acls_deleted": len(acl_req["operations"]),
             }
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         principal = acl_req["principal"]
         resource_type = acl_req["resource_type"].lower()
@@ -1033,7 +1071,7 @@ class KafkaAdmin:
             "resource_name": resource_name,
             "operations": operations,
         })
-        KafkaAdmin._audit(db, cluster_id, "acl_deleted", "acl", f"{principal}:{resource_name}", details)
+        KafkaAdmin._audit(db, cluster_id, "acl_deleted", "acl", f"{principal}:{resource_name}", details, actor=actor)
         db.commit()
 
         return {"success": True, "message": stdout.strip() or "ACL(s) deleted"}
@@ -1110,8 +1148,7 @@ class KafkaAdmin:
         """Describe all topics and build broker-to-partition distribution map."""
         if _is_external(cluster_id, db):
             _external_only_unsupported("Partition rebalance/reassignment")
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
             host, f"{kh}/bin/kafka-topics.sh --bootstrap-server {bootstrap} --describe",
@@ -1180,8 +1217,7 @@ class KafkaAdmin:
     @staticmethod
     def generate_reassignment_plan(cluster_id: str, topics: list[str], broker_ids: list[int], db: Session) -> dict:
         """Generate a partition reassignment plan using kafka-reassign-partitions.sh."""
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         topics_json = json.dumps({"topics": [{"topic": t} for t in topics], "version": 1})
         broker_list = ",".join(str(b) for b in broker_ids)
@@ -1232,8 +1268,7 @@ class KafkaAdmin:
     @staticmethod
     def execute_reassignment(cluster_id: str, reassignment_json: dict, db: Session) -> dict:
         """Execute a partition reassignment plan."""
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         reassign_str = json.dumps(reassignment_json)
         safe_json = reassign_str.replace("'", "'\\''")
@@ -1261,8 +1296,7 @@ class KafkaAdmin:
     @staticmethod
     def verify_reassignment(cluster_id: str, reassignment_json: dict, db: Session) -> dict:
         """Verify the status of a partition reassignment."""
-        host, bootstrap = KafkaAdmin._get_broker(cluster_id, db)
-        kh = settings.KAFKA_INSTALL_DIR
+        host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         reassign_str = json.dumps(reassignment_json)
         safe_json = reassign_str.replace("'", "'\\''")
@@ -1301,14 +1335,22 @@ class KafkaAdmin:
 
     @staticmethod
     def _audit(db: Session, cluster_id: str, action: str, resource_type: str,
-               resource_name: str, details: str | None = None):
-        """Create an audit log entry."""
+               resource_name: str, details: str | None = None,
+               actor: "User | None" = None):
+        """Create an audit log entry.
+
+        actor is the calling User (from FastAPI dependency); we capture
+        both id + username so the activity feed can show "alice rotated
+        password for foo" even after the User row is later deleted.
+        """
         log = AuditLog(
             cluster_id=cluster_id,
             action=action,
             resource_type=resource_type,
             resource_name=resource_name,
             details=details,
+            actor_user_id=getattr(actor, "id", None) if actor else None,
+            actor_username=getattr(actor, "username", None) if actor else None,
         )
         db.add(log)
 

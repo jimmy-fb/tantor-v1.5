@@ -32,6 +32,18 @@ _REQUIRED_COLUMNS: list[tuple[str, str, str, str | None]] = [
     ("clusters", "encrypted_tls_password", "TEXT", None),
     # QA #51: environment tagging for cluster organization
     ("clusters", "environment", "VARCHAR(40)", "DEFAULT ''"),
+    # APB v1.3: SSH broker hosts for externally-managed clusters (start/restart)
+    ("clusters", "external_broker_hosts_json", "TEXT", None),
+    # APB v1.3.5 — multi-cluster /opt/kafka collision fix
+    ("clusters", "kafka_install_dir", "VARCHAR(255)", None),
+    ("clusters", "kafka_data_dir", "VARCHAR(255)", None),
+    ("clusters", "kafka_unit_name", "VARCHAR(120)", None),
+    # APB v1.4.0 — capture actor on every audit row (#13)
+    ("audit_logs", "actor_user_id", "VARCHAR(36)", None),
+    ("audit_logs", "actor_username", "VARCHAR(255)", None),
+    # APB v1.4.0 — LDAP-vs-manual user provenance (#11)
+    ("users", "auth_source", "VARCHAR(20)", "DEFAULT 'local'"),
+    ("users", "ldap_dn", "VARCHAR(500)", None),
 ]
 
 

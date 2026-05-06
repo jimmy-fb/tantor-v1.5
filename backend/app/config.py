@@ -1,9 +1,16 @@
+import os
 from pathlib import Path
 
 from pydantic_settings import BaseSettings
 from cryptography.fernet import Fernet
 
-_BASE_DIR = Path(__file__).parent.parent
+# In-tree dev mode and the prod systemd unit both work: the unit sets
+# TANTOR_HOME / TANTOR_DATA / TANTOR_LOG when the operator used
+# `--install-dir` (APB v1.2.0 #1 / v1.1 #43). Falling back to
+# Path(__file__).parent.parent keeps `python -m app.main` working in dev.
+_BASE_DIR = Path(os.environ.get("TANTOR_HOME", "")).resolve() if os.environ.get("TANTOR_HOME") else Path(__file__).parent.parent
+_DATA_DIR_ENV = os.environ.get("TANTOR_DATA", "").strip()
+_LOG_DIR_ENV = os.environ.get("TANTOR_LOG", "").strip()
 
 
 def _load_or_generate_key(key_file: Path) -> str:
@@ -16,12 +23,28 @@ def _load_or_generate_key(key_file: Path) -> str:
     key = Fernet.generate_key().decode()
     key_file.parent.mkdir(parents=True, exist_ok=True)
     key_file.write_text(key)
+    try:
+        os.chmod(key_file, 0o600)
+    except OSError:
+        pass
     return key
 
 
-_SECRETS_DIR = _BASE_DIR / ".secrets"
-_DEFAULT_FERNET_KEY = _load_or_generate_key(_SECRETS_DIR / "fernet.key")
-_DEFAULT_JWT_KEY = _load_or_generate_key(_SECRETS_DIR / "jwt.key")
+# Secrets must live alongside the SQLite DB (TANTOR_DATA in production) so
+# that --reinstall — which wipes the app dir but preserves the data dir —
+# keeps the keys that decrypt existing rows. Falling back to the in-tree
+# ./.secrets directory keeps `python -m app.main` working in dev mode.
+_secrets_env = os.environ.get("TANTOR_SECRETS_DIR", "").strip()
+if _secrets_env:
+    _DATA_SECRETS = Path(_secrets_env)
+elif _DATA_DIR_ENV:
+    _DATA_SECRETS = Path(_DATA_DIR_ENV) / "secrets"
+else:
+    _PROD_SECRETS = Path("/var/lib/tantor/secrets")
+    _DATA_SECRETS = _PROD_SECRETS if _PROD_SECRETS.parent.exists() else (_BASE_DIR / ".secrets")
+
+_DEFAULT_FERNET_KEY = _load_or_generate_key(_DATA_SECRETS / "fernet.key")
+_DEFAULT_JWT_KEY = _load_or_generate_key(_DATA_SECRETS / "jwt.key")
 
 
 class Settings(BaseSettings):

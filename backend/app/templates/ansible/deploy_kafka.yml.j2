@@ -67,25 +67,14 @@
         mode: "0644"
 
     # ── Cleanup stale Kafka services ─────────────────────────────────
-    - name: Find all existing kafka systemd units
-      find:
-        paths: /etc/systemd/system
-        patterns: "kafka*.service"
-      register: existing_kafka_services
-
-    - name: Stop and disable stale Kafka services
+    # APB v1.2.0 #5 — DO NOT wipe every kafka*.service unit. The previous
+    # logic blew away neighboring Tantor clusters' units. Stop ONLY this
+    # cluster's unit (idempotent: ignore-error if it doesn't exist yet).
+    - name: Stop existing instance of this cluster's Kafka unit (if any)
       systemd:
-        name: "{{ '{{' }} item.path | basename {{ '}}' }}"
+        name: "{{ kafka_unit_name }}"
         state: stopped
-        enabled: false
-      loop: "{{ '{{' }} existing_kafka_services.files {{ '}}' }}"
       ignore_errors: true
-
-    - name: Remove stale Kafka service files
-      file:
-        path: "{{ '{{' }} item.path {{ '}}' }}"
-        state: absent
-      loop: "{{ '{{' }} existing_kafka_services.files {{ '}}' }}"
 
     - name: Reload systemd after cleanup
       systemd:
@@ -130,19 +119,25 @@
         path: "{{ kafka_install_dir }}/bin/kafka-server-start.sh"
       register: kafka_bin
 
-    - name: Extract Kafka
+    # APB v1.2.0 #5 — extract directly INTO the per-cluster install dir
+    # (NOT a symlink to a shared /opt/kafka_X.Y.Z). Two clusters on the
+    # same host need two physical Kafka trees so their server.properties,
+    # config/log4j2.yaml, and any other config edits don't share state.
+    - name: Ensure per-cluster install dir exists
+      file:
+        path: "{{ kafka_install_dir }}"
+        state: directory
+        owner: kafka
+        group: kafka
+        mode: "0755"
+
+    - name: Extract Kafka into per-cluster install dir
       unarchive:
         src: "/tmp/{{ kafka_binary_filename }}"
-        dest: /opt/
-        remote_src: true
-      when: not kafka_bin.stat.exists
-
-    - name: Symlink Kafka home
-      file:
-        src: "/opt/{{ kafka_binary_filename | replace('.tgz', '') }}"
         dest: "{{ kafka_install_dir }}"
-        state: link
-        force: true
+        remote_src: true
+        extra_opts: ["--strip-components=1"]
+      when: not kafka_bin.stat.exists
 
     - name: Set Kafka ownership
       file:
@@ -206,6 +201,27 @@
         group: kafka
         mode: "0640"
 
+    # APB v1.4.0 #5 — ship a known-good log4j2.yaml. The tarball includes
+    # one but we've seen extract-time permission glitches that cause
+    # broker startup to dump StatusLogger reconfiguration errors into
+    # journalctl. Owning the file ourselves removes that whole class of
+    # bug AND lets us pin the log layout.
+    - name: Upload Tantor log4j2.yaml
+      copy:
+        src: "{{ log4j2_local_path }}"
+        dest: "{{ kafka_install_dir }}/config/log4j2.yaml"
+        owner: kafka
+        group: kafka
+        mode: "0640"
+
+    - name: Mirror log4j2.yaml as tools-log4j2.yaml so kafka-storage.sh and friends emit clean output
+      copy:
+        src: "{{ log4j2_local_path }}"
+        dest: "{{ kafka_install_dir }}/config/tools-log4j2.yaml"
+        owner: kafka
+        group: kafka
+        mode: "0640"
+
     # ── Validate node_id vs meta.properties ────────────────────────
     - name: Check if meta.properties exists
       stat:
@@ -257,10 +273,12 @@
         - existing_node_id.stdout != config_node_id.stdout
 
     # ── Upload systemd unit with JAVA_HOME ─────────────────────────
+    # Per-cluster unit name (APB v1.2.0 #5) so two clusters on the same
+    # host don't fight over /etc/systemd/system/kafka.service.
     - name: Upload systemd unit
       copy:
         src: "{{ systemd_dir }}/{{ '{{' }} ansible_host {{ '}}' }}_{{ '{{' }} node_id {{ '}}' }}_kafka.service"
-        dest: /etc/systemd/system/kafka.service
+        dest: /etc/systemd/system/{{ kafka_unit_name }}
         mode: "0644"
 
     - name: Reload systemd
@@ -277,24 +295,90 @@
       become_user: kafka
       environment:
         JAVA_HOME: "{{ '{{' }} discovered_java_home {{ '}}' }}"
+        # APB v1.4.0 #5 — point CLI tools at the tools-log4j2.yaml we ship
+        # so kafka-storage.sh format doesn't print "ERROR StatusLogger
+        # No log4j2 configuration file found" during deploy.
+        KAFKA_LOG4J_OPTS: "-Dlog4j2.configurationFile=file:{{ kafka_install_dir }}/config/tools-log4j2.yaml"
 {% endif %}
 
     - name: Enable and start Kafka
       systemd:
-        name: kafka
+        name: "{{ kafka_unit_name }}"
         enabled: true
         state: started
 
-    # ── Health check: wait for Kafka to be ready ───────────────────
+    # Cold JVM + KRaft metadata replay can take >60s on small VMs. Give it
+    # real headroom AND fail-fast if systemd already reports the unit failed
+    # so the operator gets a useful error instead of a 60s timeout silence.
+    # If we DO time out, attach the last 80 lines of journalctl so the
+    # deploy task logs (and thus the UI Deploy Progress panel) tell the
+    # operator exactly why Kafka didn't come up.
+    - name: Sleep briefly so systemd can transition the unit
+      pause: { seconds: 2 }
+
+    - name: Pre-check — bail early if Kafka unit already failed
+      command: systemctl is-failed {{ kafka_unit_name }}
+      register: kafka_prefail
+      changed_when: false
+      failed_when: false
+
+    - name: Capture journalctl when systemd reports kafka failed
+      command: journalctl -u {{ kafka_unit_name }} --no-pager -n 80
+      register: kafka_early_journal
+      changed_when: false
+      when: kafka_prefail.stdout == 'failed'
+
+    - name: Surface kafka early-failure log
+      fail:
+        msg: |
+          {{ kafka_unit_name }} failed to start. Last 80 lines of journalctl:
+
+          {{ '{{' }} kafka_early_journal.stdout {{ '}}' }}
+      when: kafka_prefail.stdout == 'failed'
+
     - name: Wait for Kafka to start listening
       wait_for:
         port: {{ cluster_config.get('listener_port', 9092) }}
         host: "{{ '{{' }} ansible_host {{ '}}' }}"
-        timeout: 60
+        timeout: 180
         delay: 5
+      register: kafka_port_wait
+      ignore_errors: true
+
+    - name: Capture journalctl on port-wait timeout
+      command: journalctl -u {{ kafka_unit_name }} --no-pager -n 80
+      register: kafka_late_journal
+      changed_when: false
+      when: kafka_port_wait is failed
+
+    - name: Capture systemctl status on port-wait timeout
+      command: systemctl status {{ kafka_unit_name }} --no-pager -l
+      register: kafka_late_status
+      changed_when: false
+      when: kafka_port_wait is failed
+
+    - name: Fail with full diagnostic when Kafka never bound the port
+      fail:
+        msg: |
+          Kafka did not start listening on port {{ cluster_config.get('listener_port', 9092) }}
+          within 180s on host {{ '{{' }} ansible_host {{ '}}' }}.
+
+          systemctl status kafka:
+          {{ '{{' }} kafka_late_status.stdout {{ '}}' }}
+
+          Last 80 lines of journalctl -u kafka:
+          {{ '{{' }} kafka_late_journal.stdout {{ '}}' }}
+
+          Common causes:
+            - firewalld blocking the listener port (run: firewall-cmd --add-port={{ cluster_config.get('listener_port', 9092) }}/tcp --permanent && firewall-cmd --reload)
+            - SELinux denying bind (audit2allow on /var/log/audit/audit.log)
+            - advertised.listeners pointing at an IP this host can't bind
+            - /var/lib/kafka/data permissions wrong (chown -R kafka:kafka)
+            - Stale meta.properties from a previous cluster (rm -rf /var/lib/kafka/data/* and re-deploy)
+      when: kafka_port_wait is failed
 
     - name: Verify Kafka process is running
-      command: systemctl is-active kafka
+      command: systemctl is-active {{ kafka_unit_name }}
       register: kafka_status
       changed_when: false
       failed_when: kafka_status.stdout != "active"

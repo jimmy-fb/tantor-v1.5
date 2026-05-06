@@ -98,7 +98,11 @@ export interface DeploymentTask {
   task_id: string;
   cluster_id: string;
   status: string;
+  current_step?: string;
   logs?: string[];
+  error_message?: string;
+  started_at?: string;
+  finished_at?: string;
 }
 
 export interface ServiceAction {
@@ -314,6 +318,7 @@ export interface AuditLogEntry {
   resource_type: string;
   resource_name: string;
   details: string | null;
+  actor_username: string | null;
   created_at: string;
 }
 
@@ -335,6 +340,24 @@ export interface ConnectorPluginInfo {
   class_name: string;
   type: string;
   version: string | null;
+}
+
+export interface CdcTemplateField {
+  key: string;
+  label: string;
+  required?: boolean;
+  default?: string;
+  placeholder?: string;
+  secret?: boolean;
+}
+
+export interface CdcTemplate {
+  id: string;
+  name: string;
+  connector_class: string;
+  description: string;
+  fields: CdcTemplateField[];
+  fixed?: Record<string, string>;
 }
 
 // ---- ksqlDB types ----
@@ -416,6 +439,8 @@ export interface UserResponse {
   username: string;
   role: string;
   is_active: boolean;
+  auth_source?: string;          // "local" | "ldap"
+  ldap_dn?: string | null;
   created_at: string;
   last_login: string | null;
 }
@@ -467,4 +492,18 @@ export interface ExporterStatus {
   hostname: string;
   node_exporter: string;
   jmx_exporter: string;
+}
+
+export interface CapacityForecast {
+  available: boolean;
+  reason?: string;
+  history: Array<{ t: number; used_bytes: number }>;
+  forecast: Array<{ t: number; used_bytes: number }>;
+  total_bytes: number;
+  current_used_bytes: number;
+  current_used_pct: number;
+  growth_bytes_per_day: number;
+  eta_to_threshold_unix: number | null;
+  eta_to_threshold_days: number | null;
+  full_threshold: number;
 }

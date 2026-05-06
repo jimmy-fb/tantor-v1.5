@@ -42,7 +42,18 @@ def _log(task_id: str, message: str):
 
 
 def _get_broker_addresses(cluster_id: str, db: Session) -> list[str]:
-    """Get bootstrap server addresses for a cluster (broker IPs with port 9092)."""
+    """Get bootstrap server addresses for a cluster.
+
+    APB v1.4.0 #4 — external clusters have no Service rows, so we fall
+    back to their saved `bootstrap_servers` field. Without this fix
+    cluster-linking refused to create any link involving an external
+    cluster ("Source cluster has no brokers").
+    """
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if cluster and (cluster.kind or "managed") == "external":
+        bs = (cluster.bootstrap_servers or "").strip()
+        return [s.strip() for s in bs.split(",") if s.strip()]
+
     services = db.query(Service).filter(
         Service.cluster_id == cluster_id,
         Service.role.in_(["broker", "broker_controller"]),
@@ -52,7 +63,16 @@ def _get_broker_addresses(cluster_id: str, db: Session) -> list[str]:
     for svc in services:
         host = hosts.get(svc.host_id)
         if host:
-            addresses.append(f"{host.ip_address}:9092")
+            # Use the cluster's listener port if recorded; default 9092.
+            port = 9092
+            if cluster and cluster.config_json:
+                try:
+                    import json as _json
+                    cfg = _json.loads(cluster.config_json or "{}")
+                    port = int(cfg.get("listener_port") or 9092)
+                except Exception:
+                    pass
+            addresses.append(f"{host.ip_address}:{port}")
     return addresses
 
 
@@ -155,12 +175,25 @@ class ClusterLinkingManager:
             source_brokers, dest_brokers, topics_pattern, sync_offsets, sync_configs
         )
 
-        # Pick a deploy host from the source cluster
-        source_services = db.query(Service).filter(
-            Service.cluster_id == source_cluster_id,
-            Service.role.in_(["broker", "broker_controller"]),
-        ).all()
-        deploy_host_id = source_services[0].host_id if source_services else None
+        # Pick a deploy host. Preference order:
+        #   1. A broker host from the source cluster (managed)
+        #   2. A broker host from the destination cluster (managed)
+        #   3. ANY Tantor-registered host (we just need somewhere to run MM2)
+        # APB v1.4.0 #4 — without this, an external→external or
+        # external→managed link fails with "no deploy host configured".
+        deploy_host_id = None
+        for cid in (source_cluster_id, dest_cluster_id):
+            svcs = db.query(Service).filter(
+                Service.cluster_id == cid,
+                Service.role.in_(["broker", "broker_controller"]),
+            ).all()
+            if svcs:
+                deploy_host_id = svcs[0].host_id
+                break
+        if not deploy_host_id:
+            any_host = db.query(Host).first()
+            if any_host:
+                deploy_host_id = any_host.id
 
         link = ClusterLink(
             name=name,

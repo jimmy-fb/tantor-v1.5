@@ -13,7 +13,7 @@ from app.models.cluster import Cluster
 from app.models.deployment_task import DeploymentTask
 from app.models.host import Host
 from app.models.service import Service
-from app.services import cert_manager
+from app.services import cert_manager, cluster_paths
 from app.services.ansible_runner import ansible_runner
 from app.services.config_generator import config_generator
 from app.services.crypto import decrypt
@@ -349,24 +349,25 @@ def _run_ansible_deployment(
             svc_info, all_service_infos, cluster_config
         )
 
+        kafka_dir = cluster_paths.install_dir(cluster)
         if role in ("broker", "broker_controller", "controller"):
             config_name = f"{ip}_{nid}_server.properties"
-            remote_config = f"{settings.KAFKA_INSTALL_DIR}/config/server.properties"
+            remote_config = f"{kafka_dir}/config/server.properties"
         elif role == "ksqldb":
             config_name = f"{ip}_{nid}_ksql-server.properties"
             remote_config = f"{settings.KSQLDB_INSTALL_DIR}/config/ksql-server.properties"
         elif role == "kafka_connect":
             config_name = f"{ip}_{nid}_connect-distributed.properties"
-            remote_config = f"{settings.KAFKA_INSTALL_DIR}/config/connect-distributed.properties"
+            remote_config = f"{kafka_dir}/config/connect-distributed.properties"
         elif role == "zookeeper":
             config_name = f"{ip}_{nid}_zookeeper.properties"
-            remote_config = f"{settings.KAFKA_INSTALL_DIR}/config/zookeeper.properties"
+            remote_config = f"{kafka_dir}/config/zookeeper.properties"
         elif role == "schema_registry":
             config_name = f"{ip}_{nid}_apicurio.properties"
             remote_config = f"{settings.APICURIO_INSTALL_DIR}/application.properties"
         else:
             config_name = f"{ip}_{nid}_server.properties"
-            remote_config = f"{settings.KAFKA_INSTALL_DIR}/config/server.properties"
+            remote_config = f"{kafka_dir}/config/server.properties"
 
         configs[config_name] = config_content
 
@@ -380,13 +381,16 @@ def _run_ansible_deployment(
         }
         service_type = service_type_map.get(role, "kafka")
         unit_content = config_generator.generate_systemd_unit(
-            service_type, remote_config, settings.KAFKA_INSTALL_DIR, settings.KSQLDB_INSTALL_DIR
+            service_type, remote_config, kafka_dir, settings.KSQLDB_INSTALL_DIR,
+            unit_name=cluster_paths.unit_name(cluster) if service_type == "kafka" else None,
+            kafka_log_dir=settings.KAFKA_LOG_DIR,
         )
         unit_name = f"{ip}_{nid}_{service_type}.service"
         systemd_units[unit_name] = unit_content
 
     configs_dir = ansible_runner.write_config_files(work_dir, configs)
     systemd_dir = ansible_runner.write_systemd_units(work_dir, systemd_units)
+    log4j2_path = ansible_runner.write_kafka_log4j2(work_dir, settings.KAFKA_LOG_DIR)
     log(f"Generated {len(configs)} configs and {len(systemd_units)} systemd units")
 
     # Determine which role groups exist
@@ -443,18 +447,21 @@ def _run_ansible_deployment(
             apicurio_tgz = existing[-1].name
             log(f"Using Apicurio binary: {apicurio_tgz} ({existing[-1].stat().st_size // (1024*1024)} MB)")
 
-    # Generate playbook
+    # Generate playbook. Kafka paths are PER-CLUSTER (APB v1.2.0 #5) so two
+    # managed clusters on the same host don't collide on /opt/kafka.
     playbook_path = ansible_runner.generate_playbook(work_dir, "deploy_kafka.yml.j2", {
-        "kafka_install_dir": settings.KAFKA_INSTALL_DIR,
+        "kafka_install_dir": cluster_paths.install_dir(cluster),
+        "kafka_unit_name": cluster_paths.unit_name(cluster),
         "kafka_binary_filename": kafka_tgz,
         "kafka_binary_local_path": str(kafka_tgz_path),
-        "kafka_data_dir": cluster_config.get("log_dirs", settings.KAFKA_DATA_DIR),
+        "kafka_data_dir": cluster_paths.data_dir(cluster),
         "kafka_log_dir": settings.KAFKA_LOG_DIR,
         "cluster_uuid": cluster_uuid,
         "cluster_mode": cluster.mode,
         "cluster_config": cluster_config,
         "configs_dir": str(configs_dir),
         "systemd_dir": str(systemd_dir),
+        "log4j2_local_path": str(log4j2_path),
         "has_brokers": has_brokers,
         "has_controllers": has_controllers,
         "has_ksqldb": has_ksqldb,
@@ -491,6 +498,44 @@ def _run_ansible_deployment(
             svc.status = "running"
         cluster.state = "running"
         db.commit()
+
+        # Auto-deploy monitoring + alerting on the same host as the first broker.
+        # Best-effort — if monitoring deploy fails the cluster is still usable;
+        # operator can retry from the Monitoring page. We pre-seed the four
+        # default rule templates so the alerting story works out of the box.
+        try:
+            from app.services.monitoring_deployer import MonitoringDeployer
+            from app.services import alert_manager as _am
+            mon_host_id = services[0].host_id if services else None
+            if mon_host_id:
+                log("Auto-deploying monitoring stack (Prometheus + Alertmanager + Grafana + JMX)...")
+                mon_result = MonitoringDeployer.deploy_monitoring_stack(
+                    cluster_id=cluster.id,
+                    monitoring_host_id=mon_host_id,
+                    grafana_port=settings.GRAFANA_PORT,
+                    prometheus_port=settings.PROMETHEUS_PORT,
+                    db=db,
+                )
+                ok_steps = sum(1 for s in mon_result.get("steps", []) if s.get("status") == "success")
+                log(f"Monitoring deployed ({ok_steps}/{len(mon_result.get('steps', []))} steps green)")
+                seeded = _am.seed_default_rules(cluster.id, db)
+                if seeded:
+                    log(f"Seeded {seeded} default alert rule(s)")
+                    # Re-render Prometheus rules.yml + reload — the monitoring
+                    # deploy above wrote an empty rules file because the seed
+                    # had not run yet.
+                    try:
+                        from app.models.host import Host as _Host
+                        mon_host = db.query(_Host).filter(_Host.id == mon_host_id).first()
+                        if mon_host:
+                            MonitoringDeployer._render_alerting_files(cluster.id, mon_host, db)
+                            log("Prometheus rules reloaded with seeded alerts")
+                    except Exception as render_e:
+                        log(f"Rules render after seed failed (non-fatal): {render_e}")
+        except Exception as mon_e:
+            # Don't fail the cluster deploy on a monitoring hiccup.
+            log(f"Monitoring auto-deploy failed (cluster is still up): {mon_e}")
+
         _set_status(db, task_id, "completed")
         _set_step(db, task_id, "Completed")
         log("")
@@ -506,3 +551,157 @@ def _run_ansible_deployment(
     # Cleanup
     ansible_runner.cleanup_workspace(work_dir)
     log("Workspace cleaned up")
+
+
+def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: str) -> None:
+    """Add an Apicurio Schema Registry to an already-deployed cluster (APB v1.4.0 #2).
+
+    Runs in a background thread the same way deploy_cluster does. Uses
+    deploy_schema_registry.yml.j2 — a compact playbook that ONLY touches
+    the SR install dir + systemd unit, leaving brokers untouched.
+    """
+    import base64, uuid as _uuid
+    from app.services.crypto import decrypt
+    from app.models.service import Service as _Service
+
+    db = SessionLocal()
+    try:
+        cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+        if not cluster:
+            _set_status(db, task_id, "error", error_message="Cluster not found")
+            return
+
+        host = db.query(Host).filter(Host.id == host_id).first()
+        if not host:
+            _set_status(db, task_id, "error", error_message="Host not found")
+            return
+
+        def log(msg: str = ""):
+            _append_log(db, task_id, msg)
+
+        log(f"Adding Schema Registry to cluster '{cluster.name}' on {host.ip_address}:{port}")
+
+        # Up-front config_json updates: ensure schema_registry_port is recorded
+        try:
+            cfg = json.loads(cluster.config_json or "{}")
+        except Exception:
+            cfg = {}
+        cfg["schema_registry_port"] = port
+        cluster.config_json = json.dumps(cfg)
+
+        # Find an existing SR Service row or create one
+        sr_svc = db.query(_Service).filter(
+            _Service.cluster_id == cluster_id, _Service.role == "schema_registry",
+        ).first()
+        # node_id is unique within the cluster — pick the next free
+        existing_ids = [s.node_id for s in db.query(_Service).filter(_Service.cluster_id == cluster_id).all()]
+        next_id = (max(existing_ids) + 1) if existing_ids else 1001
+        if not sr_svc:
+            sr_svc = _Service(
+                cluster_id=cluster_id, host_id=host_id, role="schema_registry",
+                node_id=next_id, status="deploying",
+            )
+            db.add(sr_svc)
+        else:
+            sr_svc.host_id = host_id
+            sr_svc.status = "deploying"
+        db.commit()
+
+        # Get broker hosts for bootstrap
+        brokers = db.query(_Service).filter(
+            _Service.cluster_id == cluster_id,
+            _Service.role.in_(["broker", "broker_controller"]),
+        ).all()
+        if not brokers:
+            log("No brokers found in cluster — Schema Registry needs Kafka to be deployed first.")
+            _set_status(db, task_id, "error", error_message="No brokers in cluster")
+            sr_svc.status = "error"
+            db.commit()
+            return
+        host_rows = {h.id: h for h in db.query(Host).all()}
+        broker_infos = []
+        for b in brokers:
+            bh = host_rows.get(b.host_id)
+            if bh:
+                broker_infos.append({"ip_address": bh.ip_address, "node_id": b.node_id, "role": b.role})
+
+        # Render config + systemd unit
+        cluster_config = json.loads(cluster.config_json or "{}")
+        sr_info = {"ip_address": host.ip_address, "node_id": sr_svc.node_id, "role": "schema_registry"}
+        sr_config = config_generator.generate_schema_registry_config(sr_info, broker_infos, cluster_config)
+        sr_unit = config_generator.generate_systemd_unit(
+            "schema-registry",
+            f"{settings.APICURIO_INSTALL_DIR}/application.properties",
+            cluster_paths.install_dir(cluster), settings.KSQLDB_INSTALL_DIR,
+        )
+
+        configs = {f"{host.ip_address}_{sr_svc.node_id}_apicurio.properties": sr_config}
+        units = {f"{host.ip_address}_{sr_svc.node_id}_schema-registry.service": sr_unit}
+
+        work_dir = ansible_runner.prepare_workspace(task_id)
+        configs_dir = ansible_runner.write_config_files(work_dir, configs)
+        systemd_dir = ansible_runner.write_systemd_units(work_dir, units)
+
+        # Apicurio binary
+        from pathlib import Path as _Path
+        apicurio_repo = settings.APICURIO_REPO_DIR
+        existing = sorted(_Path(apicurio_repo).glob("apicurio-registry-app-*.tar.gz"))
+        if not existing:
+            log(f"ERROR: no Apicurio tarball in {apicurio_repo} — fetch one before retrying.")
+            _set_status(db, task_id, "error", error_message="Apicurio tarball missing")
+            sr_svc.status = "error"
+            db.commit()
+            return
+        apicurio_tgz = existing[-1].name
+        apicurio_tgz_path = str(existing[-1])
+        # Detect strip-components from the tarball layout
+        try:
+            import tarfile
+            with tarfile.open(apicurio_tgz_path) as tf:
+                names = tf.getnames()[:5]
+            apicurio_strip = 1 if names and "/" in names[0] else 0
+        except Exception:
+            apicurio_strip = 1
+
+        # Build a single-host inventory for SR
+        svc_dicts = [{
+            "ip_address": host.ip_address, "port": host.ssh_port,
+            "username": host.username, "auth_type": host.auth_type,
+            "credential": decrypt(host.encrypted_credential),
+            "role": "schema_registry", "node_id": sr_svc.node_id,
+        }]
+        ansible_runner.generate_inventory(work_dir, svc_dicts, tls_keystores=None)
+        ansible_runner.generate_ansible_cfg(work_dir)
+        playbook_path = ansible_runner.generate_playbook(work_dir, "deploy_schema_registry.yml.j2", {
+            "apicurio_install_dir": settings.APICURIO_INSTALL_DIR,
+            "apicurio_binary_filename": apicurio_tgz,
+            "apicurio_binary_local_path": apicurio_tgz_path,
+            "apicurio_strip_components": apicurio_strip,
+            "configs_dir": str(configs_dir),
+            "systemd_dir": str(systemd_dir),
+            "schema_registry_port": port,
+        })
+
+        _set_step(db, task_id, "Running Schema Registry playbook")
+        log("Running Ansible…")
+
+        def emit(line: str):
+            log(line)
+
+        exit_code = ansible_runner.run_playbook(work_dir, playbook_path, emit)
+        if exit_code == 0:
+            sr_svc.status = "running"
+            db.commit()
+            _set_status(db, task_id, "completed")
+            _set_step(db, task_id, "Completed")
+            log("Schema Registry deployed successfully")
+        else:
+            sr_svc.status = "error"
+            db.commit()
+            _set_status(db, task_id, "completed_with_errors", error_message=f"ansible exit code: {exit_code}")
+            _set_step(db, task_id, "Failed")
+            log(f"Deployment failed (ansible exit code: {exit_code})")
+
+        ansible_runner.cleanup_workspace(work_dir)
+    finally:
+        db.close()

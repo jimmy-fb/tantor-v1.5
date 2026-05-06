@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Settings, Search, RefreshCw, Loader2, AlertCircle, Save, X,
   ChevronDown, ChevronRight, Edit3, RotateCcw, Clock, ArrowRight,
-  Info, AlertTriangle, CheckCircle, Filter,
+  Info, AlertTriangle, CheckCircle, Filter, Plus, Layers,
 } from 'lucide-react';
 import axios from 'axios';
 import { getAccessToken } from '../../lib/auth';
@@ -102,6 +102,18 @@ export default function BrokerConfigManager({ clusterId }: Props) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState('');
   const [saveSuccess, setSaveSuccess] = useState<UpdateResult | null>(null);
+
+  // APB v1.4.0 #10 + #16 — add new key + apply-to-all-brokers modal state
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [newConfigKey, setNewConfigKey] = useState('');
+  const [newConfigValue, setNewConfigValue] = useState('');
+  const [applyToAll, setApplyToAll] = useState(false);
+  const [addSaving, setAddSaving] = useState(false);
+  const [addError, setAddError] = useState('');
+  const [bulkResult, setBulkResult] = useState<{
+    config_key: string; broker_count: number; success_count: number;
+    results: Array<{ broker_id: number; ok: boolean; error?: string }>;
+  } | null>(null);
 
   // Audit state
   const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
@@ -303,6 +315,9 @@ export default function BrokerConfigManager({ clusterId }: Props) {
     setSaving(true);
     setSaveError('');
     setSaveSuccess(null);
+    const savedKey = editingKey;
+    const savedValue = editValue;
+    const savedBrokerId = editBrokerId;
     try {
       const { data } = await authApi.put<UpdateResult>(
         `/broker-config/clusters/${clusterId}/brokers/${editBrokerId}/config`,
@@ -312,13 +327,82 @@ export default function BrokerConfigManager({ clusterId }: Props) {
       setEditingKey(null);
       setEditValue('');
       setEditBrokerId(null);
-      // Refresh configs
-      fetchConfigs();
+
+      // Optimistic local update — show the new value immediately so the
+      // user doesn't see a stale field even if kafka-configs.sh returns
+      // cached data for the next few seconds. fetchConfigs() will reconcile.
+      setBrokerConfigs(prev => prev.map(b =>
+        b.broker_id === savedBrokerId && b.configs
+          ? { ...b, configs: { ...b.configs, [savedKey]: savedValue } }
+          : b
+      ));
+
+      // Kafka's broker-config alter is async — describe sometimes returns
+      // the OLD value if called immediately. Wait briefly, refetch, and
+      // retry once if the just-saved key still shows the old value.
+      const refetchUntilMatch = async () => {
+        await new Promise(r => setTimeout(r, 800));
+        await fetchConfigs();
+        // If the latest fetch still shows the stale value, do one more
+        // round 1.5s later.
+        await new Promise(r => setTimeout(r, 1500));
+        await fetchConfigs();
+      };
+      refetchUntilMatch();
     } catch (err: unknown) {
       const axErr = err as { response?: { data?: { detail?: string } } };
       setSaveError(axErr.response?.data?.detail || 'Failed to update configuration');
     } finally {
       setSaving(false);
+    }
+  };
+
+  // APB v1.4.0 #10 + #16 — submit a brand-new config key, optionally
+  // applying it to every broker in the cluster.
+  const handleAddConfig = async () => {
+    if (!newConfigKey.trim() || !newConfigValue.trim()) {
+      setAddError('Both key and value are required');
+      return;
+    }
+    if (!applyToAll && selectedBroker === null) {
+      setAddError('Pick a broker or check "Apply to all brokers"');
+      return;
+    }
+    setAddSaving(true);
+    setAddError('');
+    setBulkResult(null);
+    try {
+      if (applyToAll) {
+        const { data } = await authApi.post(
+          `/broker-config/clusters/${clusterId}/bulk-config`,
+          { config_key: newConfigKey, config_value: newConfigValue }
+        );
+        setBulkResult(data);
+        if (data.success_count === data.broker_count) {
+          // All brokers succeeded — close modal and refresh
+          setAddModalOpen(false);
+          setNewConfigKey('');
+          setNewConfigValue('');
+          setApplyToAll(false);
+        }
+      } else {
+        await authApi.post(
+          `/broker-config/clusters/${clusterId}/configs?broker_id=${selectedBroker}`,
+          { config_key: newConfigKey, config_value: newConfigValue }
+        );
+        setAddModalOpen(false);
+        setNewConfigKey('');
+        setNewConfigValue('');
+      }
+      // Refresh after a short delay so kafka-configs.sh has time to ack
+      await new Promise(r => setTimeout(r, 800));
+      await fetchConfigs();
+      await fetchAuditLog();
+    } catch (err: unknown) {
+      const axErr = err as { response?: { data?: { detail?: string } } };
+      setAddError(axErr.response?.data?.detail || 'Failed to add configuration');
+    } finally {
+      setAddSaving(false);
     }
   };
 
@@ -477,6 +561,18 @@ export default function BrokerConfigManager({ clusterId }: Props) {
               className="flex items-center gap-1.5 px-3 py-2 border border-gray-200 rounded-lg text-sm hover:bg-gray-50 transition-colors"
             >
               <RefreshCw size={14} className={configsLoading ? 'animate-spin' : ''} /> Refresh
+            </button>
+
+            {/* Add Config (APB v1.4.0 #10 + #16) */}
+            <button
+              onClick={() => {
+                setAddModalOpen(true);
+                setAddError('');
+                setBulkResult(null);
+              }}
+              className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 transition-colors"
+            >
+              <Plus size={14} /> Add Config
             </button>
           </div>
 
@@ -823,6 +919,119 @@ export default function BrokerConfigManager({ clusterId }: Props) {
               </table>
             </div>
           )}
+        </div>
+      )}
+
+      {/* APB v1.4.0 #10 + #16 — Add Config modal */}
+      {addModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => !addSaving && setAddModalOpen(false)}>
+          <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-6" onClick={e => e.stopPropagation()}>
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+                  <Plus size={18} /> Add broker config
+                </h3>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Add a new key (or overwrite an existing one) on a single broker or all brokers in this cluster.
+                </p>
+              </div>
+              <button onClick={() => !addSaving && setAddModalOpen(false)} className="text-gray-400 hover:text-gray-600">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Config key</label>
+                <input
+                  type="text"
+                  value={newConfigKey}
+                  onChange={e => setNewConfigKey(e.target.value)}
+                  placeholder="e.g. log.retention.hours"
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                  autoFocus
+                />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Value</label>
+                <input
+                  type="text"
+                  value={newConfigValue}
+                  onChange={e => setNewConfigValue(e.target.value)}
+                  placeholder="e.g. 168"
+                  className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                />
+              </div>
+              <label className="flex items-start gap-2 p-3 bg-blue-50 border border-blue-200 rounded-lg cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={applyToAll}
+                  onChange={e => setApplyToAll(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <div className="text-sm">
+                  <div className="font-medium text-blue-900 flex items-center gap-1.5">
+                    <Layers size={14} /> Apply to all brokers
+                  </div>
+                  <div className="text-xs text-blue-700 mt-0.5">
+                    Push this same value to every broker in the cluster ({brokerConfigs.length} broker{brokerConfigs.length === 1 ? '' : 's'}).
+                  </div>
+                </div>
+              </label>
+              {!applyToAll && (
+                <div className="text-xs text-gray-500">
+                  Will be applied to <span className="font-mono font-medium">broker #{selectedBroker ?? '—'}</span>.
+                </div>
+              )}
+
+              {addError && (
+                <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-sm text-red-700">
+                  <AlertCircle size={14} /> {addError}
+                </div>
+              )}
+
+              {bulkResult && (
+                <div className={`rounded-lg px-3 py-2 text-sm border ${
+                  bulkResult.success_count === bulkResult.broker_count
+                    ? 'bg-green-50 border-green-200 text-green-800'
+                    : 'bg-amber-50 border-amber-200 text-amber-900'
+                }`}>
+                  <div className="font-medium mb-1">
+                    {bulkResult.success_count}/{bulkResult.broker_count} brokers updated
+                  </div>
+                  <ul className="text-xs space-y-0.5">
+                    {bulkResult.results.map(r => (
+                      <li key={r.broker_id} className="flex items-center gap-2">
+                        {r.ok
+                          ? <CheckCircle size={11} className="text-green-600" />
+                          : <AlertCircle size={11} className="text-red-600" />}
+                        <span className="font-mono">#{r.broker_id}</span>
+                        {!r.ok && <span className="text-red-700">{r.error}</span>}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 mt-5">
+              <button
+                onClick={() => !addSaving && setAddModalOpen(false)}
+                disabled={addSaving}
+                className="px-4 py-2 text-sm border border-gray-200 rounded-lg hover:bg-gray-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleAddConfig}
+                disabled={addSaving}
+                className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {addSaving && <Loader2 size={14} className="animate-spin" />}
+                {applyToAll ? 'Apply to all brokers' : 'Add to broker'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

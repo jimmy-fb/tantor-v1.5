@@ -127,11 +127,52 @@ def _common_kwargs(cluster: Cluster, secrets: dict, ssl_paths: dict) -> dict:
 # ── Public operations ─────────────────────────────────────────────────────
 
 
+def _detect_broker_version(admin: KafkaAdminClient) -> str | None:
+    """Detect broker software version.
+
+    kafka-python-ng's `check_version()` only walks API versions it knows
+    about — it caps at ~2.6 even when talking to a Kafka 4.x broker. We try
+    each path in order:
+      1. Read `software_version` from an ApiVersionRequest_v3 response if
+         the kafka-python build has the field decoded.
+      2. Read it off the cached cluster metadata if available.
+      3. Fall back to check_version() and label "≥ X.Y.Z" so the operator
+         knows it's a floor, not the exact version.
+    """
+    # Path 1: explicit ApiVersions request.
+    try:
+        from kafka.protocol.admin import ApiVersionRequest_v3
+        client = admin._client  # type: ignore[attr-defined]
+        node_id = next(iter(client._connections), None)
+        if node_id is not None:
+            future = client.send(node_id, ApiVersionRequest_v3([]))
+            client.poll(future=future, timeout_ms=2000)
+            if future.is_done and future.succeeded():
+                resp = future.value
+                ver = getattr(resp, "software_version", None) or getattr(resp, "broker_software_version", None)
+                if ver and isinstance(ver, (str, bytes)):
+                    return ver.decode() if isinstance(ver, bytes) else ver
+    except Exception:
+        pass
+    # Path 2: heuristic. kafka-python-ng tops out at the highest API
+    # version it knows; for newer brokers the result is a lower bound.
+    try:
+        client = admin._client  # type: ignore[attr-defined]
+        ver = client.check_version()
+        if isinstance(ver, tuple) and len(ver) >= 2:
+            base = ".".join(str(x) for x in ver)
+            return f"≥ {base}"
+    except Exception:
+        pass
+    return None
+
+
 def test_connection(cluster: Cluster) -> dict:
     """Open an admin client and call describe_cluster — fastest end-to-end probe.
 
-    Returns {success, message, broker_count, controller_id} so the UI can show
-    what it's actually connected to.
+    Returns {success, message, broker_count, controller_id, kafka_version}
+    so the UI can show what it's actually connected to. APB asked for the
+    real broker version to appear instead of "unknown".
     """
     secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
     try:
@@ -141,12 +182,26 @@ def test_connection(cluster: Cluster) -> dict:
             try:
                 desc = admin.describe_cluster()
                 brokers = desc.get("brokers", [])
+                kafka_version = _detect_broker_version(admin)
+                # Each broker dict from kafka-python looks like:
+                # {"node_id": 0, "host": "...", "port": 9092, "rack": None}
+                broker_summary = [
+                    {
+                        "node_id": b.get("node_id"),
+                        "host": b.get("host"),
+                        "port": b.get("port"),
+                        "rack": b.get("rack"),
+                    }
+                    for b in brokers
+                ]
                 return {
                     "success": True,
                     "message": f"Connected to {len(brokers)} broker(s)",
                     "broker_count": len(brokers),
                     "controller_id": desc.get("controller_id"),
                     "cluster_id": desc.get("cluster_id"),
+                    "kafka_version": kafka_version,
+                    "brokers": broker_summary,
                 }
             finally:
                 admin.close()
@@ -420,7 +475,14 @@ def produce_message(cluster: Cluster, topic: str, key: str | None, value: str) -
                 value=value.encode(),
             )
             md = future.get(timeout=10)
-            return {"topic": md.topic, "partition": md.partition, "offset": md.offset}
+            # Match the managed-cluster ProduceResponse shape exactly so the
+            # /produce endpoint's response_model validation doesn't reject a
+            # successful produce with 500 "Internal server error". APB hit
+            # this every time they used the Produce tab on an external cluster.
+            return {
+                "success": True,
+                "message": f"Produced to {md.topic} (partition {md.partition}, offset {md.offset})",
+            }
         finally:
             producer.close(timeout=5)
 

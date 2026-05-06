@@ -191,6 +191,38 @@ def list_incidents(
     db: Session = Depends(get_db),
     _: User = Depends(require_monitor_or_above),
 ):
+    # Reconcile DB state against AM's currently-firing alerts before responding.
+    # Alertmanager's resolve_timeout is 5m and group_interval can delay resolve
+    # webhooks further, so we don't want incidents stuck on "firing" in the UI
+    # while Prometheus has long since cleared the alert. If a fingerprint we
+    # have as firing isn't in AM's live set, mark it resolved.
+    try:
+        reachable, _am_url = alert_manager.alertmanager_reachable(cluster_id, db)
+        if reachable:
+            live = alert_manager.list_firing_for_cluster(cluster_id, db)
+            live_fps = {a.get("fingerprint") for a in live if a.get("fingerprint")}
+            stale = (
+                db.query(AlertIncident)
+                .filter(
+                    AlertIncident.cluster_id == cluster_id,
+                    AlertIncident.status == "firing",
+                )
+                .all()
+            )
+            now = datetime.now(timezone.utc)
+            changed = False
+            for inc in stale:
+                if inc.fingerprint not in live_fps:
+                    inc.status = "resolved"
+                    if inc.resolved_at is None:
+                        inc.resolved_at = now
+                    changed = True
+            if changed:
+                db.commit()
+    except Exception:
+        # Reconciliation is best-effort — never block the read.
+        pass
+
     q = db.query(AlertIncident).filter(AlertIncident.cluster_id == cluster_id)
     if status:
         q = q.filter(AlertIncident.status == status)

@@ -1,0 +1,127 @@
+# Tantor-provided log4j2 config for Kafka 4.x.
+#
+# Ships explicitly so we don't get warnings about missing log4j2 configs
+# (the Kafka tarball does ship one, but customers occasionally hit
+# permission issues on it after extract — owning the copy ourselves
+# avoids the failure mode entirely).
+#
+# Routes broker logs to {{ kafka_log_dir }}/server.log with daily rotation.
+# Tools logging falls back to console — see tools-log4j2.yaml.
+
+Configuration:
+  status: WARN
+  monitorInterval: 30
+
+  Properties:
+    Property:
+      - name: "logPattern"
+        value: "[%d] %p %m (%c)%n"
+      - name: "kafkaLogDir"
+        value: "{{ kafka_log_dir | default('/var/log/kafka') }}"
+
+  Appenders:
+    Console:
+      name: STDOUT
+      target: SYSTEM_OUT
+      PatternLayout:
+        pattern: "${logPattern}"
+
+    RollingFile:
+      - name: KafkaAppender
+        fileName: "${kafkaLogDir}/server.log"
+        filePattern: "${kafkaLogDir}/server.log.%d{yyyy-MM-dd-HH}"
+        PatternLayout:
+          pattern: "${logPattern}"
+        Policies:
+          TimeBasedTriggeringPolicy:
+            interval: 1
+        DefaultRolloverStrategy:
+          max: 10
+
+      - name: ControllerAppender
+        fileName: "${kafkaLogDir}/controller.log"
+        filePattern: "${kafkaLogDir}/controller.log.%d{yyyy-MM-dd-HH}"
+        PatternLayout:
+          pattern: "${logPattern}"
+        Policies:
+          TimeBasedTriggeringPolicy:
+            interval: 1
+        DefaultRolloverStrategy:
+          max: 10
+
+      - name: StateChangeAppender
+        fileName: "${kafkaLogDir}/state-change.log"
+        filePattern: "${kafkaLogDir}/state-change.log.%d{yyyy-MM-dd-HH}"
+        PatternLayout:
+          pattern: "${logPattern}"
+        Policies:
+          TimeBasedTriggeringPolicy:
+            interval: 1
+        DefaultRolloverStrategy:
+          max: 10
+
+      - name: RequestAppender
+        fileName: "${kafkaLogDir}/kafka-request.log"
+        filePattern: "${kafkaLogDir}/kafka-request.log.%d{yyyy-MM-dd-HH}"
+        PatternLayout:
+          pattern: "${logPattern}"
+        Policies:
+          TimeBasedTriggeringPolicy:
+            interval: 1
+        DefaultRolloverStrategy:
+          max: 10
+
+      - name: AuthorizerAppender
+        fileName: "${kafkaLogDir}/kafka-authorizer.log"
+        filePattern: "${kafkaLogDir}/kafka-authorizer.log.%d{yyyy-MM-dd-HH}"
+        PatternLayout:
+          pattern: "${logPattern}"
+        Policies:
+          TimeBasedTriggeringPolicy:
+            interval: 1
+        DefaultRolloverStrategy:
+          max: 10
+
+  Loggers:
+    Root:
+      level: INFO
+      AppenderRef:
+        - ref: STDOUT
+        - ref: KafkaAppender
+
+    Logger:
+      - name: kafka
+        level: INFO
+
+      - name: org.apache.kafka
+        level: INFO
+
+      - name: kafka.controller
+        level: INFO
+        additivity: false
+        AppenderRef:
+          ref: ControllerAppender
+
+      - name: kafka.network.RequestChannel$
+        level: WARN
+        additivity: false
+        AppenderRef:
+          ref: RequestAppender
+
+      - name: kafka.request.logger
+        level: WARN
+        additivity: false
+        AppenderRef:
+          ref: RequestAppender
+
+      - name: kafka.authorizer.logger
+        level: INFO
+        additivity: false
+        AppenderRef:
+          ref: AuthorizerAppender
+
+      - name: state.change.logger
+        level: INFO
+        additivity: false
+        AppenderRef:
+          ref: StateChangeAppender

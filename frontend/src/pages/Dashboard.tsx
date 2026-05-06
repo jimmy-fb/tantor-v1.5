@@ -14,7 +14,18 @@ export default function Dashboard() {
   }, []);
 
   const onlineHosts = hosts.filter(h => h.status === 'online').length;
-  const runningClusters = clusters.filter(c => c.state === 'running').length;
+  // APB v1.2.0 #11 — Dashboard's running-cluster count was excluding external
+  // clusters (which use state="connected" instead of "running"). Count both,
+  // since they're equally healthy and equally manageable from this UI.
+  const runningClusters = clusters.filter(c =>
+    c.state === 'running' || c.state === 'connected'
+  ).length;
+  const internalRunning = clusters.filter(c =>
+    (c.kind || 'managed') === 'managed' && c.state === 'running'
+  ).length;
+  const externalConnected = clusters.filter(c =>
+    c.kind === 'external' && c.state === 'connected'
+  ).length;
 
   return (
     <div>
@@ -55,6 +66,7 @@ export default function Dashboard() {
             <div>
               <div className="text-2xl font-bold">{runningClusters}</div>
               <div className="text-sm text-gray-500">Running Clusters</div>
+              <div className="text-xs text-gray-400 mt-0.5">{internalRunning} managed · {externalConnected} external</div>
             </div>
           </div>
         </div>

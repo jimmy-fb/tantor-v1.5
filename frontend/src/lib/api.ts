@@ -131,6 +131,8 @@ export const deleteCluster = (id: string) => api.delete(`/clusters/${id}`);
 export const deployCluster = (id: string) => api.post<DeploymentTask>(`/clusters/${id}/deploy`).then(r => r.data);
 export const getDeploymentStatus = (clusterId: string, taskId: string) =>
   api.get<DeploymentTask>(`/clusters/${clusterId}/deploy/${taskId}`).then(r => r.data);
+export const listDeploymentTasks = (clusterId: string) =>
+  api.get<DeploymentTask[]>(`/clusters/${clusterId}/deploy`).then(r => r.data);
 export const startCluster = (id: string) => api.post<ServiceAction[]>(`/clusters/${id}/start`).then(r => r.data);
 export const stopCluster = (id: string) => api.post<ServiceAction[]>(`/clusters/${id}/stop`).then(r => r.data);
 export const getClusterStatus = (id: string) => api.get<ServiceStatus[]>(`/clusters/${id}/status`).then(r => r.data);
@@ -203,6 +205,63 @@ export const restartConnector = (clusterId: string, name: string) =>
 export const getConnectPlugins = (clusterId: string) =>
   api.get<ConnectorPluginInfo[]>(`/clusters/${clusterId}/connect/plugins`).then(r => r.data);
 
+// CDC quickstart — pre-curated Debezium templates
+export const listCdcTemplates = (clusterId: string) =>
+  api.get<import('../types').CdcTemplate[]>(`/clusters/${clusterId}/connect/cdc/templates`).then(r => r.data);
+export const createCdcConnector = (
+  clusterId: string,
+  data: { name: string; template_id: string; fields: Record<string, string> },
+) =>
+  api.post(`/clusters/${clusterId}/connect/cdc/create`, data).then(r => r.data);
+
+// Capacity trend forecast (Prometheus-derived linear projection of disk usage)
+export const getCapacityForecast = (clusterId: string) =>
+  api.get<import('../types').CapacityForecast>(`/monitoring/clusters/${clusterId}/capacity-forecast`).then(r => r.data);
+
+// Detailed per-cluster monitoring summary — throughput, broker up/down,
+// top topics + consumer groups, JVM heap, GC, etc.
+export interface MonitoringSummary {
+  available: boolean;
+  reason?: string;
+  throughput?: {
+    messages_in_per_sec: number;
+    bytes_in_per_sec: number;
+    bytes_out_per_sec: number;
+  };
+  scrape_targets?: Array<{ job: string; instance: string; up: boolean }>;
+  broker_up_count?: number;
+  broker_total_count?: number;
+  top_topics_by_msgs?: Array<{ key: string; value: number }>;
+  top_consumer_groups_by_lag?: Array<{ key: string; value: number }>;
+  under_replicated_partitions?: number;
+  jvm_heap_mb?: number;
+  jvm_gc_count_per_sec?: number;
+}
+export const getMonitoringSummary = (clusterId: string) =>
+  api.get<MonitoringSummary>(`/monitoring/clusters/${clusterId}/summary`).then(r => r.data);
+
+// Data Federation — single pane across all clusters
+export const getFederationOverview = () =>
+  api.get<{ clusters: any[]; total: number; managed: number; external: number }>('/federation/overview').then(r => r.data);
+export const federationTopicSearch = (q: string) =>
+  api.get<{ query: string; matches: any[]; match_count: number; skipped: Array<{ cluster_id: string; name: string; reason: string }> }>(
+    `/federation/topics/search?q=${encodeURIComponent(q)}`
+  ).then(r => r.data);
+
+// External cluster SSH-based lifecycle (start/stop/restart)
+export const getExternalBrokerHosts = (clusterId: string) =>
+  api.get<Array<{ host_id: string; kafka_unit: string; hostname?: string; ip_address?: string; online?: boolean }>>(
+    `/external-clusters/${clusterId}/broker-hosts`,
+  ).then(r => r.data);
+export const setExternalBrokerHosts = (clusterId: string, hosts: Array<{ host_id: string; kafka_unit: string }>) =>
+  api.put<Array<{ host_id: string; kafka_unit: string; hostname?: string; ip_address?: string; online?: boolean }>>(
+    `/external-clusters/${clusterId}/broker-hosts`, { hosts },
+  ).then(r => r.data);
+export const externalLifecycleAction = (clusterId: string, action: 'start' | 'stop' | 'restart') =>
+  api.post<{ results: Array<{ host_id: string; hostname?: string; kafka_unit?: string; exit_code?: number; ok: boolean; message: string }> }>(
+    `/external-clusters/${clusterId}/${action}`,
+  ).then(r => r.data);
+
 // ── Security - Kafka Users ───────────────────────────
 export const getKafkaUsers = (clusterId: string) =>
   api.get<KafkaUserInfo[]>(`/clusters/${clusterId}/security/users`).then(r => r.data);
@@ -269,7 +328,7 @@ export const verifyReassignment = (clusterId: string, data: { reassignment: Reco
 export const getMonitoringStatus = () => api.get('/monitoring/status').then(r => r.data);
 export const getClusterMetrics = (clusterId: string) =>
   api.get(`/monitoring/clusters/${clusterId}/metrics`).then(r => r.data);
-export const deployMonitoring = (clusterId: string, data: { monitoring_host_id: string; grafana_port?: number; prometheus_port?: number }) =>
+export const deployMonitoring = (clusterId: string, data: { monitoring_host_id: string; grafana_port?: number; prometheus_port?: number; external_jmx_endpoints?: string[] }) =>
   api.post(`/monitoring/clusters/${clusterId}/deploy`, data).then(r => r.data);
 export const getGrafanaInfo = (clusterId: string) =>
   api.get(`/monitoring/clusters/${clusterId}/grafana`).then(r => r.data);

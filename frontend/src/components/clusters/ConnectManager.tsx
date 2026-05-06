@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react';
 import {
   Plus, Trash2, RefreshCw, Pause, Play, RotateCw,
-  Loader2, Plug, ChevronDown, ChevronUp,
+  Loader2, Plug, ChevronDown, ChevronUp, Database,
 } from 'lucide-react';
 import type { ConnectorStatus, ConnectorPluginInfo } from '../../types';
 import {
   getConnectors, createConnector, deleteConnector,
   pauseConnector, resumeConnector, restartConnector, getConnectPlugins,
 } from '../../lib/api';
+import CdcWizard from './CdcWizard';
 
 interface Props {
   clusterId: string;
@@ -25,6 +26,7 @@ export default function ConnectManager({ clusterId }: Props) {
   const [plugins, setPlugins] = useState<ConnectorPluginInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [showDeploy, setShowDeploy] = useState(false);
+  const [showCdcWizard, setShowCdcWizard] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
@@ -118,6 +120,13 @@ export default function ConnectManager({ clusterId }: Props) {
             <RefreshCw size={13} /> Refresh
           </button>
           <button
+            onClick={() => setShowCdcWizard(true)}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs border border-blue-300 bg-white text-blue-700 rounded-lg hover:bg-blue-50"
+            title="Pre-curated Debezium MySQL/Postgres/Mongo/SQL Server templates"
+          >
+            <Database size={13} /> CDC quickstart
+          </button>
+          <button
             onClick={() => setShowDeploy(!showDeploy)}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-blue-600 text-white rounded-lg hover:bg-blue-700"
           >
@@ -125,6 +134,14 @@ export default function ConnectManager({ clusterId }: Props) {
           </button>
         </div>
       </div>
+
+      {showCdcWizard && (
+        <CdcWizard
+          clusterId={clusterId}
+          onClose={() => setShowCdcWizard(false)}
+          onCreated={() => fetchConnectors()}
+        />
+      )}
 
       {/* Deploy form */}
       {showDeploy && (

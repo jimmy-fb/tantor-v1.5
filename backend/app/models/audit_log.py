@@ -16,4 +16,8 @@ class AuditLog(Base):
     resource_type: Mapped[str] = mapped_column(String(30))  # "user" or "acl"
     resource_name: Mapped[str] = mapped_column(String(255))
     details: Mapped[str | None] = mapped_column(Text, nullable=True)  # JSON details
+    # APB v1.4.0 — actor metadata so the activity log shows WHO did what.
+    # Nullable for back-compat with rows written before these columns existed.
+    actor_user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    actor_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))

@@ -2,6 +2,7 @@ import json
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -14,7 +15,7 @@ from app.schemas.cluster import (
     ClusterUpdateRequest,
 )
 from app.schemas.service import ServiceActionResponse
-from app.services.deployer import deploy_cluster, get_task, init_task
+from app.services.deployer import deploy_cluster, get_task, init_task, deploy_schema_registry
 from app.services.cluster_manager import cluster_manager
 from app.api.deps import require_admin, require_monitor_or_above
 from app.models.user import User
@@ -39,7 +40,13 @@ def create_cluster(data: ClusterCreate, db: Session = Depends(get_db), _: User =
         environment=(data.environment or "").strip().lower(),
     )
     db.add(cluster)
-    db.flush()
+    db.flush()  # populate cluster.id before path assignment
+
+    # APB v1.2.0 #5 — give every new cluster its own Kafka install dir,
+    # data dir, and systemd unit name so two clusters on the same broker
+    # host coexist instead of stomping on /opt/kafka + kafka.service.
+    from app.services import cluster_paths
+    cluster_paths.assign_paths_for_new_cluster(cluster)
 
     for svc_data in data.services:
         svc = Service(
@@ -66,6 +73,31 @@ def get_cluster(cluster_id: str, db: Session = Depends(get_db), _: User = Depend
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
     services = db.query(Service).filter(Service.cluster_id == cluster_id).all()
+
+    # APB v1.2.0 #7: external clusters had an empty Overview tab because they
+    # have no Service rows. Synthesize one row per broker by calling
+    # describe_cluster — purely cosmetic, gives the operator a list of
+    # connected brokers + ids on the same Overview screen as managed clusters.
+    if (cluster.kind or "managed") == "external" and not services:
+        try:
+            from app.services import external_admin
+            from app.models.service import Service as _SvcModel
+            probe = external_admin.test_connection(cluster)
+            for b in probe.get("brokers") or []:
+                services.append(_SvcModel(
+                    id=f"ext-{cluster.id[:8]}-{b.get('node_id', 0)}",
+                    cluster_id=cluster.id,
+                    host_id="",  # synthetic — no Tantor Host record
+                    role="broker",
+                    node_id=int(b.get("node_id", 0)),
+                    config_overrides=None,
+                    status="connected" if probe.get("success") else "unknown",
+                ))
+        except Exception:
+            # Best-effort. Empty list is the existing behavior; never break the
+            # detail load because the external cluster is momentarily unreachable.
+            pass
+
     return ClusterDetailResponse(
         cluster=ClusterResponse.model_validate(cluster),
         services=[ServiceResponse.model_validate(s) for s in services],
@@ -196,6 +228,160 @@ def get_cluster_status(cluster_id: str, db: Session = Depends(get_db), _: User =
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
     return cluster_manager.get_cluster_status(cluster_id, db)
+
+
+# ── One-click deploy (APB v1.4.0 #6) ─────────────────
+
+class QuickDeployRequest(BaseModel):
+    """No required fields — the endpoint picks sensible defaults from
+    whatever hosts the operator has already registered."""
+    name: str | None = None
+    environment: str = "dev"
+
+
+@router.post("/quick-deploy")
+def quick_deploy(
+    req: QuickDeployRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db), _: User = Depends(require_admin),
+):
+    """Create + deploy a cluster with sensible defaults in one call.
+
+    Picks the latest Kafka version available locally, KRaft mode, and
+    assigns all registered hosts as `broker_controller` (combined mode).
+    Replication factor scales with broker count (max 3). Ideal for QA
+    smoke environments and demos — the customer asked for "without
+    user" deployment.
+    """
+    hosts = db.query(Host).all()
+    if not hosts:
+        raise HTTPException(status_code=400, detail="Register at least one host before quick-deploy")
+
+    # Pick name
+    name = (req.name or "").strip()
+    if not name:
+        existing = {c.name for c in db.query(Cluster.name).all()}
+        i = 1
+        while f"cluster-{i}" in existing:
+            i += 1
+        name = f"cluster-{i}"
+    elif db.query(Cluster).filter(Cluster.name == name).first():
+        raise HTTPException(status_code=400, detail=f"Cluster '{name}' already exists")
+
+    # Kafka version: latest available locally; falls back to a sensible default
+    from app.config import settings as _settings
+    from pathlib import Path as _P
+    repo = _P(_settings.KAFKA_REPO_DIR)
+    versions = []
+    if repo.exists():
+        for f in repo.glob("kafka_*-*.tgz"):
+            try:
+                # filename like kafka_2.13-4.1.0.tgz
+                ver = f.stem.split("-", 1)[1]
+                versions.append(ver)
+            except IndexError:
+                continue
+    if versions:
+        # Pick the highest version semantically
+        def _v(s: str) -> tuple:
+            try:
+                return tuple(int(x) for x in s.split("."))
+            except ValueError:
+                return (0,)
+        versions.sort(key=_v, reverse=True)
+        kafka_version = versions[0]
+    else:
+        kafka_version = "4.1.0"  # baked-in fallback
+
+    # Pick replication factor — never exceed broker count
+    rf = min(3, len(hosts))
+
+    # Assign each host as combined broker_controller
+    from app.schemas.cluster import ServiceAssignment as _SA
+    services = []
+    for i, h in enumerate(hosts, start=1):
+        services.append(_SA(host_id=h.id, role="broker_controller", node_id=i))
+
+    cluster_config = {
+        "replication_factor": rf,
+        "num_partitions": 3,
+        "log_dirs": "/var/lib/kafka/data",
+        "listener_port": 9092,
+        "controller_port": 9093,
+        "heap_size": "1G",
+    }
+
+    cluster = Cluster(
+        name=name,
+        kafka_version=kafka_version,
+        mode="kraft",
+        config_json=json.dumps(cluster_config),
+        environment=(req.environment or "dev").strip().lower(),
+    )
+    db.add(cluster)
+    db.flush()
+
+    from app.services import cluster_paths
+    cluster_paths.assign_paths_for_new_cluster(cluster)
+
+    for svc_data in services:
+        svc = Service(
+            cluster_id=cluster.id,
+            host_id=svc_data.host_id,
+            role=svc_data.role,
+            node_id=svc_data.node_id,
+        )
+        db.add(svc)
+    db.commit()
+
+    # Kick off the deploy in the background — caller polls
+    # /api/clusters/{id}/deploy/{task_id} the same way the wizard does.
+    task_id = str(uuid.uuid4())
+    init_task(task_id, cluster.id)
+    background_tasks.add_task(deploy_cluster, cluster.id, task_id)
+
+    return {
+        "cluster_id": cluster.id,
+        "name": cluster.name,
+        "task_id": task_id,
+        "kafka_version": kafka_version,
+        "broker_count": len(services),
+    }
+
+
+# ── Schema Registry deploy (APB v1.4.0 #2) ──────────
+
+class SchemaRegistryDeployRequest(BaseModel):
+    host_id: str
+    port: int = 8085
+
+
+@router.post("/{cluster_id}/services/schema-registry")
+def deploy_schema_registry_endpoint(
+    cluster_id: str, req: SchemaRegistryDeployRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db), _: User = Depends(require_admin),
+):
+    """Deploy a Schema Registry instance bound to this cluster.
+
+    The customer asked for SR to be deployable per-cluster from the
+    cluster detail page rather than globally from a sidebar entry.
+    Returns a deploy task_id the UI can poll the same way it polls the
+    main cluster deploy.
+    """
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+    if (cluster.kind or "managed") == "external":
+        raise HTTPException(status_code=400, detail="Schema Registry deploy is only supported on managed clusters")
+    host = db.query(Host).filter(Host.id == req.host_id).first()
+    if not host:
+        raise HTTPException(status_code=400, detail="Host not found")
+
+    task_id = str(uuid.uuid4())
+    init_task(task_id, cluster_id)
+    background_tasks.add_task(deploy_schema_registry, cluster_id, req.host_id, req.port, task_id)
+    return DeploymentTaskResponse(task_id=task_id, cluster_id=cluster_id, status="running")
 
 
 # ── Node scaling (add/remove hosts) ──────────────────

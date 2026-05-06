@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Server, Network, Plus, Package, Users, BarChart3, LogOut, User, Shield, Link2, KeyRound, Activity, Bell, Database, Plug } from 'lucide-react';
+import { LayoutDashboard, Server, Network, Plus, Package, Users, LogOut, User, Shield, Link2, KeyRound, Activity, Bell, Plug, Globe2, BarChart3 } from 'lucide-react';
 import { isAdmin, getUsername, clearTokens } from '../../lib/auth';
 import { getHealthInfo } from '../../lib/api';
 
@@ -25,8 +25,14 @@ export default function Sidebar() {
     { to: '/clusters', icon: Network, label: 'Clusters' },
     { to: '/clusters/new', icon: Plus, label: 'New Cluster', adminOnly: true },
     { to: '/external-clusters', icon: Plug, label: 'External Clusters' },
+    { to: '/federation', icon: Globe2, label: 'Federation' },
     { to: '/versions', icon: Package, label: 'Kafka Versions' },
-    { to: '/schema-registry', icon: Database, label: 'Schema Registry' },
+    // APB v1.4.0 #2 — Schema Registry now lives per-cluster (Cluster → Schema tab).
+    // The standalone sidebar entry was misleading because schemas are inherently
+    // tied to one cluster's bootstrap servers.
+    // Cross-cluster monitoring overview (deep-links into per-cluster
+    // Monitoring tabs). Detailed metrics for one cluster live on
+    // Cluster → Monitoring tab, not here.
     { to: '/monitoring', icon: BarChart3, label: 'Monitoring' },
 
     { to: '/security-scan', icon: Shield, label: 'Security Scan' },

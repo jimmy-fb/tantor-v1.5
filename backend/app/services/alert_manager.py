@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from typing import Iterable
 
 import urllib.request
@@ -109,6 +110,27 @@ RULE_TEMPLATES: dict[str, dict] = {
         "summary": "Consumer lag > 100k on {{ $labels.consumergroup }}",
         "description": "Consumer group {{ $labels.consumergroup }} is lagging by {{ $value }} messages.",
     },
+    # APB-requested intelligent consumer alerting: detect stalled consumers
+    # (lag is not decreasing — group exists but isn't catching up) and failed
+    # consumers (zero live members on a previously-active group).
+    "consumer_stalled": {
+        "name": "ConsumerStalled",
+        "severity": "warning",
+        "for_seconds": 900,
+        # Lag is non-zero AND its 15-min derivative is ~0 (not making progress).
+        "expr": 'kafka_consumergroup_lag > 0 and deriv(kafka_consumergroup_lag[15m]) >= 0',
+        "summary": "Consumer group {{ $labels.consumergroup }} is stalled (no progress)",
+        "description": "Consumer group {{ $labels.consumergroup }} has lag {{ $value }} that hasn't decreased in 15 minutes — likely a hung consumer.",
+    },
+    "consumer_failed": {
+        "name": "ConsumerFailed",
+        "severity": "critical",
+        "for_seconds": 300,
+        # The group exists in metrics but has no live members.
+        "expr": 'kafka_consumergroup_members == 0',
+        "summary": "Consumer group {{ $labels.consumergroup }} has no live members",
+        "description": "Consumer group {{ $labels.consumergroup }} has zero active members for over 5 minutes — consumers may have crashed.",
+    },
     "disk_almost_full": {
         "name": "DiskAlmostFull",
         "severity": "warning",
@@ -122,6 +144,40 @@ RULE_TEMPLATES: dict[str, dict] = {
 
 def get_template(name: str) -> dict | None:
     return RULE_TEMPLATES.get(name)
+
+
+def seed_default_rules(cluster_id: str, db: Session) -> int:
+    """Idempotently create the four default alert rules for a cluster.
+
+    Called from the deployer right after monitoring stack is up. Skips any rule
+    name that already exists, so re-running on an existing cluster is safe.
+    Returns the number of rules newly created.
+    """
+    from app.models.alert_rule import AlertRule  # local import — avoid cycle
+    existing_names = {
+        r.name
+        for r in db.query(AlertRule).filter(AlertRule.cluster_id == cluster_id).all()
+    }
+    created = 0
+    for tpl in RULE_TEMPLATES.values():
+        if tpl["name"] in existing_names:
+            continue
+        db.add(AlertRule(
+            id=str(uuid.uuid4()),
+            cluster_id=cluster_id,
+            name=tpl["name"],
+            expr=tpl["expr"],
+            for_seconds=tpl["for_seconds"],
+            severity=tpl["severity"],
+            summary=tpl["summary"],
+            description=tpl["description"],
+            channel_ids="[]",
+            enabled=True,
+        ))
+        created += 1
+    if created:
+        db.commit()
+    return created
 
 
 # ── Rendering: Prometheus rules YAML ──────────────────────────────────────
@@ -176,12 +232,15 @@ def render_alertmanager_yaml(
 
     lines: list[str] = []
     lines.append("global:")
-    lines.append("  resolve_timeout: 5m")
+    # Tightened from 5m → 1m so resolve webhooks arrive while operators are still
+    # watching. The /incidents endpoint reconciles against Prometheus on read
+    # too, so this is just for receiver-side notifications (Slack/email/etc).
+    lines.append("  resolve_timeout: 1m")
     lines.append("")
     lines.append("route:")
     lines.append("  group_by: ['alertname', 'tantor_cluster_id']")
-    lines.append("  group_wait: 30s")
-    lines.append("  group_interval: 5m")
+    lines.append("  group_wait: 15s")
+    lines.append("  group_interval: 1m")
     lines.append("  repeat_interval: 4h")
     lines.append("  receiver: tantor_default")
     if enabled_channels:

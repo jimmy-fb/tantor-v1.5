@@ -1,4 +1,5 @@
 """Rolling Restart Manager — restart Kafka brokers one by one without downtime."""
+import json
 import logging
 import time
 import uuid
@@ -7,9 +8,25 @@ from app.models.cluster import Cluster
 from app.models.service import Service
 from app.models.host import Host
 from app.services.ssh_manager import SSHManager
+from app.services import cluster_paths
 from app.config import settings
 
 logger = logging.getLogger("tantor.rolling_restart")
+
+
+def _cluster_listener_port(cluster: Cluster) -> int:
+    """Read the broker listener port from the cluster's config_json.
+    Falls back to 9092 for clusters that predate per-cluster ports.
+    Multi-cluster on the same host depends on this — the readiness probe
+    can't just hit localhost:9092 for both."""
+    try:
+        cfg = json.loads(cluster.config_json or "{}")
+    except Exception:
+        cfg = {}
+    try:
+        return int(cfg.get("listener_port") or 9092)
+    except (TypeError, ValueError):
+        return 9092
 
 # In-memory task tracking (same pattern as deployer.py)
 _restart_tasks: dict[str, dict] = {}
@@ -20,6 +37,9 @@ def init_restart_task(task_id: str):
 def get_restart_task(task_id: str) -> dict | None:
     return _restart_tasks.get(task_id)
 
+# Fallback unit names for non-Kafka roles. Kafka-role units are now
+# resolved via cluster_paths.unit_name(cluster) so multi-cluster
+# deployments hit the right kafka-<slug>-<id>.service.
 SERVICE_TYPE_MAP = {
     "broker": "kafka",
     "broker_controller": "kafka",
@@ -28,6 +48,21 @@ SERVICE_TYPE_MAP = {
     "ksqldb": "ksqldb",
     "kafka_connect": "kafka-connect",
 }
+
+KAFKA_ROLES = ("broker", "broker_controller", "controller", "zookeeper")
+
+
+def _unit_for_service(cluster: Cluster, svc: Service) -> str:
+    """Resolve the systemd unit name to use for this service.
+
+    For Kafka roles on a managed cluster, returns the per-cluster unit
+    (e.g. kafka-prod-1ac9bbbe.service). Falls back to the legacy role
+    map for non-Kafka services (ksqlDB, Connect) and external clusters.
+    """
+    is_managed = (cluster.kind or "managed") == "managed"
+    if is_managed and svc.role in KAFKA_ROLES:
+        return cluster_paths.unit_name(cluster)
+    return SERVICE_TYPE_MAP.get(svc.role, "kafka") + ".service"
 
 class RollingRestartManager:
     def rolling_restart(self, cluster_id: str, task_id: str, restart_scope: str, db: Session):
@@ -86,7 +121,7 @@ class RollingRestartManager:
                     log(f"⚠ Skipping service {svc.id} — host not found")
                     continue
 
-                unit_name = SERVICE_TYPE_MAP.get(svc.role, "kafka") + ".service"
+                unit_name = _unit_for_service(cluster, svc)
                 task["progress"]["current"] = idx + 1
                 task["progress"]["current_broker"] = f"Node {svc.node_id} ({host.ip_address})"
 
@@ -96,7 +131,7 @@ class RollingRestartManager:
                     with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
                         # Step 1: Pre-restart health check
                         log(f"  Pre-restart health check...")
-                        healthy = self._check_broker_health(client, svc.role)
+                        healthy = self._check_broker_health(client, svc.role, cluster)
                         if not healthy:
                             log(f"  ⚠ Broker not healthy before restart, proceeding anyway")
 
@@ -138,7 +173,7 @@ class RollingRestartManager:
                             if self._check_service_running(client, unit_name):
                                 if svc.role in ("broker", "broker_controller"):
                                     # For brokers, also check Kafka is accepting connections
-                                    if self._check_kafka_port(client):
+                                    if self._check_kafka_port(client, _cluster_listener_port(cluster)):
                                         healthy = True
                                         break
                                 else:
@@ -158,7 +193,7 @@ class RollingRestartManager:
                         # Step 5: Wait for ISR recovery (for brokers)
                         if svc.role in ("broker", "broker_controller"):
                             log(f"  Waiting for ISR recovery...")
-                            isr_ok = self._wait_for_isr(client, max_wait=120)
+                            isr_ok = self._wait_for_isr(client, cluster, max_wait=120)
                             if isr_ok:
                                 log(f"  ✓ ISR recovery complete")
                             else:
@@ -182,13 +217,18 @@ class RollingRestartManager:
             log(f"ERROR: {str(e)}")
             task["status"] = "error"
 
-    def _check_broker_health(self, client, role: str) -> bool:
-        """Check if broker is healthy before restart."""
+    def _check_broker_health(self, client, role: str, cluster: Cluster | None = None) -> bool:
+        """Check if broker is healthy before restart.
+
+        Uses the cluster's per-install Kafka path + listener port so
+        multi-cluster hosts probe the right broker."""
         if role not in ("broker", "broker_controller"):
             return True
+        kafka_home = cluster_paths.install_dir(cluster) if cluster else settings.KAFKA_INSTALL_DIR
+        port = _cluster_listener_port(cluster) if cluster else 9092
         exit_code, stdout, _ = SSHManager.exec_command(
             client,
-            f"{settings.KAFKA_INSTALL_DIR}/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 2>/dev/null | head -1",
+            f"{kafka_home}/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:{port} 2>/dev/null | head -1",
             timeout=15,
         )
         return exit_code == 0
@@ -207,12 +247,14 @@ class RollingRestartManager:
         )
         return exit_code == 0
 
-    def _wait_for_isr(self, client, max_wait: int = 120) -> bool:
+    def _wait_for_isr(self, client, cluster: Cluster | None = None, max_wait: int = 120) -> bool:
         """Wait for all partitions to be in-sync after broker restart."""
+        kafka_home = cluster_paths.install_dir(cluster) if cluster else settings.KAFKA_INSTALL_DIR
+        port = _cluster_listener_port(cluster) if cluster else 9092
         for _ in range(max_wait // 5):
             exit_code, stdout, _ = SSHManager.exec_command(
                 client,
-                f"{settings.KAFKA_INSTALL_DIR}/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe --under-replicated-partitions 2>/dev/null",
+                f"{kafka_home}/bin/kafka-topics.sh --bootstrap-server localhost:{port} --describe --under-replicated-partitions 2>/dev/null",
                 timeout=15,
             )
             if exit_code == 0 and not stdout.strip():
@@ -240,8 +282,8 @@ class RollingRestartManager:
                 continue
             try:
                 with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                    healthy = self._check_broker_health(client, svc.role)
-                    port_ok = self._check_kafka_port(client)
+                    healthy = self._check_broker_health(client, svc.role, cluster)
+                    port_ok = self._check_kafka_port(client, _cluster_listener_port(cluster))
                     checks.append({
                         "broker_id": svc.node_id,
                         "host": host.ip_address,

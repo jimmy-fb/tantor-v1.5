@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   Shield, ShieldOff, Plus, Trash2, RefreshCw, Loader2, AlertCircle,
   UserPlus, RotateCw, Copy, Eye, EyeOff, Lock, Clock, Check,
-  ChevronDown, ChevronUp, Search, Filter,
+  ChevronDown, ChevronUp, Search, Filter, FileKey, Upload,
 } from 'lucide-react';
 import type {
   KafkaUserInfo, KafkaUserCreatedResponse, KafkaUserRotateResponse,
@@ -13,12 +13,29 @@ import {
   getAcls, createAcl, deleteAcl,
   getAuditLog,
 } from '../../lib/api';
+import axios from 'axios';
+import { getAccessToken } from '../../lib/auth';
 
 interface Props {
   clusterId: string;
+  isExternal?: boolean;
 }
 
-type SecurityTab = 'users' | 'acls' | 'audit';
+type SecurityTab = 'users' | 'acls' | 'audit' | 'certificates';
+
+interface CertSummary {
+  cluster_id: string;
+  ca: {
+    present: boolean;
+    subject?: string;
+    fingerprint_sha256?: string;
+    not_before?: string;
+    not_after?: string;
+    uploaded?: boolean;
+    error?: string;
+  };
+  broker_certs: Array<{ filename: string; size_bytes: number }>;
+}
 
 const OPERATIONS = ['Read', 'Write', 'Create', 'Describe', 'Alter', 'Delete', 'All'];
 const RESOURCE_TYPES = ['topic', 'group', 'cluster', 'transactional-id'];
@@ -31,7 +48,7 @@ const ACTION_COLORS: Record<string, string> = {
   acl_deleted: 'bg-red-100 text-red-800',
 };
 
-export default function SecurityManager({ clusterId }: Props) {
+export default function SecurityManager({ clusterId, isExternal = false }: Props) {
   const [activeTab, setActiveTab] = useState<SecurityTab>('users');
 
   // ── Users state ──
@@ -74,6 +91,15 @@ export default function SecurityManager({ clusterId }: Props) {
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditFilter, setAuditFilter] = useState('');
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
+
+  // ── Certificates state (APB v1.4.0 #8) ──
+  const [certs, setCerts] = useState<CertSummary | null>(null);
+  const [certsLoading, setCertsLoading] = useState(false);
+  const [certsError, setCertsError] = useState('');
+  const [caCertFile, setCaCertFile] = useState<File | null>(null);
+  const [caKeyFile, setCaKeyFile] = useState<File | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadResult, setUploadResult] = useState<string | null>(null);
 
   // ── Data fetching ──
 
@@ -122,11 +148,59 @@ export default function SecurityManager({ clusterId }: Props) {
     }
   }, [clusterId, auditFilter]);
 
+  const fetchCerts = useCallback(async () => {
+    setCertsLoading(true);
+    setCertsError('');
+    try {
+      const token = getAccessToken();
+      const { data } = await axios.get<CertSummary>(`/api/clusters/${clusterId}/security/certificates`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
+      setCerts(data);
+    } catch (err: unknown) {
+      const axErr = err as { response?: { data?: { detail?: string } } };
+      setCertsError(axErr.response?.data?.detail || 'Failed to load certificates');
+    } finally {
+      setCertsLoading(false);
+    }
+  }, [clusterId]);
+
+  const handleUploadCa = async () => {
+    if (!caCertFile) {
+      setCertsError('Pick a CA certificate (.pem / .crt) to upload');
+      return;
+    }
+    setUploading(true);
+    setUploadResult(null);
+    setCertsError('');
+    try {
+      const fd = new FormData();
+      fd.append('ca_cert', caCertFile);
+      if (caKeyFile) fd.append('ca_key', caKeyFile);
+      const token = getAccessToken();
+      const { data } = await axios.post(
+        `/api/clusters/${clusterId}/security/certificates/ca`,
+        fd,
+        { headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) } }
+      );
+      setUploadResult(`Uploaded — subject: ${data.subject}`);
+      setCaCertFile(null);
+      setCaKeyFile(null);
+      fetchCerts();
+    } catch (err: unknown) {
+      const axErr = err as { response?: { data?: { detail?: string } } };
+      setCertsError(axErr.response?.data?.detail || 'Upload failed');
+    } finally {
+      setUploading(false);
+    }
+  };
+
   useEffect(() => {
     if (activeTab === 'users') fetchUsers();
     else if (activeTab === 'acls') fetchAcls();
     else if (activeTab === 'audit') fetchAuditLog();
-  }, [activeTab, fetchUsers, fetchAcls, fetchAuditLog]);
+    else if (activeTab === 'certificates') fetchCerts();
+  }, [activeTab, fetchUsers, fetchAcls, fetchAuditLog, fetchCerts]);
 
   // ── User actions ──
 
@@ -263,6 +337,7 @@ export default function SecurityManager({ clusterId }: Props) {
     { id: 'users', label: 'Users', icon: <UserPlus size={14} /> },
     { id: 'acls', label: 'ACLs', icon: <Lock size={14} /> },
     { id: 'audit', label: 'Audit Log', icon: <Clock size={14} /> },
+    { id: 'certificates', label: 'Certificates', icon: <FileKey size={14} /> },
   ];
 
   return (
@@ -376,7 +451,11 @@ export default function SecurityManager({ clusterId }: Props) {
           <div className="flex items-center gap-2 mb-4">
             <button
               onClick={() => { setShowCreateUser(true); setCreatedUser(null); setRotatedResult(null); }}
-              className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700"
+              disabled={isExternal}
+              title={isExternal
+                ? 'SCRAM user admin not supported for externally-connected clusters — kafka-python AdminClient gap. Manage users on the source cluster.'
+                : ''}
+              className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Plus size={14} /> Create User
             </button>
@@ -388,6 +467,13 @@ export default function SecurityManager({ clusterId }: Props) {
               <RefreshCw size={14} className={usersLoading ? 'animate-spin' : ''} /> Refresh
             </button>
           </div>
+          {isExternal && (
+            <div className="mb-4 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 px-3">
+              ⓘ SCRAM user creation, deletion and password rotation are not supported on
+              externally-connected clusters (kafka-python AdminClient gap). Manage users
+              directly on your source cluster via <code className="bg-white px-1 rounded">kafka-configs.sh</code>.
+            </div>
+          )}
 
           {/* Create user form */}
           {showCreateUser && (
@@ -842,6 +928,7 @@ export default function SecurityManager({ clusterId }: Props) {
                 <thead>
                   <tr className="bg-gray-50 text-left text-xs text-gray-500 uppercase">
                     <th className="px-4 py-3">Time</th>
+                    <th className="px-4 py-3">Actor</th>
                     <th className="px-4 py-3">Action</th>
                     <th className="px-4 py-3">Type</th>
                     <th className="px-4 py-3">Resource</th>
@@ -853,6 +940,9 @@ export default function SecurityManager({ clusterId }: Props) {
                     <tr key={log.id} className="hover:bg-gray-50">
                       <td className="px-4 py-3 text-xs text-gray-500 whitespace-nowrap">
                         {new Date(log.created_at).toLocaleString()}
+                      </td>
+                      <td className="px-4 py-3 text-xs text-gray-700 whitespace-nowrap">
+                        {log.actor_username || <span className="text-gray-300">—</span>}
                       </td>
                       <td className="px-4 py-3">
                         <span className={`px-2 py-0.5 rounded text-xs font-medium ${ACTION_COLORS[log.action] || 'bg-gray-100 text-gray-800'}`}>
@@ -880,7 +970,7 @@ export default function SecurityManager({ clusterId }: Props) {
                   {auditLogs.map(log =>
                     expandedLog === log.id && log.details ? (
                       <tr key={`${log.id}-detail`}>
-                        <td colSpan={5} className="px-4 py-3 bg-gray-50">
+                        <td colSpan={6} className="px-4 py-3 bg-gray-50">
                           <pre className="text-xs font-mono text-gray-600 whitespace-pre-wrap">
                             {(() => {
                               try {
@@ -896,6 +986,119 @@ export default function SecurityManager({ clusterId }: Props) {
                   )}
                 </tbody>
               </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ══════════ CERTIFICATES TAB (APB v1.4.0 #8) ══════════ */}
+      {activeTab === 'certificates' && (
+        <div className="space-y-4">
+          {certsError && (
+            <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg px-4 py-3 text-sm text-red-700">
+              <AlertCircle size={14} /> {certsError}
+            </div>
+          )}
+          {uploadResult && (
+            <div className="flex items-center gap-2 bg-green-50 border border-green-200 rounded-lg px-4 py-3 text-sm text-green-800">
+              <Check size={14} /> {uploadResult}
+            </div>
+          )}
+
+          {/* Current CA */}
+          <div className="border border-gray-200 rounded-xl p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-2">
+                <FileKey size={16} /> Cluster certificate authority
+              </h3>
+              <button
+                onClick={fetchCerts}
+                disabled={certsLoading}
+                className="text-xs text-blue-600 flex items-center gap-1 hover:underline"
+              >
+                <RefreshCw size={12} className={certsLoading ? 'animate-spin' : ''} /> Refresh
+              </button>
+            </div>
+            {certsLoading && !certs ? (
+              <div className="text-sm text-gray-500 flex items-center gap-2">
+                <Loader2 size={14} className="animate-spin" /> Loading…
+              </div>
+            ) : certs?.ca?.present ? (
+              <dl className="grid grid-cols-3 gap-x-4 gap-y-2 text-sm">
+                <dt className="text-gray-500">Subject</dt>
+                <dd className="col-span-2 font-mono text-xs text-gray-800 break-all">{certs.ca.subject || '—'}</dd>
+                <dt className="text-gray-500">Source</dt>
+                <dd className="col-span-2">
+                  {certs.ca.uploaded
+                    ? <span className="px-2 py-0.5 bg-blue-100 text-blue-800 rounded text-xs">Operator-supplied</span>
+                    : <span className="px-2 py-0.5 bg-gray-100 text-gray-700 rounded text-xs">Tantor-generated</span>
+                  }
+                </dd>
+                <dt className="text-gray-500">SHA-256</dt>
+                <dd className="col-span-2 font-mono text-xs text-gray-700 break-all">{certs.ca.fingerprint_sha256}</dd>
+                <dt className="text-gray-500">Valid until</dt>
+                <dd className="col-span-2 text-xs text-gray-700">{certs.ca.not_after ? new Date(certs.ca.not_after).toLocaleString() : '—'}</dd>
+              </dl>
+            ) : (
+              <p className="text-sm text-gray-500">No CA stored yet — Tantor generates one on first TLS deploy, or you can upload your own below.</p>
+            )}
+          </div>
+
+          {/* Upload CA */}
+          <div className="border border-gray-200 rounded-xl p-4">
+            <h3 className="text-sm font-semibold text-gray-900 flex items-center gap-2 mb-1">
+              <Upload size={16} /> Upload your own CA
+            </h3>
+            <p className="text-xs text-gray-500 mb-3">
+              Replace Tantor's auto-generated CA with your organization's CA so broker certificates chain up to a trust anchor your clients already accept.
+            </p>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">CA certificate (PEM, required)</label>
+                <input
+                  type="file"
+                  accept=".pem,.crt,.cer"
+                  onChange={e => setCaCertFile(e.target.files?.[0] || null)}
+                  className="text-sm"
+                />
+                {caCertFile && <span className="ml-2 text-xs text-gray-500">{caCertFile.name}</span>}
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">CA private key (PEM, optional)</label>
+                <input
+                  type="file"
+                  accept=".pem,.key"
+                  onChange={e => setCaKeyFile(e.target.files?.[0] || null)}
+                  className="text-sm"
+                />
+                {caKeyFile && <span className="ml-2 text-xs text-gray-500">{caKeyFile.name}</span>}
+                <p className="text-[11px] text-gray-500 mt-1">
+                  Without the key, Tantor still uses the uploaded cert as a trust anchor but signs broker certificates with its internal CA.
+                </p>
+              </div>
+              <button
+                onClick={handleUploadCa}
+                disabled={uploading || !caCertFile}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {uploading && <Loader2 size={14} className="animate-spin" />}
+                <Upload size={14} /> Upload CA
+              </button>
+            </div>
+          </div>
+
+          {/* Broker certificates */}
+          {certs?.broker_certs && certs.broker_certs.length > 0 && (
+            <div className="border border-gray-200 rounded-xl p-4">
+              <h3 className="text-sm font-semibold text-gray-900 mb-2">Broker keystores</h3>
+              <ul className="text-xs text-gray-700 space-y-1 font-mono">
+                {certs.broker_certs.map(c => (
+                  <li key={c.filename} className="flex justify-between">
+                    <span>{c.filename}</span>
+                    <span className="text-gray-400">{(c.size_bytes / 1024).toFixed(1)} KB</span>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </div>

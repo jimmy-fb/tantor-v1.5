@@ -51,3 +51,22 @@ class Cluster(Base):
     # Fernet-encrypted; same password used for keystore + truststore on every
     # broker so we don't have to thread per-broker passwords through Ansible.
     encrypted_tls_password: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ── External cluster broker hosts (for start/restart over SSH) ──────
+    # JSON-encoded list of {"host_id": "...", "kafka_unit": "kafka.service"}.
+    # Optional; present only when the operator has registered SSH-reachable
+    # broker hosts so Tantor can issue lifecycle actions (start/stop/restart)
+    # against an externally-deployed cluster. Tantor never touches Kafka data
+    # — it only runs systemctl on the customer-supplied unit name.
+    external_broker_hosts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ── Per-cluster Kafka paths (APB v1.2.0 #5: multi-cluster collision) ──
+    # When two managed clusters target the same broker host, the old shared
+    # /opt/kafka symlink + kafka.service unit collided. Each cluster now
+    # owns its own install dir, data dir, and systemd unit so they coexist.
+    # NULL means "use legacy defaults" (/opt/kafka, /var/lib/kafka/data,
+    # kafka.service) for backward compat with clusters created before this
+    # field existed.
+    kafka_install_dir: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    kafka_data_dir: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    kafka_unit_name: Mapped[str | None] = mapped_column(String(120), nullable=True)

@@ -38,7 +38,10 @@ class LogManager:
     @staticmethod
     def _build_journalctl_cmd(unit_name: str, lines: int, since: str | None,
                                priority: str | None, grep_filter: str | None) -> str:
-        cmd = f"journalctl -u {unit_name}.service --no-pager -n {lines} --output=short-iso"
+        # Use sudo -n: ec2-user / tantor can SSH but generally can't read
+        # other users' systemd journals without elevation. -n means
+        # non-interactive — fail rather than prompt for a password.
+        cmd = f"sudo -n journalctl -u {unit_name}.service --no-pager -n {lines} --output=short-iso"
         if since:
             cmd += f' --since="{since}"'
         if priority:
@@ -50,7 +53,9 @@ class LogManager:
 
     @staticmethod
     def _build_logfile_cmd(log_path: str, lines: int, grep_filter: str | None) -> str:
-        cmd = f"tail -n {lines} {log_path} 2>/dev/null"
+        # sudo for the same reason — kafka.service's log files are owned
+        # kafka:kafka mode 640 by default.
+        cmd = f"sudo -n tail -n {lines} {log_path} 2>/dev/null"
         if grep_filter:
             safe_filter = grep_filter.replace("'", "'\\''")
             cmd += f" | grep -i '{safe_filter}'"
@@ -64,14 +69,31 @@ class LogManager:
         since: str | None = None,
         priority: str | None = None,
         grep_filter: str | None = None,
+        unit_override: str | None = None,
+        kafka_install_dir: str | None = None,
     ) -> dict:
         """Fetch historical logs via SSH.
 
         Strategy: try journalctl first; if it fails (not found), fall back to
         reading the service's log file via tail.
+
+        unit_override + kafka_install_dir let the caller supply the
+        per-cluster systemd unit (e.g. kafka-prod-1ac9bbbe.service) and
+        Kafka install dir so multi-cluster deployments don't all read from
+        the legacy /opt/kafka path. Falls back to the role-derived defaults.
         """
-        unit_name = SERVICE_UNIT_MAP.get(service_role, "kafka")
-        log_path = SERVICE_LOG_FILE_MAP.get(service_role, "/opt/kafka/logs/server.log")
+        if unit_override:
+            # The override is the FULL unit name (e.g. "kafka-prod-XYZ.service");
+            # _build_journalctl_cmd appends ".service" so strip it here.
+            unit_name = unit_override.removesuffix(".service")
+        else:
+            unit_name = SERVICE_UNIT_MAP.get(service_role, "kafka")
+        if kafka_install_dir and service_role in ("broker", "broker_controller", "controller", "zookeeper"):
+            log_path = f"{kafka_install_dir}/logs/server.log"
+            if service_role == "controller":
+                log_path = f"{kafka_install_dir}/logs/controller.log"
+        else:
+            log_path = SERVICE_LOG_FILE_MAP.get(service_role, "/opt/kafka/logs/server.log")
 
         try:
             with SSHManager.connect(
@@ -110,20 +132,34 @@ class LogManager:
             }
 
     @staticmethod
-    def tail_logs(host: Host, service_role: str):
+    def tail_logs(host: Host, service_role: str, unit_override: str | None = None,
+                  kafka_install_dir: str | None = None):
         """Generator that yields log lines in real-time.
 
         Tries journalctl -f first; falls back to tail -f on the log file.
-        Used by the WebSocket endpoint for live tailing.
+        Used by the WebSocket endpoint for live tailing. Per-cluster
+        unit_override / kafka_install_dir keep this working when the
+        cluster's systemd unit isn't named "kafka.service" (multi-cluster
+        deployments — APB v1.2.0 #5).
         """
-        unit_name = SERVICE_UNIT_MAP.get(service_role, "kafka")
-        log_path = SERVICE_LOG_FILE_MAP.get(service_role, "/opt/kafka/logs/server.log")
+        if unit_override:
+            unit_name = unit_override.removesuffix(".service")
+        else:
+            unit_name = SERVICE_UNIT_MAP.get(service_role, "kafka")
+        if kafka_install_dir and service_role in ("broker", "broker_controller", "controller", "zookeeper"):
+            log_path = f"{kafka_install_dir}/logs/server.log"
+            if service_role == "controller":
+                log_path = f"{kafka_install_dir}/logs/controller.log"
+        else:
+            log_path = SERVICE_LOG_FILE_MAP.get(service_role, "/opt/kafka/logs/server.log")
 
-        # Build command that tries journalctl, falls back to tail -f
+        # Build command that tries journalctl, falls back to tail -f.
+        # sudo -n needed for both since journal + log files are owned by
+        # the kafka user, not the SSH user.
         cmd = (
             f"if command -v journalctl >/dev/null 2>&1; then "
-            f"journalctl -u {unit_name}.service -f --no-pager --output=short-iso; "
-            f"else tail -f {log_path} 2>/dev/null; fi"
+            f"sudo -n journalctl -u {unit_name}.service -f --no-pager --output=short-iso; "
+            f"else sudo -n tail -f {log_path} 2>/dev/null; fi"
         )
 
         client = None

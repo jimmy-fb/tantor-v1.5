@@ -185,6 +185,7 @@ export default function UserManagement() {
           <thead>
             <tr className="bg-gray-50 border-b border-gray-200">
               <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">User</th>
+              <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Source</th>
               <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Role</th>
               <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
               <th className="text-left px-6 py-3 text-xs font-medium text-gray-500 uppercase tracking-wider">Last Login</th>
@@ -197,6 +198,22 @@ export default function UserManagement() {
               <tr key={user.id} className="hover:bg-gray-50">
                 <td className="px-6 py-4">
                   <span className="font-medium text-gray-900">{user.username}</span>
+                </td>
+                <td className="px-6 py-4">
+                  {/* APB v1.4.0 #11 — show provenance so admins can tell at a
+                      glance whether a user is local or LDAP-synced. */}
+                  {user.auth_source === 'ldap' ? (
+                    <span
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-indigo-100 text-indigo-700"
+                      title={user.ldap_dn || 'Synced from directory'}
+                    >
+                      LDAP
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700">
+                      local
+                    </span>
+                  )}
                 </td>
                 <td className="px-6 py-4">
                   <button
@@ -256,13 +273,23 @@ export default function UserManagement() {
                         </button>
                       </div>
                     ) : (
-                      <button
-                        onClick={() => setEditingPassword(user.id)}
-                        className="p-1.5 text-gray-400 hover:text-blue-600 rounded"
-                        title="Change password"
-                      >
-                        <Key size={16} />
-                      </button>
+                      // APB v1.4.0 #11 — hide local password change for LDAP-synced users.
+                      user.auth_source === 'ldap' ? (
+                        <span
+                          className="p-1.5 text-gray-300 cursor-not-allowed"
+                          title="Password is managed by your directory (LDAP)"
+                        >
+                          <Key size={16} />
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setEditingPassword(user.id)}
+                          className="p-1.5 text-gray-400 hover:text-blue-600 rounded"
+                          title="Change password"
+                        >
+                          <Key size={16} />
+                        </button>
+                      )
                     )}
                     <button
                       onClick={() => handleDelete(user)}

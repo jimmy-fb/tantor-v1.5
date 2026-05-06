@@ -26,11 +26,25 @@
 
 set -e
 
-VERSION="1.0.0"
+VERSION="1.4.0"
+
+# Default paths follow FHS: code in /opt, mutable data in /var/lib, logs in /var/log.
+# `--install-dir <BASE>` collapses everything under BASE so customers with a
+# dedicated /data, /apps, etc. mountpoint don't need three separate paths
+# scattered across the system. APB asked for this in v1.2.0 #1 / v1.1 #43.
+#
+# We remember the operator's choice in /etc/tantor/install.conf so a later
+# `--reinstall` (or `--purge`) without --install-dir doesn't accidentally
+# install a second copy at /opt/tantor while the customer's real install
+# is at /data/tantor.
 TANTOR_HOME="/opt/tantor"
 TANTOR_DATA="/var/lib/tantor"
 TANTOR_LOG="/var/log/tantor"
 TANTOR_USER="tantor"
+if [ -f /etc/tantor/install.conf ]; then
+    # shellcheck disable=SC1091
+    . /etc/tantor/install.conf
+fi
 KAFKA_VERSION="4.1.0"
 KAFKA_SCALA="2.13"
 KAFKA_TGZ="kafka_${KAFKA_SCALA}-${KAFKA_VERSION}.tgz"
@@ -47,26 +61,151 @@ FORCE=false
 UNINSTALL=false
 PURGE=false
 REINSTALL=false
+TLS_ENABLE=false
+TLS_CERT_PATH=""
+TLS_KEY_PATH=""
 INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# ─── Install log + error trap ────────────────────────────────────────────────
+# Persist EVERYTHING to a file so frozen / failed installs are diagnosable.
+# Without this, customers see "stuck on step N" with no log to send back.
+INSTALL_LOG="/var/log/tantor-install.log"
+mkdir -p "$(dirname "$INSTALL_LOG")" 2>/dev/null || true
+: > "$INSTALL_LOG" 2>/dev/null || INSTALL_LOG="/tmp/tantor-install.log"
+exec 3>>"$INSTALL_LOG"  # fd 3 is the "verbose only" sink
+echo "=== Tantor installer v${VERSION} started at $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >&3
+
+# Run a command, write its stdout+stderr to the log file, do NOT show on screen.
+# If it fails, print the exit code and the last 40 lines of log so the operator
+# sees something actionable instead of a blank "stuck on step N" screen.
+log_run() {
+    local label="$1"; shift
+    echo "+ [$label] $*" >&3
+    if ! ( "$@" >&3 2>&1 ); then
+        local rc=$?
+        echo "" >&2
+        echo -e "${RED}✗ [$label] failed (exit $rc)${NC}" >&2
+        echo -e "${YELLOW}  Last log lines (full log: $INSTALL_LOG):${NC}" >&2
+        tail -n 40 "$INSTALL_LOG" >&2 || true
+        return $rc
+    fi
+}
+
+# Same idea but with a hard timeout — for commands that can hang on network
+# stalls (curl, dnf metadata refresh on broken proxies, etc.).
+log_run_timeout() {
+    local secs="$1"; local label="$2"; shift 2
+    echo "+ [$label] (timeout ${secs}s) $*" >&3
+    if ! timeout "$secs" "$@" >&3 2>&1; then
+        local rc=$?
+        echo "" >&2
+        if [ $rc -eq 124 ]; then
+            echo -e "${RED}✗ [$label] timed out after ${secs}s${NC}" >&2
+            echo -e "${YELLOW}  Likely a network / firewall / proxy issue.${NC}" >&2
+        else
+            echo -e "${RED}✗ [$label] failed (exit $rc)${NC}" >&2
+        fi
+        echo -e "${YELLOW}  Last log lines (full log: $INSTALL_LOG):${NC}" >&2
+        tail -n 40 "$INSTALL_LOG" >&2 || true
+        return $rc
+    fi
+}
+
+# Background heartbeat — prints "still working" every 30s during long steps so
+# the operator knows the installer hasn't frozen.
+_HEARTBEAT_PID=""
+heartbeat_start() {
+    local label="$1"
+    heartbeat_stop  # belt-and-braces in case of nested calls
+    (
+        local n=0
+        while sleep 30; do
+            n=$((n + 30))
+            echo -e "  ${YELLOW}… ${label} still running (${n}s elapsed)${NC}"
+        done
+    ) &
+    _HEARTBEAT_PID=$!
+    disown 2>/dev/null || true
+}
+heartbeat_stop() {
+    if [ -n "$_HEARTBEAT_PID" ] && kill -0 "$_HEARTBEAT_PID" 2>/dev/null; then
+        kill "$_HEARTBEAT_PID" 2>/dev/null || true
+        wait "$_HEARTBEAT_PID" 2>/dev/null || true
+    fi
+    _HEARTBEAT_PID=""
+}
+
+# Trap any unhandled error and tell the operator where to look.
+on_error() {
+    local rc=$?
+    local line=$1
+    heartbeat_stop
+    echo "" >&2
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+    echo -e "${RED}✗ Tantor install failed (line $line, exit $rc)${NC}" >&2
+    echo -e "${YELLOW}  Full log:    $INSTALL_LOG${NC}" >&2
+    echo -e "${YELLOW}  Send this file to your Tantor contact for diagnosis.${NC}" >&2
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}" >&2
+    exit $rc
+}
+trap 'on_error $LINENO' ERR
+trap 'heartbeat_stop' EXIT
 
 # ─── Parse Arguments ───
 while [[ $# -gt 0 ]]; do
     case $1 in
         --force|-f|--yes|-y)  FORCE=true; shift ;;
         --uninstall)          UNINSTALL=true; shift ;;
-        # --purge implies --uninstall AND wipes /var/lib/tantor (DB + repos).
+        # --purge implies --uninstall AND wipes the data dir (DB + repos).
         --purge)              UNINSTALL=true; PURGE=true; FORCE=true; shift ;;
         # --reinstall = uninstall (preserve data) then run a fresh install.
         --reinstall)          REINSTALL=true; FORCE=true; shift ;;
+        # --install-dir <BASE> overrides the default FHS layout. App goes to
+        # BASE/app, data to BASE/data, logs to BASE/log. The runtime backend
+        # picks these up via the TANTOR_HOME / TANTOR_DATA / TANTOR_LOG env
+        # vars on its systemd unit, so nothing else is hardcoded.
+        --install-dir|--prefix)
+            if [ -z "$2" ]; then echo "Error: --install-dir requires a path"; exit 1; fi
+            BASE="$2"
+            TANTOR_HOME="$BASE/app"
+            TANTOR_DATA="$BASE/data"
+            TANTOR_LOG="$BASE/log"
+            shift 2
+            ;;
+        # APB v1.4.0 #12 — wrap the Tantor UI in HTTPS. With no cert+key
+        # paths supplied, the installer mints a self-signed cert valid
+        # for the host's IP/hostname. Operators that already have a real
+        # cert can pass --tls-cert and --tls-key.
+        --tls)
+            TLS_ENABLE=true
+            shift
+            ;;
+        --tls-cert)
+            if [ -z "$2" ]; then echo "Error: --tls-cert requires a path"; exit 1; fi
+            TLS_ENABLE=true
+            TLS_CERT_PATH="$2"
+            shift 2
+            ;;
+        --tls-key)
+            if [ -z "$2" ]; then echo "Error: --tls-key requires a path"; exit 1; fi
+            TLS_ENABLE=true
+            TLS_KEY_PATH="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: sudo ./install.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --force       Skip confirmation prompts"
-            echo "  --uninstall   Remove Tantor (preserves /var/lib/tantor)"
-            echo "  --purge       Uninstall AND wipe /var/lib/tantor (data, DB, repos)"
-            echo "  --reinstall   Uninstall + fresh install in one step (data preserved)"
-            echo "  --help        Show this message"
+            echo "  --force                 Skip confirmation prompts"
+            echo "  --uninstall             Remove Tantor (preserves data dir)"
+            echo "  --purge                 Uninstall AND wipe data + DB + repos"
+            echo "  --reinstall             Uninstall + fresh install in one step (data preserved)"
+            echo "  --install-dir <BASE>    Install everything under BASE/{app,data,log}"
+            echo "                          Default: /opt/tantor + /var/lib/tantor + /var/log/tantor"
+            echo "  --tls                   Enable HTTPS for the Tantor UI (auto-generates a self-signed cert)"
+            echo "  --tls-cert <path>       Use this cert file instead of self-signing (PEM)"
+            echo "  --tls-key  <path>       Use this private key (PEM, must match --tls-cert)"
+            echo "  --help                  Show this message"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -124,6 +263,12 @@ do_uninstall() {
     rm -rf /etc/systemd/system/tantor-backend.service.d
     rm -f /etc/nginx/sites-enabled/tantor.conf
     rm -f /etc/nginx/conf.d/tantor.conf
+    # Restore stock RHEL nginx.conf if we replaced it during install — without
+    # this, nginx after uninstall still points to a Tantor-mangled config and
+    # may fail to start.
+    if [ -f /etc/nginx/nginx.conf.tantor-bak ]; then
+        mv /etc/nginx/nginx.conf.tantor-bak /etc/nginx/nginx.conf
+    fi
     systemctl daemon-reload 2>/dev/null || true
     systemctl restart nginx 2>/dev/null || true
     rm -rf "$TANTOR_HOME"
@@ -134,6 +279,27 @@ do_uninstall() {
     if [ "$PURGE" = true ]; then
         echo -e "${YELLOW}  --purge requested: also wiping data at $TANTOR_DATA${NC}"
         rm -rf "$TANTOR_DATA"
+        # Kafka, Apicurio, Prometheus etc. own their own data dirs — wipe those
+        # too on --purge, otherwise stale meta.properties / KRaft cluster IDs
+        # break the next deploy with "Invalid cluster.id".
+        rm -rf /var/lib/kafka /var/log/kafka /var/lib/prometheus /var/lib/grafana /var/lib/alertmanager
+        # Grafana ships as a deb/rpm package and its dpkg/rpm state survives
+        # a plain `rm -rf` on its data dir — leaving its postinst convinced
+        # it's still "installed" and skipping data dir recreation on next
+        # deploy. Fully purge the package state too.
+        if command -v dpkg-query &>/dev/null && dpkg-query -W grafana &>/dev/null; then
+            DEBIAN_FRONTEND=noninteractive dpkg --purge --force-all grafana 2>/dev/null || true
+        fi
+        if command -v rpm &>/dev/null && rpm -q grafana &>/dev/null; then
+            dnf remove -y grafana 2>/dev/null || rpm -e --nodeps grafana 2>/dev/null || true
+        fi
+        # nginx dpkg/rpm state can stay — we only manage its config drop-in.
+        # Wipe install log + tantor user home (userdel -r is best-effort).
+        rm -f /var/log/tantor-install.log
+        rm -rf /home/${TANTOR_USER}
+        # Drop the install layout file so the next install starts at default
+        # paths unless --install-dir is supplied again.
+        rm -rf /etc/tantor
         # Also remove the system user since we're nuking everything.
         userdel -r "$TANTOR_USER" 2>/dev/null || true
     fi
@@ -172,7 +338,9 @@ echo ""
 detect_os
 echo -e "  ${BLUE}OS Detected:${NC}  $OS_NAME"
 echo -e "  ${BLUE}OS Family:${NC}    $OS_FAMILY"
-echo -e "  ${BLUE}Install To:${NC}   $TANTOR_HOME"
+echo -e "  ${BLUE}App dir:${NC}      $TANTOR_HOME"
+echo -e "  ${BLUE}Data dir:${NC}     $TANTOR_DATA"
+echo -e "  ${BLUE}Log dir:${NC}      $TANTOR_LOG"
 echo ""
 
 # ─── Verify source ───
@@ -193,51 +361,71 @@ echo -e "\n${BLUE}▶ Step 1/9: Installing system dependencies...${NC}"
 
 install_deps_debian() {
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq \
+    echo -e "  apt-get update..."
+    heartbeat_start "apt-get update"
+    log_run_timeout 300 "apt-get update" apt-get update -qq
+    heartbeat_stop
+
+    echo -e "  Installing python, nginx, ssh, curl..."
+    heartbeat_start "apt install (core packages)"
+    log_run_timeout 600 "apt install core" apt-get install -y -qq \
         python3 python3-pip python3-venv python3-full \
         nginx \
         openssh-client sshpass \
-        wget curl jq gnupg ca-certificates net-tools \
-        > /dev/null 2>&1
+        wget curl jq gnupg ca-certificates net-tools
+    heartbeat_stop
 
-    # Install Node.js 20 for building frontend
     if ! command -v node &>/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 18 ]; then
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-        apt-get install -y -qq nodejs > /dev/null 2>&1
+        echo -e "  Adding NodeSource repo + installing nodejs 20..."
+        heartbeat_start "NodeSource setup + nodejs"
+        log_run_timeout 120 "NodeSource setup_20.x" bash -c \
+            "curl -fsSL --connect-timeout 15 --max-time 90 https://deb.nodesource.com/setup_20.x | bash -"
+        log_run_timeout 300 "apt install nodejs" apt-get install -y -qq nodejs
+        heartbeat_stop
     fi
     echo -e "${GREEN}✓ System packages installed${NC}"
 }
 
 install_deps_rhel() {
-    dnf install -y -q epel-release 2>/dev/null || true
+    echo -e "  Installing EPEL..."
+    log_run_timeout 180 "dnf install epel-release" bash -c "dnf install -y -q epel-release || true"
 
-    # RHEL 8.x ships Python 3.6 — too old for FastAPI. Install 3.11 via AppStream.
+    # RHEL 8.x ships Python 3.6, RHEL/Rocky 9 ships 3.9.
+    # ansible-core 2.16+ requires Python 3.10+, so install Python 3.11 from AppStream
+    # for anything older than 3.10.
     local py_ver
     py_ver=$(python3 -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo "0")
-    if [ "$py_ver" -lt 9 ]; then
-        echo "  Default Python 3.${py_ver} too old, installing Python 3.11..."
-        dnf module enable -y python311 2>/dev/null || true
-        dnf install -y -q python3.11 python3.11-pip python3.11-devel 2>/dev/null
+    if [ "$py_ver" -lt 10 ]; then
+        echo -e "  Default Python 3.${py_ver} too old for ansible-core 2.16+, installing Python 3.11..."
+        heartbeat_start "dnf install python3.11"
+        log_run_timeout 60 "dnf module enable python311" bash -c "dnf module enable -y python311 || true"
+        log_run_timeout 600 "dnf install python3.11" dnf install -y -q python3.11 python3.11-pip python3.11-devel
+        heartbeat_stop
         if command -v python3.11 &>/dev/null; then
-            alternatives --set python3 /usr/bin/python3.11 2>/dev/null || \
-                alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 2>/dev/null || true
+            log_run "alternatives python3.11" bash -c \
+                "alternatives --set python3 /usr/bin/python3.11 2>/dev/null || \
+                 alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 2>/dev/null || true"
         else
-            echo -e "${RED}ERROR: Failed to install Python 3.11${NC}"
+            echo -e "${RED}ERROR: Failed to install Python 3.11. See $INSTALL_LOG${NC}" >&2
             exit 1
         fi
     fi
 
-    dnf install -y -q \
+    echo -e "  Installing nginx, ssh, curl..."
+    heartbeat_start "dnf install (core packages)"
+    log_run_timeout 600 "dnf install core" dnf install -y -q \
         nginx \
         openssh-clients sshpass \
-        wget curl jq ca-certificates net-tools \
-        > /dev/null 2>&1
+        wget curl jq ca-certificates net-tools
+    heartbeat_stop
 
-    # Install Node.js 20 for building frontend
     if ! command -v node &>/dev/null || [ "$(node -v | cut -d. -f1 | tr -d v)" -lt 18 ]; then
-        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1
-        dnf install -y -q nodejs > /dev/null 2>&1
+        echo -e "  Adding NodeSource repo + installing nodejs 20..."
+        heartbeat_start "NodeSource setup + nodejs"
+        log_run_timeout 120 "NodeSource setup_20.x" bash -c \
+            "curl -fsSL --connect-timeout 15 --max-time 90 https://rpm.nodesource.com/setup_20.x | bash -"
+        log_run_timeout 300 "dnf install nodejs" dnf install -y -q nodejs
+        heartbeat_stop
     fi
     echo -e "${GREEN}✓ System packages installed${NC}"
 }
@@ -278,17 +466,51 @@ mkdir -p \
     "$TANTOR_DATA/ssh" \
     "$TANTOR_DATA/backups" \
     "$TANTOR_DATA/certs" \
+    "$TANTOR_DATA/secrets" \
     "$TANTOR_LOG/backend" \
     "$TANTOR_LOG/nginx"
+
+# Migrate Fernet/JWT secrets from the old in-tree location to the data dir on
+# upgrade. /opt/tantor is wiped on --reinstall but /var/lib/tantor is preserved,
+# so secrets must live with the data they decrypt — see backend/app/config.py.
+if [ -d "$TANTOR_HOME/backend/.secrets" ] && [ ! -f "$TANTOR_DATA/secrets/fernet.key" ]; then
+    cp -an "$TANTOR_HOME/backend/.secrets/." "$TANTOR_DATA/secrets/" 2>/dev/null || true
+fi
 
 # Set ownership + traversable permissions on the Tantor tree right after
 # creation so the service user can read/write before chown -R at the end.
 chown -R "$TANTOR_USER:$TANTOR_USER" "$TANTOR_HOME" "$TANTOR_DATA" "$TANTOR_LOG"
 chmod 755 "$TANTOR_HOME" "$TANTOR_DATA" "$TANTOR_LOG"
 
+# When --install-dir is used (e.g. /data/tantor), SELinux blocks systemd
+# from writing logs because the custom path doesn't carry var_log_t /
+# usr_t / var_lib_t labels. Set them explicitly so systemd-managed
+# StandardOutput= and exec policy work on enforcing systems.
+if command -v chcon >/dev/null 2>&1 && [ -f /sys/fs/selinux/enforce ]; then
+    chcon -R -t var_log_t   "$TANTOR_LOG"  2>/dev/null || true
+    chcon -R -t var_lib_t   "$TANTOR_DATA" 2>/dev/null || true
+    chcon -R -t bin_t       "$TANTOR_HOME" 2>/dev/null || true
+fi
+
 # Grant tantor user passwordless sudo
 echo "${TANTOR_USER} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/tantor
 chmod 440 /etc/sudoers.d/tantor
+
+# Persist install layout so future invocations of install.sh (e.g.
+# --reinstall, --purge) keep using the same paths instead of silently
+# reverting to /opt/tantor. APB hit this when their --reinstall created
+# a parallel install while the original was at /data/tantor.
+mkdir -p /etc/tantor
+cat > /etc/tantor/install.conf <<CONFEOF
+# Auto-generated by tantor installer. Edit at your own risk — run
+# 'sudo /tmp/tantor-installer.bin --install-dir <new>' to relocate.
+TANTOR_HOME="$TANTOR_HOME"
+TANTOR_DATA="$TANTOR_DATA"
+TANTOR_LOG="$TANTOR_LOG"
+TANTOR_USER="$TANTOR_USER"
+TLS_ENABLE=$TLS_ENABLE
+CONFEOF
+chmod 644 /etc/tantor/install.conf
 
 echo -e "${GREEN}✓ User '${TANTOR_USER}' and directories created${NC}"
 
@@ -310,7 +532,12 @@ fi
 # ─── Step 4: Python Dependencies ───
 echo -e "${BLUE}▶ Step 4/9: Installing Python dependencies...${NC}"
 
-python3 -m venv "$TANTOR_HOME/venv"
+# Pick the newest available python — ansible-core 2.16+ wants 3.10+. Prefer python3.11
+# (installed by us on RHEL 8/9) over the system python3 which may be 3.6 or 3.9.
+PYTHON_BIN=$(command -v python3.11 || command -v python3.12 || command -v python3.10 || command -v python3)
+echo "  Using $PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
+
+"$PYTHON_BIN" -m venv "$TANTOR_HOME/venv"
 "$TANTOR_HOME/venv/bin/pip" install --upgrade pip -q 2>/dev/null
 "$TANTOR_HOME/venv/bin/pip" install -q -r "$INSTALL_DIR/backend/requirements.txt"
 
@@ -340,7 +567,27 @@ echo -e "${BLUE}▶ Step 6/9: Installing frontend...${NC}"
 
 cp -r "$INSTALL_DIR/frontend/dist/"* "$TANTOR_HOME/frontend/dist/"
 
-echo -e "${GREEN}✓ Frontend installed${NC}"
+# Validate. APB hit a case where --purge + reinstall left an empty dist/
+# because of a network issue during npm ci — verify the bundle exists,
+# the assets directory has at least one .js file, and index.html mentions
+# at least one of those .js files. If any of these fail, abort with a
+# clear error instead of finishing "successfully" and leaving a blank UI.
+if [ ! -f "$TANTOR_HOME/frontend/dist/index.html" ]; then
+    echo -e "${RED}ERROR: frontend/dist/index.html is missing after copy.${NC}" >&2
+    echo "  Source dir: $INSTALL_DIR/frontend/dist (probably empty in this build)." >&2
+    exit 1
+fi
+JS_COUNT=$(ls "$TANTOR_HOME/frontend/dist/assets/"*.js 2>/dev/null | wc -l | tr -d ' ')
+if [ "${JS_COUNT:-0}" -lt 1 ]; then
+    echo -e "${RED}ERROR: no JavaScript bundle in $TANTOR_HOME/frontend/dist/assets/${NC}" >&2
+    echo "  The .bin was packaged with a broken frontend dist. Re-build the .bin." >&2
+    exit 1
+fi
+if ! grep -q "/assets/" "$TANTOR_HOME/frontend/dist/index.html"; then
+    echo -e "${RED}ERROR: frontend/dist/index.html does not reference /assets/ — UI will not load.${NC}" >&2
+    exit 1
+fi
+echo -e "${GREEN}✓ Frontend installed (${JS_COUNT} JS bundle$([ "$JS_COUNT" = "1" ] || echo s))${NC}"
 
 # ─── Step 7: Download Kafka Binary ───
 echo -e "${BLUE}▶ Step 7/9: Installing Kafka binary...${NC}"
@@ -359,9 +606,11 @@ elif [ -f "$KAFKA_DEST" ]; then
 else
     echo -e "${YELLOW}  Downloading Kafka ${KAFKA_VERSION} (~113 MB)...${NC}"
     # Try the primary mirror first, then archive, with one retry each.
+    # archive.apache.org keeps every release; downloads.apache.org rotates point
+    # releases off the CDN as new ones ship. Hit archive first — it always works.
     KAFKA_URLS=(
-        "https://downloads.apache.org/kafka/${KAFKA_VERSION}/${KAFKA_TGZ}"
         "https://archive.apache.org/dist/kafka/${KAFKA_VERSION}/${KAFKA_TGZ}"
+        "https://downloads.apache.org/kafka/${KAFKA_VERSION}/${KAFKA_TGZ}"
     )
     DOWNLOAD_OK=0
     for url in "${KAFKA_URLS[@]}"; do
@@ -391,12 +640,58 @@ fi
 # ─── Step 8: Configure Services ───
 echo -e "${BLUE}▶ Step 8/9: Configuring services...${NC}"
 
-# Nginx config
-NGINX_CONF='server {
+# APB v1.4.0 #12 — optionally generate / accept a TLS cert for the UI.
+if [ "$TLS_ENABLE" = true ]; then
+    TLS_DIR="/etc/tantor/tls"
+    mkdir -p "$TLS_DIR"
+    chmod 750 "$TLS_DIR"
+    if [ -n "$TLS_CERT_PATH" ] && [ -n "$TLS_KEY_PATH" ]; then
+        echo -e "${BLUE}  Using operator-supplied TLS material${NC}"
+        cp "$TLS_CERT_PATH" "$TLS_DIR/server.crt"
+        cp "$TLS_KEY_PATH"  "$TLS_DIR/server.key"
+    elif [ -f "$TLS_DIR/server.crt" ] && [ -f "$TLS_DIR/server.key" ]; then
+        echo -e "${BLUE}  Reusing existing TLS cert at $TLS_DIR${NC}"
+    else
+        echo -e "${BLUE}  Generating self-signed TLS cert (valid 825 days)${NC}"
+        HOST_FQDN="$(hostname -f 2>/dev/null || hostname)"
+        HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        SAN="DNS:${HOST_FQDN},DNS:localhost,IP:127.0.0.1"
+        if [ -n "$HOST_IP" ]; then SAN="$SAN,IP:${HOST_IP}"; fi
+        log_run "tls-keygen" openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "$TLS_DIR/server.key" \
+            -out    "$TLS_DIR/server.crt" \
+            -days 825 \
+            -subj "/CN=${HOST_FQDN}" \
+            -addext "subjectAltName=${SAN}" || true
+    fi
+    chmod 600 "$TLS_DIR/server.key" 2>/dev/null || true
+    chmod 644 "$TLS_DIR/server.crt" 2>/dev/null || true
+fi
+
+# Nginx config. Single-quoted heredoc keeps nginx variables ($host, $uri,
+# $remote_addr) literal; we sed-substitute __TANTOR_HOME__ afterwards so the
+# `--install-dir` override propagates without breaking nginx's own variables.
+if [ "$TLS_ENABLE" = true ]; then
+    NGINX_CONF='# APB v1.4.0 #12 — HTTPS for the Tantor UI. The :80 server
+# unconditionally redirects to https so bookmarks keep working.
+server {
     listen 80 default_server;
     server_name _;
+    return 301 https://$host$request_uri;
+}
 
-    root /opt/tantor/frontend/dist;
+server {
+    listen 443 ssl default_server;
+    http2 on;
+    server_name _;
+
+    ssl_certificate     /etc/tantor/tls/server.crt;
+    ssl_certificate_key /etc/tantor/tls/server.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+
+    root __TANTOR_HOME__/frontend/dist;
     index index.html;
 
     client_max_body_size 500M;
@@ -434,6 +729,51 @@ NGINX_CONF='server {
         add_header Cache-Control "public, immutable";
     }
 }'
+else
+    NGINX_CONF='server {
+    listen 80 default_server;
+    server_name _;
+
+    root __TANTOR_HOME__/frontend/dist;
+    index index.html;
+
+    client_max_body_size 500M;
+
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml text/javascript image/svg+xml;
+    gzip_min_length 256;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400;
+    }
+
+    location ^~ /grafana/ {
+        proxy_pass http://127.0.0.1:3000/;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}'
+fi
+NGINX_CONF="${NGINX_CONF//__TANTOR_HOME__/$TANTOR_HOME}"
 
 if [ "$OS_FAMILY" = "debian" ]; then
     echo "$NGINX_CONF" > /etc/nginx/sites-enabled/tantor.conf
@@ -441,18 +781,50 @@ if [ "$OS_FAMILY" = "debian" ]; then
 else
     echo "$NGINX_CONF" > /etc/nginx/conf.d/tantor.conf
     rm -f /etc/nginx/conf.d/default.conf
-    # Remove default server block in RHEL nginx.conf
-    if grep -q 'default_server' /etc/nginx/nginx.conf 2>/dev/null; then
-        sed -i '/^    server {/,/^    }/d' /etc/nginx/nginx.conf
+    # Replace the stock RHEL nginx.conf with a minimal version that drops the
+    # embedded default server block (which would otherwise win on :80) but keeps
+    # the include of conf.d/*.conf so our tantor.conf takes over.
+    if [ ! -f /etc/nginx/nginx.conf.tantor-bak ]; then
+        cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.tantor-bak
     fi
+    cat > /etc/nginx/nginx.conf <<'NGXEOF'
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log;
+pid /run/nginx.pid;
+
+include /usr/share/nginx/modules/*.conf;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+    access_log  /var/log/nginx/access.log  main;
+    sendfile            on;
+    tcp_nopush          on;
+    tcp_nodelay         on;
+    keepalive_timeout   65;
+    types_hash_max_size 4096;
+    include             /etc/nginx/mime.types;
+    default_type        application/octet-stream;
+
+    include /etc/nginx/conf.d/*.conf;
+}
+NGXEOF
     # SELinux
     if command -v setsebool &>/dev/null; then
         setsebool -P httpd_can_network_connect 1 2>/dev/null || true
     fi
 fi
 
-# Systemd service
-cat > /etc/systemd/system/tantor-backend.service << 'SYSEOF'
+# Systemd service. Use double-quoted heredoc + escaped $MAINPID so the
+# install-time TANTOR_HOME / TANTOR_DATA / TANTOR_LOG variables interpolate
+# but systemd's own $MAINPID stays literal.
+cat > /etc/systemd/system/tantor-backend.service <<SYSEOF
 [Unit]
 Description=Tantor Kafka Manager — Backend API
 After=network.target
@@ -460,17 +832,24 @@ Wants=nginx.service
 
 [Service]
 Type=simple
-User=tantor
-Group=tantor
-WorkingDirectory=/opt/tantor/backend
-Environment=DATABASE_URL=sqlite:////var/lib/tantor/db/tantor.db
+User=${TANTOR_USER}
+Group=${TANTOR_USER}
+WorkingDirectory=${TANTOR_HOME}/backend
+Environment=DATABASE_URL=sqlite:///${TANTOR_DATA}/db/tantor.db
+Environment=TANTOR_HOME=${TANTOR_HOME}
+Environment=TANTOR_DATA=${TANTOR_DATA}
+Environment=TANTOR_LOG=${TANTOR_LOG}
+Environment=TANTOR_SECRETS_DIR=${TANTOR_DATA}/secrets
+Environment=ANSIBLE_WORKING_DIR=${TANTOR_DATA}/ansible_work
+Environment=KAFKA_REPO_DIR=${TANTOR_DATA}/repo/kafka
+Environment=APICURIO_REPO_DIR=${TANTOR_DATA}/repo/apicurio
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/tantor/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=${TANTOR_HOME}/venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 2
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=always
 RestartSec=5
-StandardOutput=append:/var/log/tantor/backend/stdout.log
-StandardError=append:/var/log/tantor/backend/stderr.log
+StandardOutput=append:${TANTOR_LOG}/backend/stdout.log
+StandardError=append:${TANTOR_LOG}/backend/stderr.log
 NoNewPrivileges=false
 ProtectSystem=false
 
@@ -510,8 +889,12 @@ fi
 # usual Tantor host-deploy code path works against this VM.
 "$TANTOR_HOME/venv/bin/python3" - <<PYEOF || echo "  (localhost auto-register skipped)"
 import os, sys, uuid
-sys.path.insert(0, "/opt/tantor/backend")
-os.environ.setdefault("DATABASE_URL", "sqlite:////var/lib/tantor/db/tantor.db")
+sys.path.insert(0, "${TANTOR_HOME}/backend")
+os.environ["TANTOR_HOME"] = "${TANTOR_HOME}"
+os.environ["TANTOR_DATA"] = "${TANTOR_DATA}"
+os.environ["TANTOR_LOG"] = "${TANTOR_LOG}"
+os.environ["TANTOR_SECRETS_DIR"] = "${TANTOR_DATA}/secrets"
+os.environ.setdefault("DATABASE_URL", "sqlite:///${TANTOR_DATA}/db/tantor.db")
 from app.database import Base, engine, SessionLocal
 from app.models.host import Host
 from app.services.crypto import encrypt
@@ -539,6 +922,13 @@ echo -e "${BLUE}▶ Step 9/9: Starting services...${NC}"
 
 chown -R "$TANTOR_USER:$TANTOR_USER" "$TANTOR_HOME" "$TANTOR_DATA" "$TANTOR_LOG"
 chmod -R o+r "$TANTOR_HOME/frontend/dist"
+
+# Re-apply SELinux labels after the recursive chown (chown can reset xattrs).
+if command -v chcon >/dev/null 2>&1 && [ -f /sys/fs/selinux/enforce ]; then
+    chcon -R -t var_log_t   "$TANTOR_LOG"  2>/dev/null || true
+    chcon -R -t var_lib_t   "$TANTOR_DATA" 2>/dev/null || true
+    chcon -R -t bin_t       "$TANTOR_HOME" 2>/dev/null || true
+fi
 
 systemctl restart nginx
 systemctl restart tantor-backend
@@ -581,4 +971,6 @@ echo -e "  ${BLUE}Service commands:${NC}"
 echo "    systemctl status tantor-backend    — Check backend"
 echo "    systemctl status nginx             — Check nginx"
 echo "    journalctl -u tantor-backend -f    — View logs"
+echo ""
+echo -e "  ${BLUE}Install log:${NC}      $INSTALL_LOG"
 echo ""

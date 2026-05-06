@@ -362,12 +362,28 @@ function ConnectModal({
                   <AlertCircle size={12} /> SSL verification OFF — vulnerable to MITM. Use only for dev clusters.
                 </div>
               )}
-              <Field label={`CA certificate PEM ${form.id ? '(leave blank to keep)' : '(optional)'}`}
-                value={form.ssl_ca_pem} onChange={(v) => onChange({ ssl_ca_pem: v })} rows={3} />
-              <Field label={`Client certificate PEM ${form.id ? '(leave blank to keep)' : '(optional, mTLS only)'}`}
-                value={form.ssl_cert_pem} onChange={(v) => onChange({ ssl_cert_pem: v })} rows={3} />
-              <Field label={`Client key PEM ${form.id ? '(leave blank to keep)' : '(optional, mTLS only)'}`}
-                value={form.ssl_key_pem} onChange={(v) => onChange({ ssl_key_pem: v })} rows={3} />
+              <PemField
+                label={`CA certificate (server) ${form.id ? '(leave blank to keep)' : '(optional)'}`}
+                value={form.ssl_ca_pem}
+                onChange={(v) => onChange({ ssl_ca_pem: v })}
+                accept=".pem,.crt,.cer"
+              />
+              <PemField
+                label={`Client certificate ${form.id ? '(leave blank to keep)' : '(mTLS only)'}`}
+                value={form.ssl_cert_pem}
+                onChange={(v) => onChange({ ssl_cert_pem: v })}
+                accept=".pem,.crt,.cer"
+              />
+              <PemField
+                label={`Client private key ${form.id ? '(leave blank to keep)' : '(mTLS only)'}`}
+                value={form.ssl_key_pem}
+                onChange={(v) => onChange({ ssl_key_pem: v })}
+                accept=".pem,.key"
+              />
+              <div className="text-[11px] text-gray-500 italic">
+                Tip: paste PEM content into the textarea, or click <strong>Upload</strong> to load a .pem / .crt / .key file from disk.
+                JKS keystores aren't supported directly — convert with <code className="bg-gray-100 px-1 rounded">keytool -importkeystore ... -deststoretype PKCS12</code> then <code className="bg-gray-100 px-1 rounded">openssl pkcs12 -in ... -out ...pem</code>.
+              </div>
             </div>
           )}
         </div>
@@ -387,12 +403,49 @@ function ConnectModal({
   );
 }
 
-function Field({ label, value, onChange, rows = 1 }: { label: string; value: string; onChange: (v: string) => void; rows?: number }) {
+
+function PemField({
+  label, value, onChange, accept,
+}: {
+  label: string; value: string; onChange: (v: string) => void; accept: string;
+}) {
+  // PEM-aware textarea + "Upload" button. The file is read in the operator's
+  // browser via FileReader so its bytes never leave their machine until they
+  // hit Save (and even then are encrypted at rest by the backend's Fernet).
+  const fileInputId = `pem-file-${label.replace(/[^a-z0-9]/gi, '-').toLowerCase()}`;
+  const onFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result || '');
+      onChange(text);
+    };
+    reader.readAsText(f);
+    // reset so the same file can be picked again
+    e.target.value = '';
+  };
+  const isPem = value.includes('-----BEGIN');
   return (
     <div>
-      <label className="block text-xs font-medium text-gray-700 mb-1">{label}</label>
-      <textarea rows={rows} value={value} onChange={(e) => onChange(e.target.value)}
+      <div className="flex items-center justify-between mb-1">
+        <label className="block text-xs font-medium text-gray-700">{label}</label>
+        <label htmlFor={fileInputId} className="text-xs text-blue-600 hover:underline cursor-pointer">
+          Upload {accept.split(',')[0]} file
+        </label>
+        <input id={fileInputId} type="file" accept={accept} className="hidden" onChange={onFile} />
+      </div>
+      <textarea rows={3} value={value} onChange={(e) => onChange(e.target.value)}
+        placeholder={`-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----`}
         className="w-full px-3 py-2 border rounded text-xs font-mono" />
+      {value && (
+        <div className="text-[11px] mt-1 flex items-center gap-2">
+          <span className={isPem ? 'text-green-700' : 'text-amber-700'}>
+            {isPem ? '✓ looks like PEM' : '⚠ no -----BEGIN header detected'}
+          </span>
+          <span className="text-gray-500">{value.length} chars</span>
+        </div>
+      )}
     </div>
   );
 }

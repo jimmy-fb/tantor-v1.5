@@ -11,7 +11,9 @@ from app.config import settings
 from app.services.crypto import decrypt
 
 ANSIBLE_TEMPLATE_DIR = Path(__file__).parent.parent / "templates" / "ansible"
+KAFKA_TEMPLATE_DIR = Path(__file__).parent.parent / "templates" / "kafka"
 ansible_env = Environment(loader=FileSystemLoader(str(ANSIBLE_TEMPLATE_DIR)), keep_trailing_newline=True)
+kafka_env = Environment(loader=FileSystemLoader(str(KAFKA_TEMPLATE_DIR)), keep_trailing_newline=True)
 
 
 class AnsibleRunner:
@@ -104,6 +106,21 @@ class AnsibleRunner:
         for filename, content in units.items():
             (units_dir / filename).write_text(content)
         return units_dir
+
+    @staticmethod
+    def write_kafka_log4j2(work_dir: Path, kafka_log_dir: str) -> Path:
+        """Render Tantor's log4j2.yaml into the workspace.
+
+        Kafka 4.x ships its own log4j2.yaml in the tarball, but customers
+        sometimes hit ownership / permission issues on it after extract.
+        Owning the copy ourselves lets us guarantee broker logs land in
+        {kafka_log_dir}/server.log with predictable rotation.
+        """
+        out = work_dir / "kafka" / "log4j2.yaml"
+        out.parent.mkdir(exist_ok=True, parents=True)
+        template = kafka_env.get_template("log4j2.yaml.j2")
+        out.write_text(template.render(kafka_log_dir=kafka_log_dir))
+        return out
 
     @staticmethod
     def generate_playbook(work_dir: Path, template_name: str, context: dict) -> Path:

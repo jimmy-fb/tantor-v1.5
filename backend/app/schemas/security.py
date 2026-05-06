@@ -104,6 +104,7 @@ class AuditLogEntry(BaseModel):
     resource_type: str
     resource_name: str
     details: str | None
+    actor_username: str | None = None  # APB v1.4.0 #13
     created_at: datetime
 
     model_config = {"from_attributes": True}

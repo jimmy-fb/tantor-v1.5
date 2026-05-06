@@ -1,0 +1,114 @@
+---
+# =============================================================================
+# Tantor Schema Registry-only deployment (APB v1.4.0 #2)
+#
+# Adds an Apicurio Schema Registry instance to an already-deployed cluster
+# without touching brokers / controllers. Runs against ONE host (the user
+# picks which host to host the SR on).
+# =============================================================================
+
+- name: Prepare Schema Registry host
+  hosts: schema_registrys
+  become: true
+  tasks:
+    - name: Gather OS facts
+      setup:
+        gather_subset:
+          - '!all'
+          - 'os_family'
+
+    - name: Install Java (Debian/Ubuntu)
+      apt:
+        name: openjdk-17-jre-headless
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+
+    - name: Install Java (RHEL/Rocky/CentOS)
+      dnf:
+        name: java-17-openjdk-headless
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Find java binary
+      command: which java
+      register: java_which
+      changed_when: false
+
+    - name: Resolve java symlink
+      command: readlink -f {{ '{{' }} java_which.stdout {{ '}}' }}
+      register: java_real
+      changed_when: false
+
+    - name: Set JAVA_HOME fact
+      set_fact:
+        discovered_java_home: "{{ '{{' }} java_real.stdout | regex_replace('/bin/java$', '') {{ '}}' }}"
+
+- name: Install and start Apicurio Schema Registry
+  hosts: schema_registrys
+  become: true
+  tasks:
+    - name: Create apicurio user
+      user:
+        name: apicurio
+        system: true
+        home: "{{ apicurio_install_dir }}"
+        shell: /bin/false
+        create_home: false
+
+    - name: Create Apicurio install directory
+      file:
+        path: "{{ apicurio_install_dir }}"
+        state: directory
+        owner: apicurio
+        group: apicurio
+        mode: "0755"
+
+    - name: Copy Apicurio binary to host
+      copy:
+        src: "{{ apicurio_binary_local_path }}"
+        dest: /tmp/{{ apicurio_binary_filename }}
+        mode: "0644"
+
+    - name: Extract Apicurio
+      unarchive:
+        src: /tmp/{{ apicurio_binary_filename }}
+        dest: "{{ apicurio_install_dir }}"
+        remote_src: yes
+        extra_opts:
+          - "--strip-components={{ apicurio_strip_components }}"
+        owner: apicurio
+        group: apicurio
+
+    - name: Place application.properties
+      copy:
+        src: "{{ configs_dir }}/{{ '{{' }} ansible_host {{ '}}' }}_{{ '{{' }} node_id {{ '}}' }}_apicurio.properties"
+        dest: "{{ apicurio_install_dir }}/application.properties"
+        owner: apicurio
+        group: apicurio
+        mode: "0644"
+
+    - name: Install schema-registry systemd unit
+      copy:
+        src: "{{ systemd_dir }}/{{ '{{' }} ansible_host {{ '}}' }}_{{ '{{' }} node_id {{ '}}' }}_schema-registry.service"
+        dest: /etc/systemd/system/schema-registry.service
+        mode: "0644"
+
+    - name: Reload and start Schema Registry
+      systemd:
+        name: schema-registry
+        daemon_reload: true
+        enabled: true
+        state: started
+
+    - name: Wait for Schema Registry to be reachable
+      wait_for:
+        port: {{ schema_registry_port }}
+        host: "{{ '{{' }} ansible_host {{ '}}' }}"
+        timeout: 90
+        delay: 5
+
+    - name: Clean up tarball
+      file:
+        path: /tmp/{{ apicurio_binary_filename }}
+        state: absent

@@ -55,7 +55,12 @@ class ConsumedMessage(BaseModel):
     partition: int | None = None
     offset: int | None = None
     key: str | None = None
-    value: str
+    # Kafka allows null-valued messages (tombstones, compacted topics).
+    # If we required a string here, FastAPI's response validator would 500
+    # the entire response when ANY message had a None value — APB hit this
+    # on external clusters because kafka-python returns None for empty
+    # values, not "".
+    value: str | None = None
     headers: str | None = None
 
 

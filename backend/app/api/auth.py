@@ -92,6 +92,14 @@ def update_user(user_id: str, data: UserUpdate, db: Session = Depends(get_db), c
         user.role = data.role
 
     if data.password is not None:
+        # APB v1.4.0 #11 — LDAP-synced users authenticate against the
+        # directory; setting a local password would create two paths
+        # (one of them shadowing LDAP) so we reject the change here.
+        if user.auth_source == "ldap":
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot set a local password on an LDAP-synced user. Change the password in the directory.",
+            )
         user.hashed_password = AuthService.hash_password(data.password)
 
     if data.is_active is not None:
