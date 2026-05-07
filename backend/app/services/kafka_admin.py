@@ -784,7 +784,7 @@ class KafkaAdmin:
         )
         db.add(kafka_user)
 
-        KafkaAdmin._audit(db, cluster_id, "user_created", "user", username, f"mechanism={mechanism}")
+        KafkaAdmin._audit(db, cluster_id, "user_created", "user", username, f"mechanism={mechanism}", actor=actor)
         db.commit()
         db.refresh(kafka_user)
 

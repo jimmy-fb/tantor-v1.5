@@ -105,8 +105,11 @@
       wait_for:
         port: {{ schema_registry_port }}
         host: "{{ '{{' }} ansible_host {{ '}}' }}"
-        timeout: 90
-        delay: 5
+        # Quarkus cold-start + kafkasql topic creation takes ~60-90s on
+        # small VMs, occasionally more if Kafka is also still warming up.
+        # 180s gives plenty of headroom without making real failures slow.
+        timeout: 180
+        delay: 10
 
     - name: Clean up tarball
       file:

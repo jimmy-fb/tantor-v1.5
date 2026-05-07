@@ -629,10 +629,15 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
         cluster_config = json.loads(cluster.config_json or "{}")
         sr_info = {"ip_address": host.ip_address, "node_id": sr_svc.node_id, "role": "schema_registry"}
         sr_config = config_generator.generate_schema_registry_config(sr_info, broker_infos, cluster_config)
+        # Bootstrap = the cluster's broker host:port — Apicurio stores
+        # schemas in this cluster's own Kafka.
+        bs_str = ",".join(f"{b['ip_address']}:{cluster_config.get('listener_port', 9092)}" for b in broker_infos)
         sr_unit = config_generator.generate_systemd_unit(
             "schema-registry",
             f"{settings.APICURIO_INSTALL_DIR}/application.properties",
             cluster_paths.install_dir(cluster), settings.KSQLDB_INSTALL_DIR,
+            bootstrap_servers=bs_str or "127.0.0.1:9092",
+            schema_registry_port=port,
         )
 
         configs = {f"{host.ip_address}_{sr_svc.node_id}_apicurio.properties": sr_config}
@@ -642,18 +647,32 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
         configs_dir = ansible_runner.write_config_files(work_dir, configs)
         systemd_dir = ansible_runner.write_systemd_units(work_dir, units)
 
-        # Apicurio binary
+        # Apicurio binary — auto-download on first SR deploy if missing
+        # (mirrors deploy_cluster). Customer doesn't have to pre-stage the
+        # tarball in /var/lib/tantor/repo/apicurio.
         from pathlib import Path as _Path
         apicurio_repo = settings.APICURIO_REPO_DIR
+        _Path(apicurio_repo).mkdir(parents=True, exist_ok=True)
         existing = sorted(_Path(apicurio_repo).glob("apicurio-registry-app-*.tar.gz"))
         if not existing:
-            log(f"ERROR: no Apicurio tarball in {apicurio_repo} — fetch one before retrying.")
-            _set_status(db, task_id, "error", error_message="Apicurio tarball missing")
-            sr_svc.status = "error"
-            db.commit()
-            return
-        apicurio_tgz = existing[-1].name
-        apicurio_tgz_path = str(existing[-1])
+            apicurio_tgz = f"apicurio-registry-app-{settings.APICURIO_VERSION}-all.tar.gz"
+            apicurio_tgz_path = str(_Path(apicurio_repo) / apicurio_tgz)
+            url = f"https://github.com/Apicurio/apicurio-registry/releases/download/{settings.APICURIO_VERSION}/{apicurio_tgz}"
+            log(f"Apicurio binary not found locally. Downloading {apicurio_tgz}…")
+            try:
+                import urllib.request
+                urllib.request.urlretrieve(url, apicurio_tgz_path)
+                log(f"Downloaded {apicurio_tgz} ({_Path(apicurio_tgz_path).stat().st_size // (1024*1024)} MB)")
+            except Exception as dl_err:
+                log(f"ERROR: Failed to download Apicurio: {dl_err}")
+                log(f"Place an Apicurio app tarball at {apicurio_repo}/ and retry.")
+                _set_status(db, task_id, "error", error_message=f"Apicurio download failed: {dl_err}")
+                sr_svc.status = "error"
+                db.commit()
+                return
+        else:
+            apicurio_tgz = existing[-1].name
+            apicurio_tgz_path = str(existing[-1])
         # Detect strip-components from the tarball layout
         try:
             import tarfile
@@ -670,7 +689,7 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
             "credential": decrypt(host.encrypted_credential),
             "role": "schema_registry", "node_id": sr_svc.node_id,
         }]
-        ansible_runner.generate_inventory(work_dir, svc_dicts, tls_keystores=None)
+        inv_path = ansible_runner.generate_inventory(work_dir, svc_dicts, tls_keystores=None)
         ansible_runner.generate_ansible_cfg(work_dir)
         playbook_path = ansible_runner.generate_playbook(work_dir, "deploy_schema_registry.yml.j2", {
             "apicurio_install_dir": settings.APICURIO_INSTALL_DIR,
@@ -688,7 +707,7 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
         def emit(line: str):
             log(line)
 
-        exit_code = ansible_runner.run_playbook(work_dir, playbook_path, emit)
+        exit_code = ansible_runner.run_playbook(work_dir, playbook_path, inv_path, emit)
         if exit_code == 0:
             sr_svc.status = "running"
             db.commit()

@@ -156,6 +156,8 @@ class ConfigGenerator:
         java_home: str = "",
         unit_name: str | None = None,
         kafka_log_dir: str = "/var/log/kafka",
+        bootstrap_servers: str = "127.0.0.1:9092",
+        schema_registry_port: int = 8085,
     ) -> str:
         """Generate a systemd unit file for a Kafka service.
 
@@ -177,6 +179,8 @@ class ConfigGenerator:
             heap_opts=heap_opts,
             unit_name=unit_name or "kafka.service",
             kafka_log_dir=kafka_log_dir,
+            bootstrap_servers=bootstrap_servers,
+            schema_registry_port=schema_registry_port,
         )
 
     @staticmethod

@@ -8,10 +8,17 @@ Type=simple
 User=apicurio
 Group=apicurio
 Environment="JAVA_HOME={{ java_home }}"
+# APB v1.4.0 — Apicurio 3.x stopped honoring QUARKUS_CONFIG_LOCATIONS
+# at startup, so we pass the critical config keys as -D system
+# properties on the command line. The application.properties file
+# stays around for human inspection / future use.
 Environment="QUARKUS_CONFIG_LOCATIONS={{ config_path }}"
 {% if heap_opts %}Environment="JAVA_OPTS={{ heap_opts }}"
 {% endif %}
-ExecStart={{ java_home }}/bin/java $JAVA_OPTS -jar /opt/apicurio/quarkus-app/quarkus-run.jar
+# Apicurio 3.1+ ships quarkus-run.jar at the tarball root after our
+# strip-components extract. The legacy quarkus-app/ subdir layout was
+# removed in 3.0. Pick whichever exists.
+ExecStart=/bin/sh -c 'JAR=/opt/apicurio/quarkus-app/quarkus-run.jar; [ -f "$JAR" ] || JAR=/opt/apicurio/quarkus-run.jar; exec {{ java_home }}/bin/java $JAVA_OPTS -Dquarkus.http.port={{ schema_registry_port | default(8085) }} -Dapicurio.storage.kind=kafkasql -Dapicurio.kafkasql.bootstrap.servers={{ bootstrap_servers | default("127.0.0.1:9092") }} -jar $JAR'
 Restart=always
 RestartSec=5
 LimitNOFILE=65536

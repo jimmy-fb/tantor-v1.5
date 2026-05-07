@@ -681,8 +681,10 @@ server {
 }
 
 server {
-    listen 443 ssl default_server;
-    http2 on;
+    # Use the legacy listen-with-http2 form: RHEL 9 ships nginx 1.20
+    # which does not recognize the standalone http2 directive (introduced
+    # in 1.25.1). Both forms work on 1.25+.
+    listen 443 ssl http2 default_server;
     server_name _;
 
     ssl_certificate     /etc/tantor/tls/server.crt;
@@ -933,10 +935,22 @@ fi
 systemctl restart nginx
 systemctl restart tantor-backend
 
-# Wait for health
+# Wait for health. Hit local nginx via the right scheme so the
+# health-check actually exercises the live config (TLS cert + redirect
+# work end-to-end before we declare success).
+if [ "$TLS_ENABLE" = true ]; then
+    HEALTH_URL="https://localhost/api/health"
+    HEALTH_CURL_OPTS="-k"
+    PUBLIC_URL="https://${SERVER_IP}"
+else
+    HEALTH_URL="http://localhost/api/health"
+    HEALTH_CURL_OPTS=""
+    PUBLIC_URL="http://${SERVER_IP}"
+fi
+
 echo -n "  Waiting for Tantor to start"
 for i in $(seq 1 30); do
-    HTTP=$(curl -sf -o /dev/null -w "%{http_code}" http://localhost/api/health 2>/dev/null || echo "000")
+    HTTP=$(curl -sf $HEALTH_CURL_OPTS -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
     if [ "$HTTP" = "200" ]; then
         echo ""
         break
@@ -958,7 +972,11 @@ echo -e "${CYAN}╔════════════════════�
 echo -e "${CYAN}║           Installation Complete!                    ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${GREEN}Open in browser:${NC}  http://${SERVER_IP}"
+echo -e "  ${GREEN}Open in browser:${NC}  ${PUBLIC_URL}"
+if [ "$TLS_ENABLE" = true ]; then
+    echo -e "  ${YELLOW}TLS:${NC}              self-signed cert at /etc/tantor/tls/server.crt"
+    echo -e "                    your browser will warn on first connect — that's expected"
+fi
 echo -e "  ${GREEN}Login:${NC}            admin / admin"
 echo ""
 echo -e "  ${BLUE}Quick start:${NC}"
