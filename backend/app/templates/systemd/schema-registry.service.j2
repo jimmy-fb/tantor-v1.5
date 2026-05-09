@@ -21,6 +21,10 @@ Environment="QUARKUS_CONFIG_LOCATIONS={{ config_path }}"
 ExecStart=/bin/sh -c 'JAR=/opt/apicurio/quarkus-app/quarkus-run.jar; [ -f "$JAR" ] || JAR=/opt/apicurio/quarkus-run.jar; exec {{ java_home }}/bin/java $JAVA_OPTS -Dquarkus.http.port={{ schema_registry_port | default(8085) }} -Dapicurio.storage.kind=kafkasql -Dapicurio.kafkasql.bootstrap.servers={{ bootstrap_servers | default("127.0.0.1:9092") }} -jar $JAR'
 Restart=always
 RestartSec=5
+# APB v1.4.1 — Quarkus cold-start + kafkasql topic creation can exceed
+# systemd's default 90s start window on small VMs. 300s avoids spurious
+# "service failed" while still failing fast on a real bug.
+TimeoutStartSec=300
 LimitNOFILE=65536
 
 [Install]

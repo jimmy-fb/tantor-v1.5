@@ -686,20 +686,31 @@ def describe_broker_configs(cluster: Cluster) -> list[dict]:
 
 
 def alter_broker_config(cluster: Cluster, broker_id: int, configs: dict) -> dict:
-    """Apply config changes to a specific broker via incremental_alter_configs."""
+    """Apply config changes to a specific broker via incremental_alter_configs.
+
+    APB v1.4.1 — never silently fall back to destructive alter_configs.
+    Audit caught that an OLDER kafka-python against a NEWER broker (or
+    vice versa) might not raise AttributeError but instead truncate the
+    config. Refuse to fall back unless the operator explicitly opts in.
+    """
     from kafka.admin import ConfigResource, ConfigResourceType
+    import logging as _logging
+    _log = _logging.getLogger("tantor.external_admin")
     secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
     with _ssl_files_for(secrets) as ssl_paths:
         admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
         try:
             cr = ConfigResource(ConfigResourceType.BROKER, str(broker_id), configs=configs)
-            # incremental_alter_configs is preferred over alter_configs (which is
-            # destructive: it replaces the whole config). kafka-python falls
-            # back to alter_configs when the broker is too old.
-            try:
-                admin.incremental_alter_configs([cr])
-            except AttributeError:
-                admin.alter_configs([cr])
+            if not hasattr(admin, "incremental_alter_configs"):
+                # kafka-python is too old for this broker; refuse rather
+                # than risk wiping the broker config with alter_configs.
+                raise ValueError(
+                    "kafka-python on this Tantor server doesn't support "
+                    "incremental_alter_configs. Refusing destructive fallback. "
+                    "Upgrade kafka-python-ng (>=2.0.2) or alter the broker "
+                    "config directly via kafka-configs.sh."
+                )
+            admin.incremental_alter_configs([cr])
             return {"broker_id": broker_id, "updated": True, "configs": configs}
         finally:
             admin.close()

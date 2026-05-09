@@ -605,6 +605,18 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
         else:
             sr_svc.host_id = host_id
             sr_svc.status = "deploying"
+            # APB v1.4.1 — re-deploy idempotency: stop the old SR before
+            # re-running the playbook so two java processes don't fight
+            # over port 8085.
+            try:
+                from app.services.ssh_manager import SSHManager
+                with SSHManager.connect(
+                    host.ip_address, host.ssh_port, host.username,
+                    host.auth_type, host.encrypted_credential,
+                ) as client:
+                    SSHManager.exec_command(client, "sudo -n systemctl stop schema-registry || true", timeout=20)
+            except Exception as e:
+                log(f"  warn: pre-deploy stop failed (continuing anyway): {e}")
         db.commit()
 
         # Get broker hosts for bootstrap
@@ -658,15 +670,40 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
             apicurio_tgz = f"apicurio-registry-app-{settings.APICURIO_VERSION}-all.tar.gz"
             apicurio_tgz_path = str(_Path(apicurio_repo) / apicurio_tgz)
             url = f"https://github.com/Apicurio/apicurio-registry/releases/download/{settings.APICURIO_VERSION}/{apicurio_tgz}"
-            log(f"Apicurio binary not found locally. Downloading {apicurio_tgz}…")
-            try:
-                import urllib.request
-                urllib.request.urlretrieve(url, apicurio_tgz_path)
-                log(f"Downloaded {apicurio_tgz} ({_Path(apicurio_tgz_path).stat().st_size // (1024*1024)} MB)")
-            except Exception as dl_err:
-                log(f"ERROR: Failed to download Apicurio: {dl_err}")
-                log(f"Place an Apicurio app tarball at {apicurio_repo}/ and retry.")
-                _set_status(db, task_id, "error", error_message=f"Apicurio download failed: {dl_err}")
+            # APB v1.4.1 — retry with timeout so a flaky corp proxy or
+            # GitHub blip doesn't kill the deploy. urlretrieve has no
+            # timeout, so we wrap urlopen + write ourselves.
+            import urllib.request, socket
+            ok = False
+            last_err = None
+            for attempt in (1, 2, 3):
+                log(f"Apicurio binary not found locally. Downloading {apicurio_tgz} (attempt {attempt}/3)…")
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "tantor/1.4.1"})
+                    with urllib.request.urlopen(req, timeout=180) as r, open(apicurio_tgz_path, "wb") as f:
+                        while True:
+                            chunk = r.read(1 << 20)  # 1 MiB
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    size_mb = _Path(apicurio_tgz_path).stat().st_size // (1024*1024)
+                    if size_mb < 50:  # sanity check — real tarball is ~130 MB
+                        raise IOError(f"download truncated ({size_mb} MB; expected ~130)")
+                    log(f"Downloaded {apicurio_tgz} ({size_mb} MB)")
+                    ok = True
+                    break
+                except (socket.timeout, OSError, IOError) as e:
+                    last_err = e
+                    log(f"  attempt {attempt} failed: {e}")
+                    try:
+                        _Path(apicurio_tgz_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            if not ok:
+                log(f"ERROR: Apicurio download failed after 3 attempts: {last_err}")
+                log(f"  If you're behind a corporate proxy, set HTTP_PROXY/HTTPS_PROXY in /etc/systemd/system/tantor-backend.service.d/proxy.conf")
+                log(f"  Or air-gap workaround: place {apicurio_tgz} at {apicurio_repo}/ and retry.")
+                _set_status(db, task_id, "error", error_message=f"Apicurio download failed: {last_err}")
                 sr_svc.status = "error"
                 db.commit()
                 return

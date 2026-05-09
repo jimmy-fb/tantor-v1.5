@@ -41,6 +41,26 @@ def _log(task_id: str, message: str):
         logger.info("[%s] %s", task_id[:8], message)
 
 
+def _validate_bootstrap_address(addr: str) -> bool:
+    """APB v1.4.1 — sanity-check bootstrap addresses before MM2 sees them.
+
+    MM2 fails late and silently on a missing port or IPv6 unbracketed.
+    """
+    addr = addr.strip()
+    if not addr:
+        return False
+    # bare hostname without port — invalid for Kafka bootstrap
+    if ":" not in addr:
+        return False
+    # IPv6 needs brackets: [::1]:9092 — bare ::1:9092 is ambiguous
+    if addr.count(":") > 1 and not addr.startswith("["):
+        return False
+    host, _, port = addr.rpartition(":")
+    if not host or not port.isdigit():
+        return False
+    return True
+
+
 def _get_broker_addresses(cluster_id: str, db: Session) -> list[str]:
     """Get bootstrap server addresses for a cluster.
 
@@ -48,11 +68,16 @@ def _get_broker_addresses(cluster_id: str, db: Session) -> list[str]:
     back to their saved `bootstrap_servers` field. Without this fix
     cluster-linking refused to create any link involving an external
     cluster ("Source cluster has no brokers").
+
+    APB v1.4.1 — also validates each address has a port + correct shape.
+    Caller raises ValueError on empty list, surfacing the bad input
+    before MM2 starts and fails opaquely.
     """
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
     if cluster and (cluster.kind or "managed") == "external":
         bs = (cluster.bootstrap_servers or "").strip()
-        return [s.strip() for s in bs.split(",") if s.strip()]
+        candidates = [s.strip() for s in bs.split(",") if s.strip()]
+        return [a for a in candidates if _validate_bootstrap_address(a)]
 
     services = db.query(Service).filter(
         Service.cluster_id == cluster_id,
@@ -76,24 +101,71 @@ def _get_broker_addresses(cluster_id: str, db: Session) -> list[str]:
     return addresses
 
 
+def _security_block(prefix: str, cluster: "Cluster | None") -> str:
+    """APB v1.4.1 — emit per-cluster security.protocol / SASL / SSL
+    properties for MM2 so external clusters using SASL_SSL or SSL
+    actually authenticate.
+
+    `prefix` is "source" or "target". For managed clusters (which speak
+    PLAINTEXT by default at the listener Tantor configures), we emit
+    nothing — MM2 defaults are correct.
+    """
+    if cluster is None or (cluster.kind or "managed") == "managed":
+        return ""
+    proto = (cluster.security_protocol or "PLAINTEXT").upper()
+    if proto == "PLAINTEXT":
+        return ""
+    lines = [f"{prefix}.security.protocol = {proto}"]
+    if proto in ("SASL_PLAINTEXT", "SASL_SSL"):
+        from app.services.external_admin import decrypt_secrets
+        secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+        mech = (cluster.sasl_mechanism or "PLAIN").upper()
+        lines.append(f"{prefix}.sasl.mechanism = {mech}")
+        # JAAS module — SCRAM uses ScramLoginModule, PLAIN uses PlainLoginModule
+        if mech.startswith("SCRAM"):
+            module = "org.apache.kafka.common.security.scram.ScramLoginModule"
+        elif mech == "GSSAPI":
+            module = "com.sun.security.auth.module.Krb5LoginModule"
+        else:
+            module = "org.apache.kafka.common.security.plain.PlainLoginModule"
+        u = secrets.get("sasl_username") or ""
+        p = secrets.get("sasl_password") or ""
+        # Escape backslashes + double-quotes in passwords for JAAS string
+        p_esc = p.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'{prefix}.sasl.jaas.config = {module} required username="{u}" password="{p_esc}";')
+    if proto in ("SSL", "SASL_SSL"):
+        # Tantor doesn't auto-stage truststores on the MM2 host today;
+        # operators typically export TANTOR-trusted CAs. Leave a hint so
+        # operators see it in the config and know to point at their
+        # truststore. (Empty values cause connect to use system trust.)
+        lines.append(f"{prefix}.ssl.endpoint.identification.algorithm = https")
+        if not bool(cluster.ssl_verify):
+            lines.append(f"{prefix}.ssl.endpoint.identification.algorithm = ")
+    return "\n".join(lines) + "\n"
+
+
 def _generate_mm2_config(
     source_brokers: list[str],
     dest_brokers: list[str],
     topics_pattern: str,
     sync_consumer_offsets: bool,
     sync_topic_configs: bool,
+    source_cluster: "Cluster | None" = None,
+    dest_cluster: "Cluster | None" = None,
 ) -> str:
     """Generate MirrorMaker 2 properties file content."""
     source_bootstrap = ",".join(source_brokers)
     target_bootstrap = ",".join(dest_brokers)
     sync_offsets_str = "true" if sync_consumer_offsets else "false"
     sync_configs_str = "true" if sync_topic_configs else "false"
+    source_security = _security_block("source", source_cluster)
+    target_security = _security_block("target", dest_cluster)
 
     config = f"""# MirrorMaker 2 Configuration
 clusters = source, target
 source.bootstrap.servers = {source_bootstrap}
 target.bootstrap.servers = {target_bootstrap}
-
+{source_security}{target_security}
 # Replication
 source->target.enabled = true
 source->target.topics = {topics_pattern}
@@ -172,7 +244,8 @@ class ClusterLinkingManager:
             raise ValueError("Destination cluster has no brokers")
 
         mm2_config = _generate_mm2_config(
-            source_brokers, dest_brokers, topics_pattern, sync_offsets, sync_configs
+            source_brokers, dest_brokers, topics_pattern, sync_offsets, sync_configs,
+            source_cluster=source, dest_cluster=dest,
         )
 
         # Pick a deploy host. Preference order:
@@ -525,11 +598,14 @@ class ClusterLinkingManager:
             source_brokers = _get_broker_addresses(link.source_cluster_id, db)
             dest_brokers = _get_broker_addresses(link.destination_cluster_id, db)
             if source_brokers and dest_brokers:
+                src = db.query(Cluster).filter(Cluster.id == link.source_cluster_id).first()
+                dst = db.query(Cluster).filter(Cluster.id == link.destination_cluster_id).first()
                 link.mm2_config = _generate_mm2_config(
                     source_brokers, dest_brokers,
                     link.topics_pattern,
                     link.sync_consumer_offsets,
                     link.sync_topic_configs,
+                    source_cluster=src, dest_cluster=dst,
                 )
 
         link.updated_at = datetime.now(timezone.utc)
