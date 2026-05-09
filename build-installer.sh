@@ -20,7 +20,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.4.1"
+VERSION="1.4.2"
 WITH_KAFKA=false
 OUTPUT="tantor-installer-${VERSION}.bin"
 
@@ -159,7 +159,7 @@ cat > "$INSTALLER" << 'HEADER_EOF'
 set -e
 
 ARCHIVE_LINE=$(awk '/^__ARCHIVE_BELOW__$/{print NR + 1; exit 0;}' "$0")
-VERSION="1.4.1"
+VERSION="1.4.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ChevronRight, ChevronLeft, Check, Server, Loader2, AlertTriangle } from 'lucide-react';
 import type { Host, KafkaVersionInfo, ClusterCreate, ServiceAssignment, ClusterConfig } from '../../types';
-import { getHosts, createCluster, getKafkaVersions, getClusters } from '../../lib/api';
+import { getHosts, createCluster, getKafkaVersions, getClusters, preflightPorts } from '../../lib/api';
 
 const ROLES = [
   { id: 'broker_controller', label: 'Broker + Controller', description: 'Combined KRaft broker and controller (recommended for small clusters)', color: 'bg-blue-100 text-blue-800 border-blue-200' },
@@ -61,6 +61,14 @@ export default function ClusterWizard() {
   // Validation warnings
   const [nameError, setNameError] = useState('');
   const [portError, setPortError] = useState('');
+
+  // APB v1.4.2 — port preflight against the selected hosts.
+  const [portCheckLoading, setPortCheckLoading] = useState(false);
+  const [portCheckResult, setPortCheckResult] = useState<{
+    ok: boolean;
+    conflicts: Array<{ host_ip: string; port: number; label: string; process: string }>;
+    ssh_failures: Array<{ host_ip: string; error: string }>;
+  } | null>(null);
 
   useEffect(() => {
     getHosts().then(setHosts);
@@ -535,6 +543,77 @@ export default function ClusterWizard() {
                   className="w-full px-3 py-2 border rounded-lg text-sm"
                 />
               </div>
+            )}
+          </div>
+
+          {/* APB v1.4.2 — Check ports on selected hosts before submit */}
+          <div className="border border-gray-200 rounded-xl p-4 bg-gray-50">
+            <div className="flex items-center justify-between mb-2">
+              <div>
+                <div className="text-sm font-medium text-gray-900">Port availability</div>
+                <div className="text-xs text-gray-500 mt-0.5">
+                  Run a quick SSH check against your selected hosts to make sure these ports are free.
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={portCheckLoading || Object.keys(assignments).length === 0}
+                onClick={async () => {
+                  setPortCheckLoading(true);
+                  setPortCheckResult(null);
+                  try {
+                    const ports = [config.listener_port, config.controller_port];
+                    if (assignedRoles.includes('schema_registry')) ports.push(config.schema_registry_port || 8085);
+                    if (assignedRoles.includes('ksqldb')) ports.push(config.ksqldb_port);
+                    if (assignedRoles.includes('kafka_connect')) ports.push(config.connect_rest_port);
+                    const hostIds = Object.keys(assignments).filter(h => assignments[h].length > 0);
+                    const r = await preflightPorts(hostIds, ports);
+                    setPortCheckResult(r);
+                  } catch (e: unknown) {
+                    const ax = e as { response?: { data?: { detail?: string } } };
+                    setPortCheckResult({ ok: false, conflicts: [], ssh_failures: [{
+                      host_ip: 'preflight', error: ax.response?.data?.detail || 'preflight failed',
+                    }] });
+                  } finally {
+                    setPortCheckLoading(false);
+                  }
+                }}
+                className="px-3 py-1.5 bg-white border border-gray-300 rounded-lg text-sm hover:bg-gray-100 disabled:opacity-50 flex items-center gap-1.5"
+              >
+                {portCheckLoading ? <Loader2 size={14} className="animate-spin" /> : <Server size={14} />}
+                Check ports
+              </button>
+            </div>
+            {portCheckResult && (
+              portCheckResult.ok ? (
+                <div className="text-sm text-green-700 flex items-center gap-2 mt-2">
+                  <Check size={14} /> All ports free on selected hosts.
+                </div>
+              ) : (
+                <div className="text-sm space-y-1 mt-2">
+                  {portCheckResult.conflicts.map((c, i) => (
+                    <div key={i} className="flex items-start gap-2 text-amber-800 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+                      <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                      <div>
+                        <div className="font-mono text-xs">
+                          {c.host_ip}:{c.port} ({c.label}) is in use
+                        </div>
+                        <div className="text-xs text-amber-700 mt-0.5">
+                          held by: <span className="font-mono">{c.process}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {portCheckResult.ssh_failures.map((s, i) => (
+                    <div key={`s${i}`} className="flex items-start gap-2 text-gray-700 bg-gray-100 border border-gray-200 rounded px-3 py-2">
+                      <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+                      <div className="text-xs">
+                        Couldn't SSH to {s.host_ip}: {s.error}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
             )}
           </div>
         </div>

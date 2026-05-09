@@ -302,12 +302,34 @@ def quick_deploy(
     for i, h in enumerate(hosts, start=1):
         services.append(_SA(host_id=h.id, role="broker_controller", node_id=i))
 
+    # APB v1.4.2 — auto-pick a port set that doesn't collide with any
+    # existing cluster on the same host(s). The customer hit this when
+    # quick-deploying twice on the same machine: second cluster failed
+    # to bind 9093. Now we walk forward by 100 (9092→9192→9292…) until
+    # we find a free set.
+    from app.services import port_preflight
+    occupied: dict[str, set[int]] = {}
+    for c in db.query(Cluster).all():
+        try:
+            cfg = json.loads(c.config_json or "{}")
+        except Exception:
+            continue
+        ports = {int(cfg.get(k) or 0) for k in
+                 ("listener_port", "controller_port", "ssl_listener_port",
+                  "schema_registry_port", "ksqldb_port", "connect_rest_port")}
+        ports.discard(0)
+        # Walk this cluster's services to find their host ids
+        for svc in db.query(Service).filter(Service.cluster_id == c.id).all():
+            occupied.setdefault(svc.host_id, set()).update(ports)
+    free = port_preflight.find_free_port_set(occupied, [h.id for h in hosts])
+
     cluster_config = {
         "replication_factor": rf,
         "num_partitions": 3,
         "log_dirs": "/var/lib/kafka/data",
-        "listener_port": 9092,
-        "controller_port": 9093,
+        "listener_port": free["listener_port"],
+        "controller_port": free["controller_port"],
+        "ssl_listener_port": free["ssl_listener_port"],
         "heap_size": "1G",
     }
 
@@ -346,6 +368,52 @@ def quick_deploy(
         "task_id": task_id,
         "kafka_version": kafka_version,
         "broker_count": len(services),
+        "ports": {
+            "listener": free["listener_port"],
+            "controller": free["controller_port"],
+            "ssl_listener": free["ssl_listener_port"],
+        },
+    }
+
+
+# ── Pre-flight port checker for the create-cluster wizard ──
+
+class PreflightPortsRequest(BaseModel):
+    host_ids: list[str]
+    ports: list[int]  # the wizard sends listener+controller+SR+ksqlDB+connect_port etc.
+
+
+@router.post("/preflight-ports")
+def preflight_ports(
+    req: PreflightPortsRequest,
+    db: Session = Depends(get_db), _: User = Depends(require_monitor_or_above),
+):
+    """SSH to each host, check whether any of `ports` is already bound.
+
+    Used by the cluster create wizard so operators can hit a "Check
+    ports" button BEFORE submit. Returns one row per conflict with the
+    process holding the port; empty list = all clear.
+    """
+    from app.services import port_preflight
+    hosts = {h.id: h for h in db.query(Host).filter(Host.id.in_(req.host_ids)).all()}
+    checks = []
+    for hid in req.host_ids:
+        for p in req.ports:
+            checks.append(port_preflight.PortCheck(hid, "", int(p), f"port {p}"))
+    conflicts = port_preflight.check_ports(checks, hosts)
+    return {
+        "ok": not any(not c.label.startswith("ssh-precheck-failed") for c in conflicts),
+        "conflicts": [
+            {"host_ip": c.host_ip, "port": c.port, "label": c.label, "process": c.process}
+            for c in conflicts
+            if not c.label.startswith("ssh-precheck-failed")
+        ],
+        "ssh_failures": [
+            {"host_ip": c.host_ip, "error": c.process}
+            for c in conflicts
+            if c.label.startswith("ssh-precheck-failed")
+        ],
+        "defaults": port_preflight.DEFAULT_PORTS,
     }
 
 

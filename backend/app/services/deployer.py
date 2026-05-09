@@ -17,6 +17,7 @@ from app.services import cert_manager, cluster_paths
 from app.services.ansible_runner import ansible_runner
 from app.services.config_generator import config_generator
 from app.services.crypto import decrypt
+from app.services.ssh_manager import SSHManager
 
 logger = logging.getLogger("tantor.deployer")
 
@@ -223,6 +224,46 @@ def _deploy_cluster_inner(cluster_id: str, task_id: str, db: Session) -> None:
     if rf > broker_count:
         log(f"WARNING: replication_factor={rf} exceeds broker count={broker_count}. Adjusting to {broker_count}.")
         cluster_config["replication_factor"] = broker_count
+
+    # Check 5: Port-conflict pre-flight (APB v1.4.2). Catches the
+    # collision-with-an-existing-cluster failure mode before ansible
+    # binds and crashes silently.
+    from app.services import port_preflight
+    pp_checks = port_preflight.cluster_port_checks(cluster, services, cluster_config)
+    if pp_checks:
+        # Stop this cluster's own systemd unit first so a redeploy can
+        # reclaim its own ports without false-positive conflicts.
+        from app.services import cluster_paths
+        unit = cluster_paths.unit_name(cluster)
+        kafka_role_hosts = {svc.host_id for svc in services if svc.role in ("broker", "broker_controller", "controller", "zookeeper")}
+        for hid in kafka_role_hosts:
+            host = hosts.get(hid)
+            if not host:
+                continue
+            try:
+                with SSHManager.connect(
+                    host.ip_address, host.ssh_port, host.username,
+                    host.auth_type, host.encrypted_credential,
+                ) as client:
+                    SSHManager.exec_command(client, f"sudo -n systemctl stop {unit} 2>/dev/null || true", timeout=20)
+            except Exception:
+                pass
+        # Now check the actual ports.
+        conflicts = port_preflight.check_ports(pp_checks, hosts)
+        # Filter out the ssh-precheck-failed rows — they're not real conflicts.
+        real = [c for c in conflicts if not c.label.startswith("ssh-precheck-failed")]
+        if real:
+            msg = (
+                "Port conflict — refusing to deploy:\n  "
+                + "\n  ".join(c.message() for c in real)
+                + "\n\nFix: stop the conflicting process, or change the port in the cluster config "
+                  "(listener_port / controller_port / ssl_listener_port) and retry."
+            )
+            log(f"ERROR: {msg}")
+            _set_status(db, task_id, "error", error_message=msg)
+            cluster.state = "error"
+            db.commit()
+            return
 
     log(f"Pre-flight checks passed: {len(services)} services, {broker_count} brokers, RF={cluster_config.get('replication_factor', 1)}")
 
@@ -580,6 +621,33 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
             _append_log(db, task_id, msg)
 
         log(f"Adding Schema Registry to cluster '{cluster.name}' on {host.ip_address}:{port}")
+
+        # APB v1.4.2 — port pre-flight. Stops any existing SR on this
+        # host first (so a redeploy can reclaim its own port), then
+        # checks that the SR port is actually free.
+        try:
+            with SSHManager.connect(
+                host.ip_address, host.ssh_port, host.username,
+                host.auth_type, host.encrypted_credential,
+            ) as client:
+                SSHManager.exec_command(client, "sudo -n systemctl stop schema-registry 2>/dev/null || true", timeout=20)
+        except Exception:
+            pass
+        from app.services import port_preflight
+        sr_conflicts = port_preflight.check_ports(
+            [port_preflight.PortCheck(host_id, "", port, "schema_registry")],
+            {host_id: host},
+        )
+        sr_real = [c for c in sr_conflicts if not c.label.startswith("ssh-precheck-failed")]
+        if sr_real:
+            msg = (
+                "Port conflict — refusing to deploy Schema Registry:\n  "
+                + "\n  ".join(c.message() for c in sr_real)
+                + f"\n\nFix: stop the conflicting process, or pick a different port (current: {port})."
+            )
+            log(f"ERROR: {msg}")
+            _set_status(db, task_id, "error", error_message=msg)
+            return
 
         # Up-front config_json updates: ensure schema_registry_port is recorded
         try:

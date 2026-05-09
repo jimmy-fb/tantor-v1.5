@@ -127,6 +127,14 @@ export const checkPrereqs = (id: string) => api.post<PrereqResult>(`/hosts/${id}
 export const getClusters = () => api.get<Cluster[]>('/clusters').then(r => r.data);
 export const getCluster = (id: string) => api.get<ClusterDetail>(`/clusters/${id}`).then(r => r.data);
 export const createCluster = (data: ClusterCreate) => api.post<Cluster>('/clusters', data).then(r => r.data);
+// APB v1.4.2 — preflight port-check used by the create-cluster wizard.
+export const preflightPorts = (host_ids: string[], ports: number[]) =>
+  api.post<{
+    ok: boolean;
+    conflicts: Array<{ host_ip: string; port: number; label: string; process: string }>;
+    ssh_failures: Array<{ host_ip: string; error: string }>;
+    defaults: Record<string, number>;
+  }>('/clusters/preflight-ports', { host_ids, ports }).then(r => r.data);
 export const deleteCluster = (id: string) => api.delete(`/clusters/${id}`);
 export const deployCluster = (id: string) => api.post<DeploymentTask>(`/clusters/${id}/deploy`).then(r => r.data);
 export const getDeploymentStatus = (clusterId: string, taskId: string) =>

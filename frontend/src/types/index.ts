@@ -50,6 +50,8 @@ export interface ClusterConfig {
   log_dirs: string;
   listener_port: number;
   controller_port: number;
+  ssl_listener_port?: number;     // populated when ssl_enabled is on
+  schema_registry_port?: number;  // optional component
   heap_size: string;
   ksqldb_port: number;
   connect_port: number;
