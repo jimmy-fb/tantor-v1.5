@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Plus, Trash2, RefreshCw, ChevronDown, ChevronUp, Loader2, Search, AlertCircle, Settings, Save } from 'lucide-react';
 import type { TopicInfo, TopicDetail } from '../../types';
 import { getTopics, getTopic, createTopic, deleteTopic, updateTopicConfig, updateTopicPartitions } from '../../lib/api';
@@ -24,8 +24,11 @@ export default function TopicManager({ clusterId }: Props) {
   const [newPartitions, setNewPartitions] = useState(3);
   const [newRF, setNewRF] = useState(1);
 
-  const fetchTopics = useCallback(async () => {
-    setLoading(true);
+  // APB v1.4.3 #9 — separate visible (user-triggered) and silent
+  // (background poll) fetches so the page doesn't flash back into
+  // the loading state every 10s.
+  const fetchTopics = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const data = await getTopics(clusterId, search || undefined);
@@ -33,27 +36,30 @@ export default function TopicManager({ clusterId }: Props) {
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
       setError(msg || 'Failed to load topics. Is the broker reachable?');
-      setTopics([]);
+      // Don't blow away the existing list on a transient poll failure.
+      if (!silent) setTopics([]);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [clusterId, search]);
 
+  // Single effect for initial load + search-triggered refetch. NOT in
+  // the poll loop so the spinner doesn't reappear every 10s.
   useEffect(() => {
-    fetchTopics();
+    fetchTopics(false);
   }, [fetchTopics]);
 
-  // QA #3: visibility delay was 60s. Tighten to 10s when the tab is
-  // visible so new topics appear within a few seconds. We already
-  // re-fetch synchronously after create/delete (see handleCreate /
-  // handleDelete below), so this poll is just for changes happening
-  // out-of-band on other operators' UIs or via the kafka CLI.
+  // Background poll — silent (no loading spinner, no list wipe). Uses
+  // a ref so the interval doesn't re-fire when fetchTopics identity
+  // changes (search input typing), which was the source of #9.
+  const fetchRef = useRef(fetchTopics);
+  fetchRef.current = fetchTopics;
   useEffect(() => {
     const interval = setInterval(() => {
-      if (!document.hidden) fetchTopics();
+      if (!document.hidden) fetchRef.current(true);
     }, 10000);
     return () => clearInterval(interval);
-  }, [fetchTopics]);
+  }, []);
 
   const handleExpand = async (name: string) => {
     if (expanded === name) {
@@ -130,7 +136,7 @@ export default function TopicManager({ clusterId }: Props) {
             />
           </div>
           <button
-            onClick={fetchTopics}
+            onClick={() => fetchTopics(false)}
             className="flex items-center gap-1.5 px-3 py-1.5 text-xs border rounded-lg hover:bg-gray-50"
           >
             <RefreshCw size={13} /> Refresh
@@ -149,7 +155,7 @@ export default function TopicManager({ clusterId }: Props) {
         <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4 text-sm text-red-700">
           <AlertCircle size={16} />
           <span>{error}</span>
-          <button onClick={fetchTopics} className="ml-auto text-xs underline hover:no-underline">Retry</button>
+          <button onClick={() => fetchTopics(false)} className="ml-auto text-xs underline hover:no-underline">Retry</button>
         </div>
       )}
 

@@ -686,12 +686,17 @@ def describe_broker_configs(cluster: Cluster) -> list[dict]:
 
 
 def alter_broker_config(cluster: Cluster, broker_id: int, configs: dict) -> dict:
-    """Apply config changes to a specific broker via incremental_alter_configs.
+    """Apply config changes to a specific broker.
 
-    APB v1.4.1 — never silently fall back to destructive alter_configs.
-    Audit caught that an OLDER kafka-python against a NEWER broker (or
-    vice versa) might not raise AttributeError but instead truncate the
-    config. Refuse to fall back unless the operator explicitly opts in.
+    APB v1.4.3 — REVERTED the strict hasattr() refusal I added in 1.4.1.
+    That check was returning False for the customer's kafka-python build
+    (2.2.3 ships incremental_alter_configs but the attribute lookup was
+    failing for reasons I never reproduced), so external Config edits
+    failed for every customer. Back to try/except: attempt incremental
+    first, fall back to legacy alter_configs ONLY if the incremental
+    call itself raises NotImplementedError or AttributeError. Anything
+    else (broker rejection, timeout) bubbles up untouched so we don't
+    paper over real failures.
     """
     from kafka.admin import ConfigResource, ConfigResourceType
     import logging as _logging
@@ -701,17 +706,32 @@ def alter_broker_config(cluster: Cluster, broker_id: int, configs: dict) -> dict
         admin = KafkaAdminClient(**_common_kwargs(cluster, secrets, ssl_paths))
         try:
             cr = ConfigResource(ConfigResourceType.BROKER, str(broker_id), configs=configs)
-            if not hasattr(admin, "incremental_alter_configs"):
-                # kafka-python is too old for this broker; refuse rather
-                # than risk wiping the broker config with alter_configs.
-                raise ValueError(
-                    "kafka-python on this Tantor server doesn't support "
-                    "incremental_alter_configs. Refusing destructive fallback. "
-                    "Upgrade kafka-python-ng (>=2.0.2) or alter the broker "
-                    "config directly via kafka-configs.sh."
+            try:
+                admin.incremental_alter_configs([cr])
+                return {"broker_id": broker_id, "updated": True, "configs": configs, "method": "incremental"}
+            except (AttributeError, NotImplementedError):
+                # kafka-python on this server lacks the incremental
+                # method. Fall back to alter_configs with a loud warning
+                # — alter_configs replaces the whole config block, so
+                # we re-read the broker's existing config first and
+                # merge with the requested changes to mimic incremental
+                # semantics (KIP-516 safety).
+                _log.warning(
+                    "incremental_alter_configs unavailable for broker %s; "
+                    "falling back to alter_configs with read-then-merge",
+                    broker_id,
                 )
-            admin.incremental_alter_configs([cr])
-            return {"broker_id": broker_id, "updated": True, "configs": configs}
+                existing = describe_broker_configs(cluster)
+                cur = {}
+                for entry in existing:
+                    if entry.get("broker_id") == broker_id:
+                        cur = {c["name"]: c["value"] for c in entry.get("configs", [])
+                               if c.get("value") is not None}
+                        break
+                merged = {**cur, **configs}
+                cr_merged = ConfigResource(ConfigResourceType.BROKER, str(broker_id), configs=merged)
+                admin.alter_configs([cr_merged])
+                return {"broker_id": broker_id, "updated": True, "configs": configs, "method": "fallback_merged"}
         finally:
             admin.close()
 

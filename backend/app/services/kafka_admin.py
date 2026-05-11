@@ -397,13 +397,33 @@ class KafkaAdmin:
             safe_gid = group_id.replace("'", "'\\''")
             cmd_parts.append(f"--group '{safe_gid}'")
 
-        cmd = " ".join(cmd_parts)
+        # APB v1.4.3 #8 — redirect kafka-console-consumer stderr to
+        # /dev/null. Kafka 4.x's console-consumer occasionally prints
+        # log4j2 StatusLogger warnings + "Reconfiguration failed"
+        # noise to stderr even on healthy consumes; SSH merged
+        # stdout+stderr in some edge cases and the UI showed those
+        # log lines as message values. We only want the actual
+        # records on stdout.
+        cmd = " ".join(cmd_parts) + " 2>/dev/null"
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(host, cmd, timeout=30)
 
         messages = []
         for line in stdout.splitlines():
             line = line.strip()
             if not line:
+                continue
+            # Defensive: skip lines that obviously look like log4j2
+            # records — anything starting with "[YYYY-..." or "INFO/" /
+            # "ERROR/" is a stray log, not a real Kafka record. With
+            # 2>/dev/null this shouldn't happen, but in case kafka-
+            # console-consumer changes its output format, this
+            # backstop keeps the consume tab clean.
+            import re as _re
+            if _re.match(r"^\[\d{4}-\d{2}-\d{2}", line):
+                continue
+            if _re.match(r"^(INFO|WARN|ERROR|FATAL|DEBUG)\s", line):
+                continue
+            if "StatusLogger" in line or "Reconfiguration failed" in line:
                 continue
             msg = KafkaAdmin._parse_consumer_line(line)
             if msg:

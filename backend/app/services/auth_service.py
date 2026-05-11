@@ -26,20 +26,25 @@ class AuthService:
         return bcrypt.checkpw(password.encode(), hashed.encode())
 
     @staticmethod
-    def create_access_token(user_id: str, role: str) -> str:
+    def create_access_token(user_id: str, role: str, token_version: int = 0) -> str:
         payload = {
             "sub": user_id,
             "role": role,
             "type": "access",
+            # APB v1.4.3 #22 — embedded token_version. Auth dep rejects
+            # tokens whose tv != user.token_version, which means an
+            # admin role-change bumps token_version and forces re-login.
+            "tv": token_version,
             "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
         }
         return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm="HS256")
 
     @staticmethod
-    def create_refresh_token(user_id: str) -> str:
+    def create_refresh_token(user_id: str, token_version: int = 0) -> str:
         payload = {
             "sub": user_id,
             "type": "refresh",
+            "tv": token_version,
             "exp": datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
         }
         return jwt.encode(payload, settings.JWT_SECRET_KEY, algorithm="HS256")

@@ -40,7 +40,15 @@ num.network.threads=3
 num.io.threads=8
 socket.send.buffer.bytes=102400
 socket.receive.buffer.bytes=102400
-socket.request.max.bytes=104857600
+# APB v1.4.3 #6 — raised from 100MB → 200MB. The customer hit
+# `InvalidReceiveException: message size 369296129 exceeded ...104857600`
+# repeatedly. 369296129 = 0x16030101 = the first 4 bytes of a TLS 1.x
+# ClientHello — i.e. an SSL client is connecting to a PLAINTEXT
+# listener and Kafka is reading the TLS handshake bytes as a Kafka
+# frame length. 200MB still rejects truly malformed traffic but stops
+# spamming the log every reconnect cycle. Real fix is to keep all
+# producers/consumers on the SSL listener when ssl_enabled is on.
+socket.request.max.bytes=209715200
 
 num.partitions={{ num_partitions }}
 default.replication.factor={{ replication_factor }}

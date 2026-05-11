@@ -100,7 +100,10 @@ def get_cluster_metrics(
             "node_id": svc.node_id,
             "status": svc.status,
             "system": _get_system_metrics(host),
-            "kafka": _get_kafka_metrics(host),
+            # APB v1.4.3 #7 — pass cluster so the kafka probe uses the
+            # per-cluster systemd unit + install path + listener port
+            # instead of the legacy /opt/kafka + kafka.service + 9092.
+            "kafka": _get_kafka_metrics(host, cluster, svc),
             "disk": _get_disk_metrics(host),
         }
         seen_hosts[host.id] = node_metrics
@@ -269,15 +272,46 @@ echo "CPU_IDLE:$CPU_IDLE"
         return {"error": str(e)}
 
 
-def _get_kafka_metrics(host: Host) -> dict:
-    """Get Kafka broker metrics — service status, log size, topic count."""
-    cmd = """bash -c '
+def _get_kafka_metrics(host: Host, cluster=None, svc=None) -> dict:
+    """Get Kafka broker metrics — service status, log size, topic count.
+
+    APB v1.4.3 #7 — resolves the per-cluster unit name, install dir, data
+    dir, and listener port. Previously this always probed kafka.service
+    + /opt/kafka + localhost:9092, so for any per-cluster install (which
+    is everything since 1.3.5) the Monitoring tab reported the broker
+    as inactive even when it was running.
+    """
+    # Resolve per-cluster paths/ports/units. Falls back to legacy defaults
+    # for clusters that pre-date the per-cluster columns.
+    from app.services import cluster_paths
+    if cluster is not None and svc is not None and svc.role in ("broker", "broker_controller", "zookeeper"):
+        is_managed = (cluster.kind or "managed") == "managed"
+        unit_name = cluster_paths.unit_name(cluster) if is_managed else "kafka.service"
+        kafka_home = cluster_paths.install_dir(cluster) if is_managed else "/opt/kafka"
+        kafka_data = cluster_paths.data_dir(cluster) if is_managed else "/var/lib/kafka/data"
+        # Strip .service for systemctl show queries
+        unit_short = unit_name.removesuffix(".service")
+        # Listener port from config_json
+        try:
+            import json as _json
+            cfg = _json.loads(cluster.config_json or "{}")
+            port = int(cfg.get("listener_port") or 9092)
+        except Exception:
+            port = 9092
+    else:
+        unit_name = "kafka.service"
+        unit_short = "kafka"
+        kafka_home = "/opt/kafka"
+        kafka_data = "/var/lib/kafka/data"
+        port = 9092
+
+    cmd = f"""bash -c '
 # Service status
-ACTIVE=$(systemctl is-active kafka 2>/dev/null || echo "unknown")
+ACTIVE=$(systemctl is-active {unit_name} 2>/dev/null || echo "unknown")
 echo "KAFKA_STATUS:$ACTIVE"
 
 # PID and uptime
-PID=$(systemctl show kafka -p MainPID --value 2>/dev/null || echo 0)
+PID=$(systemctl show {unit_short} -p MainPID --value 2>/dev/null || echo 0)
 echo "KAFKA_PID:$PID"
 if [ "$PID" != "0" ] && [ -d "/proc/$PID" ]; then
     START=$(stat -c %Y /proc/$PID 2>/dev/null || echo 0)
@@ -286,38 +320,37 @@ if [ "$PID" != "0" ] && [ -d "/proc/$PID" ]; then
     echo "KAFKA_UPTIME_SECS:$UPTIME_SECS"
 
     # JVM memory from /proc
-    RSS=$(awk "/^VmRSS/{print \\$2}" /proc/$PID/status 2>/dev/null || echo 0)
+    RSS=$(awk "/^VmRSS/{{print \\$2}}" /proc/$PID/status 2>/dev/null || echo 0)
     echo "KAFKA_RSS_KB:$RSS"
 else
     echo "KAFKA_UPTIME_SECS:0"
     echo "KAFKA_RSS_KB:0"
 fi
 
-# Data directory size
-DATA_SIZE=$(du -sm /var/lib/kafka/data 2>/dev/null | awk "{print \\$1}" || sudo du -sm /var/lib/kafka/data 2>/dev/null | awk "{print \\$1}" || echo 0)
+# Data directory size (per-cluster)
+DATA_SIZE=$(du -sm {kafka_data} 2>/dev/null | awk "{{print \\$1}}" || sudo du -sm {kafka_data} 2>/dev/null | awk "{{print \\$1}}" || echo 0)
 echo "KAFKA_DATA_MB:$DATA_SIZE"
 
-# Log directory size
-LOG_SIZE=$(du -sm /opt/kafka/logs 2>/dev/null | awk "{print \\$1}" || sudo du -sm /opt/kafka/logs 2>/dev/null | awk "{print \\$1}" || echo 0)
+# Log directory size (per-cluster)
+LOG_SIZE=$(du -sm {kafka_home}/logs 2>/dev/null | awk "{{print \\$1}}" || sudo du -sm {kafka_home}/logs 2>/dev/null | awk "{{print \\$1}}" || echo 0)
 echo "KAFKA_LOG_MB:$LOG_SIZE"
 
-# Topic & partition count (prefer kafka CLI for accuracy, fall back to filesystem)
+# Topic & partition count via CLI on the right port
 JAVA_HOME_DIR=$(readlink -f $(which java 2>/dev/null) 2>/dev/null | sed "s|/bin/java||" || echo "/usr")
 export JAVA_HOME=$JAVA_HOME_DIR
-TOPIC_INFO=$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list 2>/dev/null | grep -v "^$" | wc -l || echo -1)
+TOPIC_INFO=$({kafka_home}/bin/kafka-topics.sh --bootstrap-server localhost:{port} --list 2>/dev/null | grep -v "^$" | wc -l || echo -1)
 if [ "$TOPIC_INFO" -ge 0 ] 2>/dev/null; then
     echo "KAFKA_TOPICS:$TOPIC_INFO"
-    PART_INFO=$(/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --describe 2>/dev/null | grep "PartitionCount" | awk -F'PartitionCount:' "{sum+=\\$2} END {print sum+0}" || echo 0)
+    PART_INFO=$({kafka_home}/bin/kafka-topics.sh --bootstrap-server localhost:{port} --describe 2>/dev/null | grep "PartitionCount" | awk -F"PartitionCount:" "{{sum+=\\$2}} END {{print sum+0}}" || echo 0)
     echo "KAFKA_PARTITIONS:$PART_INFO"
 else
-    # Fallback to filesystem
-    TOPICS=$(ls -d /var/lib/kafka/data/*-* 2>/dev/null | sed "s/-[0-9]*$//" | sort -u | wc -l || echo 0)
+    TOPICS=$(ls -d {kafka_data}/*-* 2>/dev/null | sed "s/-[0-9]*$//" | sort -u | wc -l || echo 0)
     echo "KAFKA_TOPICS:$TOPICS"
-    PARTITIONS=$(ls -d /var/lib/kafka/data/*-* 2>/dev/null | wc -l || echo 0)
+    PARTITIONS=$(ls -d {kafka_data}/*-* 2>/dev/null | wc -l || echo 0)
     echo "KAFKA_PARTITIONS:$PARTITIONS"
 fi
 
-# Open file descriptors (try direct, then sudo)
+# Open file descriptors
 if [ "$PID" != "0" ] && [ -d "/proc/$PID" ]; then
     FDS=$(ls /proc/$PID/fd 2>/dev/null | wc -l || echo 0)
     if [ "$FDS" = "0" ]; then
@@ -328,8 +361,8 @@ else
     echo "KAFKA_FDS:0"
 fi
 
-# Network connections on 9092
-CONNECTIONS=$(ss -tn 2>/dev/null | grep -c ":9092" || echo 0)
+# Network connections on the listener port
+CONNECTIONS=$(ss -tn 2>/dev/null | grep -c ":{port}" || echo 0)
 echo "KAFKA_CONNECTIONS:$CONNECTIONS"
 '"""
     output = _ssh_exec(host, cmd, timeout=15)

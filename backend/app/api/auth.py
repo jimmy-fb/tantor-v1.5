@@ -18,9 +18,10 @@ def login(data: LoginRequest, db: Session = Depends(get_db)):
     user = AuthService.authenticate(data.username, data.password, db)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    tv = getattr(user, "token_version", 0) or 0
     return TokenResponse(
-        access_token=AuthService.create_access_token(user.id, user.role),
-        refresh_token=AuthService.create_refresh_token(user.id),
+        access_token=AuthService.create_access_token(user.id, user.role, token_version=tv),
+        refresh_token=AuthService.create_refresh_token(user.id, token_version=tv),
         role=user.role,
     )
 
@@ -37,10 +38,14 @@ def refresh(data: TokenRefreshRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == payload["sub"]).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    # APB v1.4.3 #22 — also enforce token_version on refresh.
+    expected = getattr(user, "token_version", 0) or 0
+    if payload.get("tv", 0) != expected:
+        raise HTTPException(status_code=401, detail="Refresh token revoked — log in again")
 
     return TokenResponse(
-        access_token=AuthService.create_access_token(user.id, user.role),
-        refresh_token=AuthService.create_refresh_token(user.id),
+        access_token=AuthService.create_access_token(user.id, user.role, token_version=expected),
+        refresh_token=AuthService.create_refresh_token(user.id, token_version=expected),
         role=user.role,
     )
 
@@ -89,6 +94,10 @@ def update_user(user_id: str, data: UserUpdate, db: Session = Depends(get_db), c
         # Prevent removing admin from yourself
         if user.id == current_user.id and data.role != "admin":
             raise HTTPException(status_code=400, detail="Cannot remove admin role from yourself")
+        # APB v1.4.3 #22 — bump token_version so the affected user's
+        # in-flight JWTs get rejected on next API call.
+        if user.role != data.role:
+            user.token_version = (getattr(user, "token_version", 0) or 0) + 1
         user.role = data.role
 
     if data.password is not None:
@@ -106,6 +115,10 @@ def update_user(user_id: str, data: UserUpdate, db: Session = Depends(get_db), c
         # Prevent deactivating yourself
         if user.id == current_user.id and not data.is_active:
             raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
+        # APB v1.4.3 #22 — deactivation also bumps token_version so any
+        # JWTs already issued are rejected immediately.
+        if bool(user.is_active) != bool(data.is_active):
+            user.token_version = (getattr(user, "token_version", 0) or 0) + 1
         user.is_active = data.is_active
 
     db.commit()

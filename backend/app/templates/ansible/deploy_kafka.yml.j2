@@ -70,11 +70,21 @@
     # APB v1.2.0 #5 — DO NOT wipe every kafka*.service unit. The previous
     # logic blew away neighboring Tantor clusters' units. Stop ONLY this
     # cluster's unit (idempotent: ignore-error if it doesn't exist yet).
-    - name: Stop existing instance of this cluster's Kafka unit (if any)
+    # APB v1.4.3 #2 — first time a cluster deploys this unit doesn't
+    # exist yet, so `systemctl stop` would print a yellow warning.
+    # Probe with `systemctl list-unit-files` first so we only call
+    # stop when the unit really exists, keeping the deploy log clean.
+    - name: Detect existing Kafka unit
+      shell: "systemctl list-unit-files --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -Fxq {{ kafka_unit_name }}"
+      register: kafka_unit_present
+      failed_when: false
+      changed_when: false
+
+    - name: Stop existing instance of this cluster's Kafka unit (if it exists)
       systemd:
         name: "{{ kafka_unit_name }}"
         state: stopped
-      ignore_errors: true
+      when: kafka_unit_present.rc == 0
 
     - name: Reload systemd after cleanup
       systemd:

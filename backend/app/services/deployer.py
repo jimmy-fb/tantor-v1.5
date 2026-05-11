@@ -225,6 +225,47 @@ def _deploy_cluster_inner(cluster_id: str, task_id: str, db: Session) -> None:
         log(f"WARNING: replication_factor={rf} exceeds broker count={broker_count}. Adjusting to {broker_count}.")
         cluster_config["replication_factor"] = broker_count
 
+    # Check 5b: Java pre-flight on every host (APB v1.4.3 #17). The
+    # ansible playbook installs Java via apt/dnf, but if those package
+    # repos aren't reachable (corporate proxy, RHEL not subscribed, etc.)
+    # the install fails mid-deploy leaving a half-deployed cluster. Run
+    # a fast `java -version` probe + a `which dnf || which apt` check
+    # per host so the operator sees the gap up front.
+    missing_java_hosts: list[str] = []
+    for host_id in {svc.host_id for svc in services}:
+        host = hosts.get(host_id)
+        if not host:
+            continue
+        try:
+            with SSHManager.connect(
+                host.ip_address, host.ssh_port, host.username,
+                host.auth_type, host.encrypted_credential,
+            ) as client:
+                rc, _, _ = SSHManager.exec_command(client, "java -version 2>&1 | head -1", timeout=10)
+                if rc == 0:
+                    continue
+                # No Java — verify we have a package manager that can install it.
+                pm_cmd = "command -v dnf || command -v apt-get || command -v yum || echo NONE"
+                rc2, pm_out, _ = SSHManager.exec_command(client, pm_cmd, timeout=10)
+                pm = (pm_out or "").strip().splitlines()[0] if pm_out else "NONE"
+                if pm == "NONE" or not pm:
+                    missing_java_hosts.append(
+                        f"{host.ip_address}: Java not installed and no apt/dnf available — install openjdk-17-jre-headless manually"
+                    )
+                else:
+                    pkg_name = "java-17-openjdk-headless" if "dnf" in pm or "yum" in pm else "openjdk-17-jre-headless"
+                    missing_java_hosts.append(
+                        f"{host.ip_address}: Java not installed — Tantor's playbook will run `{pm} install -y {pkg_name}` (may fail if repos blocked)"
+                    )
+        except Exception as e:
+            # SSH problems are surfaced by later checks — don't double-fail.
+            log(f"  warning: java pre-check skipped for {host.ip_address}: {e}")
+    if missing_java_hosts:
+        msg = "Java pre-flight findings:\n  " + "\n  ".join(missing_java_hosts)
+        log(msg)
+        # Don't BLOCK on this — the playbook may still succeed if repos work.
+        # But surface it so the operator knows what to expect.
+
     # Check 5: Port-conflict pre-flight (APB v1.4.2). Catches the
     # collision-with-an-existing-cluster failure mode before ansible
     # binds and crashes silently.

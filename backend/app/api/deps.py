@@ -14,7 +14,13 @@ def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db),
 ) -> User:
-    """Extracts and validates JWT from Authorization header."""
+    """Extracts and validates JWT from Authorization header.
+
+    APB v1.4.3 #22 — also verifies token_version matches the row.
+    When an admin changes a user's role / deactivates them, we bump
+    user.token_version so existing JWTs (carrying the old version) are
+    rejected on next API call, forcing a fresh login.
+    """
     try:
         payload = AuthService.decode_token(credentials.credentials)
         if payload.get("type") != "access":
@@ -27,6 +33,16 @@ def get_current_user(
     user = db.query(User).filter(User.id == payload["sub"]).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    # Token version gate. Old tokens (no tv claim) default to 0 — for
+    # existing fresh-install users with token_version=0 they still
+    # work; once an admin bumps the version, all old tokens are dead.
+    expected = getattr(user, "token_version", 0) or 0
+    got = payload.get("tv", 0) or 0
+    if got != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Token revoked — your account's role or status changed. Please log in again.",
+        )
     return user
 
 

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Plug, RefreshCw, Plus, Trash2, X, Check, Wifi, AlertCircle } from 'lucide-react';
+import { Plug, RefreshCw, Plus, Trash2, X, Check, Wifi, AlertCircle, Loader2 } from 'lucide-react';
 import {
   listExternalClusters, createExternalCluster, updateExternalCluster, deleteExternalCluster,
   testExternalUnsaved, testExternalSaved, externalListTopics,
@@ -45,6 +45,11 @@ export default function ExternalClustersPage() {
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [topicsByCluster, setTopicsByCluster] = useState<Record<string, string[]>>({});
+  // APB v1.4.3 #12 — per-cluster button loading state. Was missing,
+  // so the Test / List Topics buttons "felt broken" because they
+  // gave no feedback while the kafka-python AdminClient probed.
+  const [testingCluster, setTestingCluster] = useState<string | null>(null);
+  const [listingCluster, setListingCluster] = useState<string | null>(null);
 
   const reload = async () => {
     setLoading(true);
@@ -142,22 +147,30 @@ export default function ExternalClustersPage() {
   };
 
   const onTestSaved = async (c: ExternalCluster) => {
+    setTestingCluster(c.id);
+    setInfo('');
     try {
       const r = await testExternalSaved(c.id);
       setInfo(r.success ? `✓ ${c.name}: ${r.message}` : `✗ ${c.name}: ${r.message}`);
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string } } };
       setInfo(`✗ ${c.name}: ${err.response?.data?.detail || 'failed'}`);
+    } finally {
+      setTestingCluster(null);
     }
   };
 
   const onListTopics = async (c: ExternalCluster) => {
+    setListingCluster(c.id);
     try {
       const tps = await externalListTopics(c.id);
       setTopicsByCluster({ ...topicsByCluster, [c.id]: tps.map((t) => t.name) });
+      setInfo(`✓ ${c.name}: ${tps.length} topic(s) loaded`);
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string } } };
       setInfo(`✗ ${c.name} list_topics: ${err.response?.data?.detail || 'failed'}`);
+    } finally {
+      setListingCluster(null);
     }
   };
 
@@ -227,11 +240,21 @@ export default function ExternalClustersPage() {
                 <td className="px-3 py-2 text-xs">{c.ssl_verify ? 'on' : 'off'}</td>
                 {admin && (
                   <td className="px-3 py-2 flex gap-1 flex-wrap">
-                    <button onClick={() => onTestSaved(c)} className="px-2 py-1 text-xs border rounded hover:bg-gray-50 flex items-center gap-1">
-                      <Wifi size={12} /> Test
+                    <button
+                      onClick={() => onTestSaved(c)}
+                      disabled={testingCluster === c.id}
+                      className="px-2 py-1 text-xs border rounded hover:bg-gray-50 disabled:opacity-50 flex items-center gap-1"
+                    >
+                      {testingCluster === c.id ? <Loader2 size={12} className="animate-spin" /> : <Wifi size={12} />}
+                      {testingCluster === c.id ? 'Testing…' : 'Test'}
                     </button>
-                    <button onClick={() => onListTopics(c)} className="px-2 py-1 text-xs border rounded hover:bg-gray-50">
-                      List topics
+                    <button
+                      onClick={() => onListTopics(c)}
+                      disabled={listingCluster === c.id}
+                      className="px-2 py-1 text-xs border rounded hover:bg-gray-50 disabled:opacity-50 flex items-center gap-1"
+                    >
+                      {listingCluster === c.id && <Loader2 size={12} className="animate-spin" />}
+                      {listingCluster === c.id ? 'Loading…' : 'List topics'}
                     </button>
                     <button onClick={() => startEdit(c)} className="px-2 py-1 text-xs border rounded hover:bg-gray-50">
                       Edit

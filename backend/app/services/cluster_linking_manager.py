@@ -238,10 +238,28 @@ class ClusterLinkingManager:
         source_brokers = _get_broker_addresses(source_cluster_id, db)
         dest_brokers = _get_broker_addresses(dest_cluster_id, db)
 
+        # APB v1.4.3 #20 — distinguish "no brokers at all" from "external
+        # cluster has malformed bootstrap_servers". The customer reported
+        # external clusters showing 1 broker in overview but link create
+        # failing — root cause was bootstrap_servers without a :port
+        # which _validate_bootstrap_address filters out. Tell the
+        # operator EXACTLY what's wrong.
+        def _explain_empty(c: Cluster, label: str) -> str:
+            kind = c.kind or "managed"
+            if kind == "external":
+                raw = (c.bootstrap_servers or "").strip()
+                if not raw:
+                    return f"{label} cluster ({c.name}): no bootstrap_servers configured. Edit the external cluster and add a comma-separated list of host:port entries."
+                return (
+                    f"{label} cluster ({c.name}): bootstrap_servers='{raw}' "
+                    "rejected — every entry must look like 'host:port' (or '[ipv6]:port'). "
+                    "Edit the external cluster to fix."
+                )
+            return f"{label} cluster ({c.name}) has no broker services registered. Deploy at least one broker before creating a link."
         if not source_brokers:
-            raise ValueError("Source cluster has no brokers")
+            raise ValueError(_explain_empty(source, "Source"))
         if not dest_brokers:
-            raise ValueError("Destination cluster has no brokers")
+            raise ValueError(_explain_empty(dest, "Destination"))
 
         mm2_config = _generate_mm2_config(
             source_brokers, dest_brokers, topics_pattern, sync_offsets, sync_configs,

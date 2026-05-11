@@ -44,6 +44,9 @@ _REQUIRED_COLUMNS: list[tuple[str, str, str, str | None]] = [
     # APB v1.4.0 — LDAP-vs-manual user provenance (#11)
     ("users", "auth_source", "VARCHAR(20)", "DEFAULT 'local'"),
     ("users", "ldap_dn", "VARCHAR(500)", None),
+    # APB v1.4.3 — bump token_version on privilege change to invalidate
+    # in-flight JWTs (#22)
+    ("users", "token_version", "INTEGER", "DEFAULT 0"),
 ]
 
 

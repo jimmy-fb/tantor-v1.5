@@ -59,28 +59,31 @@ class PortConflict:
 
 
 def _list_listening(client, ports: Iterable[int]) -> dict[int, str]:
-    """Return {port: process-description} for every port in `ports` that
-    something is currently bound to on this host.
+    """Return {port: process-description} for every port in `ports`.
 
-    Uses `ss -tnlp` (works on RHEL/Debian; no sudo because we only need
-    listening sockets which are world-visible). Falls back to `netstat`
-    if ss is unavailable. Empty dict means all ports are free.
+    APB v1.4.3 #16 — when ss reports a port held by `java pid=X`, we
+    also walk `systemctl status -- --pid=X` (via cgroup lookup) to
+    resolve the holding unit name. Previously the description was just
+    "java pid=32333" which leaves the operator guessing whether it's a
+    Tantor cluster or a hand-installed Kafka. Now we surface e.g.
+    "java pid=32333 (kafka-prod-1ac9bbbe.service)".
+
+    Uses `sudo -n ss -tnlp` if available so we get the PID even without
+    being root. Falls back to no-sudo `ss` then `netstat`.
     """
     port_list = " ".join(str(p) for p in ports)
     cmd = (
-        # First try: ss is preferred (stable output, present on all
-        # supported distros). Use the in-kernel filter so we don't
-        # transfer an entire socket dump.
         f"if command -v ss >/dev/null 2>&1; then "
         f"  for p in {port_list}; do "
-        f"    ss -tnlH 'sport = :'$p 2>/dev/null | awk -v p=$p "
-        f"      '{{print p\":\"$0}}'; "
+        # sudo -n first (gives us PIDs); fall back to no-sudo (no PIDs
+        # but still tells us "port is held").
+        f"    out=$(sudo -n ss -tnlpH 'sport = :'$p 2>/dev/null || ss -tnlH 'sport = :'$p 2>/dev/null); "
+        f"    echo \"$out\" | awk -v p=$p 'NF{{print p\"::\"$0}}'; "
         f"  done; "
-        # netstat fallback — older containers, busybox, etc.
         f"else "
         f"  for p in {port_list}; do "
         f"    netstat -tnlp 2>/dev/null | awk -v p=\":\"$p "
-        f"      '$4 ~ p {{print substr(p,2)\":\"$0}}'; "
+        f"      '$4 ~ p {{print substr(p,2)\"::\"$0}}'; "
         f"  done; "
         f"fi"
     )
@@ -89,27 +92,68 @@ def _list_listening(client, ports: Iterable[int]) -> dict[int, str]:
         return {}
 
     result: dict[int, str] = {}
+    pids_to_resolve: set[int] = set()
+    pid_for_port: dict[int, int] = {}
     for line in stdout.splitlines():
-        if ":" not in line:
+        if "::" not in line:
             continue
-        port_str, _, rest = line.partition(":")
+        port_str, _, rest = line.partition("::")
         try:
             port = int(port_str)
         except ValueError:
             continue
         if port in result:
             continue
-        # rest looks like:
-        #   "LISTEN 0 50  *:9092 *:* users:((\"java\",pid=32333,fd=164))"
-        # Extract a readable summary.
         proc = "unknown"
+        pid_int: int | None = None
         if "users:" in rest:
-            proc = rest.split("users:", 1)[1].strip().strip("(()")
+            users_part = rest.split("users:", 1)[1].strip().strip("(()")
+            proc = users_part
+            # Extract pid for unit lookup: "(\"java\",pid=32333,fd=164)"
+            import re as _re
+            m = _re.search(r"pid=(\d+)", users_part)
+            if m:
+                pid_int = int(m.group(1))
         elif "/" in rest:
-            # netstat format: "java/32333"
             tail = rest.strip().split()[-1] if rest.strip().split() else ""
             proc = tail
+            import re as _re
+            m = _re.search(r"(\d+)/", tail)
+            if m:
+                pid_int = int(m.group(1))
         result[port] = proc
+        if pid_int:
+            pids_to_resolve.add(pid_int)
+            pid_for_port[port] = pid_int
+
+    # Resolve each PID's owning systemd unit in a single SSH round-trip.
+    if pids_to_resolve:
+        pid_args = " ".join(str(p) for p in pids_to_resolve)
+        unit_cmd = (
+            f"for pid in {pid_args}; do "
+            # systemctl status takes a pid via --pid; output line 1 has the unit.
+            f"  u=$(systemctl status --no-pager -p Id --value -- $pid 2>/dev/null"
+            f"      || awk -F/ '/^0::/{{print $NF}}' /proc/$pid/cgroup 2>/dev/null"
+            f"      | sed 's/\\.service.*$/.service/'); "
+            f"  echo \"$pid=$u\"; "
+            f"done"
+        )
+        rc2, out2, _ = SSHManager.exec_command(client, unit_cmd, timeout=10)
+        if rc2 == 0 and out2:
+            pid_unit: dict[int, str] = {}
+            for line in out2.splitlines():
+                if "=" not in line:
+                    continue
+                pid_s, _, unit = line.partition("=")
+                unit = unit.strip()
+                try:
+                    pid_unit[int(pid_s)] = unit
+                except ValueError:
+                    continue
+            for port, pid_int in pid_for_port.items():
+                unit = pid_unit.get(pid_int, "")
+                if unit and unit not in ("0", "n/a", ""):
+                    result[port] = f"{result[port]} ({unit})"
     return result
 
 

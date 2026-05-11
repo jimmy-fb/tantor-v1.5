@@ -92,8 +92,14 @@ class MonitoringDeployer:
         # JMX endpoints as scrape targets instead of broker hosts we own.
         try:
             if is_external:
+                # APB v1.4.3 #21 — pass cluster_id so the scrape config
+                # tags samples with {cluster=<id>}. Grafana dashboards
+                # filter by cluster label; without it the panels query
+                # for a value that doesn't exist on the samples and
+                # show "No data" even when scrape is healthy.
                 MonitoringDeployer._deploy_prometheus_external(
                     mon_host, external_jmx_endpoints or [], prometheus_port,
+                    cluster_id=cluster_id, cluster_name=cluster.name,
                 )
             else:
                 MonitoringDeployer._deploy_prometheus(mon_host, broker_hosts, prometheus_port, jmx_port=jmx_port)
@@ -342,21 +348,40 @@ curl -sf http://localhost:{port}/-/healthy && echo "PROM_OK" || echo "PROM_FAIL"
             raise RuntimeError(f"Prometheus deploy failed: {stderr}")
 
     @staticmethod
-    def _deploy_prometheus_external(host: Host, jmx_endpoints: list[str], port: int):
+    def _deploy_prometheus_external(host: Host, jmx_endpoints: list[str], port: int,
+                                     cluster_id: str = "", cluster_name: str = ""):
         """Variant of _deploy_prometheus for external clusters.
 
         Tantor doesn't own the brokers, so it can't push JMX exporter to them.
         The customer must expose JMX (or JMX exporter) themselves; the
         endpoints they give us go straight into the kafka-jmx scrape job.
+
+        APB v1.4.3 #21 — tag samples with `cluster=<id>` and `cluster_name=<name>`
+        labels so Grafana dashboards filter correctly. Without the label,
+        all the standard Grafana templates queried for a series the
+        sample didn't have, returning "No data".
         """
         logger.info(f"Deploying Prometheus on {host.hostname} for external cluster")
 
         # Tolerate missing endpoints — the operator can start with just rules
         # and add scrape targets later by re-running the monitoring deploy.
         targets = ", ".join([f'"{ep.strip()}"' for ep in jmx_endpoints if ep.strip()]) or '""'
+        # Inject static labels so every sample has cluster=<id>.
+        labels_block = ""
+        if cluster_id:
+            labels_block = f"""
+        labels:
+          cluster: "{cluster_id}"
+          cluster_name: "{cluster_name}"
+          cluster_kind: "external\""""
         prometheus_yml = f"""global:
   scrape_interval: 15s
   evaluation_interval: 15s
+  # APB v1.4.3 #21 — global external_labels so all alert + remote_write
+  # streams carry the cluster identity even when a panel forgets.
+  external_labels:
+    cluster: "{cluster_id}"
+    cluster_kind: "external"
 
 # Tantor-managed: Alertmanager runs on the same host as Prometheus.
 alerting:
@@ -370,7 +395,7 @@ rule_files:
 scrape_configs:
   - job_name: 'kafka-jmx'
     static_configs:
-      - targets: [{targets}]
+      - targets: [{targets}]{labels_block}
 """
 
         commands = f"""

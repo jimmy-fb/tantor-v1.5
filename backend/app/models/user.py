@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, DateTime, Boolean
+from sqlalchemy import String, DateTime, Boolean, Integer
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -20,5 +20,10 @@ class User(Base):
     # the form for synced users.
     ldap_dn: Mapped[str | None] = mapped_column(String(500), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # APB v1.4.3 #22 — bumped on role change / deactivation so existing
+    # JWTs (which carry the old token_version) get rejected. Default 0,
+    # bump by 1 on every privilege-affecting change. Server-side check in
+    # the auth dependency rejects tokens with version != user.token_version.
+    token_version: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

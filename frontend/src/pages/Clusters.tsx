@@ -32,6 +32,10 @@ export default function Clusters() {
   const [retrying, setRetrying] = useState<string | null>(null);
   const [quickDeploying, setQuickDeploying] = useState(false);
   const [quickDeployError, setQuickDeployError] = useState('');
+  // APB v1.4.3 #11 — manual Refresh button with visible spinner.
+  // Auto-poll still runs every 15s but the operator wanted explicit
+  // feedback when they click refresh themselves.
+  const [manualRefreshing, setManualRefreshing] = useState(false);
 
   // APB v1.4.0 #6 — one-click deploy: spins up a cluster on every
   // registered host with sane defaults and skips the wizard entirely.
@@ -56,6 +60,19 @@ export default function Clusters() {
 
   const fetchClusters = () => {
     getClusters().then(setClusters);
+  };
+
+  const handleManualRefresh = async () => {
+    setManualRefreshing(true);
+    try {
+      const data = await getClusters();
+      setClusters(data);
+    } finally {
+      // Keep the spinner on for >=400ms so the operator sees it even
+      // when the network call is instant — the customer complained
+      // it "felt broken" with no visible feedback.
+      setTimeout(() => setManualRefreshing(false), 400);
+    }
   };
 
   useEffect(() => {
@@ -118,6 +135,16 @@ export default function Clusters() {
           <p className="text-sm text-gray-500 mt-1">Your Kafka cluster deployments</p>
         </div>
         <div className="flex items-center gap-2">
+          {/* APB v1.4.3 #11 — manual refresh with visible spinner. */}
+          <button
+            onClick={handleManualRefresh}
+            disabled={manualRefreshing}
+            className="flex items-center gap-2 px-3 py-2 border border-gray-200 text-sm rounded-lg hover:bg-gray-50 disabled:opacity-50"
+            title="Reload cluster list from backend"
+          >
+            <RotateCw size={14} className={manualRefreshing ? 'animate-spin' : ''} />
+            Refresh
+          </button>
           <button
             onClick={handleQuickDeploy}
             disabled={quickDeploying}

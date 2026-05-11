@@ -26,7 +26,7 @@
 
 set -e
 
-VERSION="1.4.2"
+VERSION="1.4.3"
 
 # Default paths follow FHS: code in /opt, mutable data in /var/lib, logs in /var/log.
 # `--install-dir <BASE>` collapses everything under BASE so customers with a
@@ -248,15 +248,29 @@ detect_os() {
 # ─── Uninstall ───
 do_uninstall() {
     echo -e "${YELLOW}▶ Uninstalling Tantor...${NC}"
-    # Stop ALL Tantor-managed services. Don't leave anything behind.
-    for unit in tantor-backend kafka schema-registry prometheus alertmanager grafana-server; do
+    # APB v1.4.3 #14/#15 — enumerate every per-cluster Kafka unit. Prior
+    # to this we only stopped the legacy `kafka.service`, leaving every
+    # `kafka-<slug>-<id>.service` running and 15+ stale data dirs piling
+    # up across reinstall cycles.
+    KAFKA_UNITS=$(systemctl list-unit-files --no-legend --no-pager 2>/dev/null \
+                  | awk '$1 ~ /^kafka-.*\.service/ {print $1}')
+    if [ -n "$KAFKA_UNITS" ]; then
+        echo -e "${YELLOW}  Stopping per-cluster Kafka units: $(echo $KAFKA_UNITS | tr '\n' ' ')${NC}"
+    fi
+    for unit in $KAFKA_UNITS tantor-backend kafka schema-registry prometheus alertmanager grafana-server; do
         if systemctl list-unit-files --no-legend --no-pager 2>/dev/null | grep -q "^$unit"; then
             systemctl stop "$unit" 2>/dev/null || true
             systemctl disable "$unit" 2>/dev/null || true
         fi
     done
+    # Murder any Kafka JVM stragglers (systemd Type=simple with start.sh
+    # wrappers can leave forked children behind on failed restarts).
+    pkill -9 -f '/opt/kafka' 2>/dev/null || true
+
     rm -f /etc/systemd/system/tantor-backend.service
     rm -f /etc/systemd/system/kafka.service
+    # APB v1.4.3 #14 — remove every per-cluster unit file.
+    rm -f /etc/systemd/system/kafka-*.service
     rm -f /etc/systemd/system/schema-registry.service
     rm -f /etc/systemd/system/prometheus.service
     rm -f /etc/systemd/system/alertmanager.service
@@ -270,10 +284,13 @@ do_uninstall() {
         mv /etc/nginx/nginx.conf.tantor-bak /etc/nginx/nginx.conf
     fi
     systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed 2>/dev/null || true
     systemctl restart nginx 2>/dev/null || true
     rm -rf "$TANTOR_HOME"
     rm -rf "$TANTOR_LOG"
     rm -rf /opt/kafka /opt/apicurio /opt/prometheus /opt/alertmanager /opt/jmx_exporter
+    # APB v1.4.3 #14 — per-cluster install dirs (kafka-<slug>-<id>).
+    rm -rf /opt/kafka-*
     rm -rf /etc/kafka/ssl /etc/prometheus /etc/alertmanager
     rm -f /usr/local/bin/tantorctl
     if [ "$PURGE" = true ]; then
@@ -283,6 +300,8 @@ do_uninstall() {
         # too on --purge, otherwise stale meta.properties / KRaft cluster IDs
         # break the next deploy with "Invalid cluster.id".
         rm -rf /var/lib/kafka /var/log/kafka /var/lib/prometheus /var/lib/grafana /var/lib/alertmanager
+        # APB v1.4.3 #14 — per-cluster data dirs + log dirs.
+        rm -rf /var/lib/kafka-* /var/log/kafka-*
         # Grafana ships as a deb/rpm package and its dpkg/rpm state survives
         # a plain `rm -rf` on its data dir — leaving its postinst convinced
         # it's still "installed" and skipping data dir recreation on next
