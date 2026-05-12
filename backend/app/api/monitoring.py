@@ -61,7 +61,7 @@ def get_cluster_metrics(
 ):
     """Get live metrics for all nodes in a cluster.
 
-    APB v1.4.0 #14 — also works for external clusters now: we synthesize
+    v1.4.0 #14 — also works for external clusters now: we synthesize
     broker entries from kafka-python's describe_cluster() and pull Kafka-
     level metrics (topic count, ISR, etc) from the AdminClient. System
     metrics (CPU/memory/disk) require SSH and stay unavailable on
@@ -100,7 +100,7 @@ def get_cluster_metrics(
             "node_id": svc.node_id,
             "status": svc.status,
             "system": _get_system_metrics(host),
-            # APB v1.4.3 #7 — pass cluster so the kafka probe uses the
+            # v1.4.3 #7 — pass cluster so the kafka probe uses the
             # per-cluster systemd unit + install path + listener port
             # instead of the legacy /opt/kafka + kafka.service + 9092.
             "kafka": _get_kafka_metrics(host, cluster, svc),
@@ -119,7 +119,7 @@ def get_cluster_metrics(
 def _external_cluster_metrics(cluster: Cluster, db: Session) -> dict:
     """Synthesize per-broker rows for an external cluster.
 
-    APB v1.4.0 #14. We don't own SSH to the customer's brokers (in the
+    v1.4.0 #14. We don't own SSH to the customer's brokers (in the
     common case), so we can only return what kafka-python's AdminClient
     exposes plus whatever JMX metrics Prometheus has scraped (if the
     operator deployed monitoring against `external_jmx_endpoints`).
@@ -275,7 +275,7 @@ echo "CPU_IDLE:$CPU_IDLE"
 def _get_kafka_metrics(host: Host, cluster=None, svc=None) -> dict:
     """Get Kafka broker metrics — service status, log size, topic count.
 
-    APB v1.4.3 #7 — resolves the per-cluster unit name, install dir, data
+    v1.4.3 #7 — resolves the per-cluster unit name, install dir, data
     dir, and listener port. Previously this always probed kafka.service
     + /opt/kafka + localhost:9092, so for any per-cluster install (which
     is everything since 1.3.5) the Monitoring tab reported the broker
@@ -495,7 +495,7 @@ def get_grafana_info(
 
 
 # ── Capacity trend forecasting ──────────────────────────────────────────────
-# APB-requested feature: predict future storage and throughput growth using
+# customerrequested feature: predict future storage and throughput growth using
 # historical cluster metrics so they can plan infrastructure proactively.
 # Implementation: pull 14 days of disk usage from Prometheus, fit a linear
 # regression on (time, used_bytes), project forward, return ETA-to-X%-full
@@ -648,7 +648,7 @@ def capacity_forecast(
 
 
 # ── Detailed per-cluster monitoring summary ────────────────────────────────
-# APB asked for "monitoring can be detailed" inside the per-cluster tab.
+# customer asked for "monitoring can be detailed" inside the per-cluster tab.
 # This endpoint hits Prometheus once and returns a digest the UI renders as
 # a dashboard panel — total throughput, broker up/down, top-N topics by
 # rate, top-N consumer groups by lag, JVM heap, GC count, scrape targets.

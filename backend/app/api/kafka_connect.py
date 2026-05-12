@@ -92,7 +92,7 @@ def list_plugins(cluster_id: str, db: Session = Depends(get_db), _: User = Depen
 
 
 # ── CDC quickstart templates ─────────────────────────────────────────────
-# APB asked for "Stream real-time database changes directly into Kafka topics
+# customer asked for "Stream real-time database changes directly into Kafka topics
 # via CDC pipelines". Tantor ships pre-curated Debezium templates so the
 # operator only fills in host / db / credentials, not the 30-key Connect
 # config every time.

@@ -138,7 +138,7 @@ def get_audit_log(
     return logs
 
 
-# ── Certificates (APB v1.4.0 #8) ──────────────────────
+# ── Certificates (v1.4.0 #8) ──────────────────────
 
 
 @router.get("/certificates")
@@ -163,7 +163,7 @@ def upload_certificate_ca(
 ):
     """Replace the cluster's CA with operator-supplied PEM material.
 
-    APB v1.4.0 #8 — operators bring their own CA so broker certs chain
+    v1.4.0 #8 — operators bring their own CA so broker certs chain
     up to a trust anchor their downstream clients already accept.
     """
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()

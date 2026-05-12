@@ -62,7 +62,7 @@ export default function ClusterWizard() {
   const [nameError, setNameError] = useState('');
   const [portError, setPortError] = useState('');
 
-  // APB v1.4.2 — port preflight against the selected hosts.
+  // v1.4.2 — port preflight against the selected hosts.
   const [portCheckLoading, setPortCheckLoading] = useState(false);
   const [portCheckResult, setPortCheckResult] = useState<{
     ok: boolean;
@@ -546,7 +546,7 @@ export default function ClusterWizard() {
             )}
           </div>
 
-          {/* APB v1.4.2 — Check ports on selected hosts before submit */}
+          {/* v1.4.2 — Check ports on selected hosts before submit */}
           <div className="border border-gray-200 rounded-xl p-4 bg-gray-50">
             <div className="flex items-center justify-between mb-2">
               <div>

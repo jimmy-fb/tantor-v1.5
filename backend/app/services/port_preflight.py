@@ -61,7 +61,7 @@ class PortConflict:
 def _list_listening(client, ports: Iterable[int]) -> dict[int, str]:
     """Return {port: process-description} for every port in `ports`.
 
-    APB v1.4.3 #16 — when ss reports a port held by `java pid=X`, we
+    v1.4.3 #16 — when ss reports a port held by `java pid=X`, we
     also walk `systemctl status -- --pid=X` (via cgroup lookup) to
     resolve the holding unit name. Previously the description was just
     "java pid=32333" which leaves the operator guessing whether it's a

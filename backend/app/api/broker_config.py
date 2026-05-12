@@ -17,7 +17,7 @@ class ConfigUpdateRequest(BaseModel):
 
 
 class BulkConfigRequest(BaseModel):
-    """Apply a config change to every broker in a cluster (APB v1.4.0 #16).
+    """Apply a config change to every broker in a cluster (v1.4.0 #16).
 
     The customer asked for "one for all" — instead of editing the same
     key on each broker individually, push it to all of them at once.
@@ -41,7 +41,7 @@ def update_config(
     db: Session = Depends(get_db), user: User = Depends(require_admin),
 ):
     """Update a single config key on a specific broker (also adds the
-    key if it doesn't exist yet — APB v1.4.0 #10)."""
+    key if it doesn't exist yet — v1.4.0 #10)."""
     try:
         return config_manager.update_broker_config(
             cluster_id, broker_id, req.config_key, req.config_value, user.username, db,
@@ -60,7 +60,7 @@ def add_config_to_broker(
 ):
     """Add a new config key (or update an existing one) on a specific
     broker. Same backing logic as PUT but reachable without already
-    knowing the key — APB v1.4.0 #10.
+    knowing the key — v1.4.0 #10.
 
     If `broker_id` is omitted, the request is rejected with a 422; use
     the `/bulk-config` endpoint for cluster-wide changes.

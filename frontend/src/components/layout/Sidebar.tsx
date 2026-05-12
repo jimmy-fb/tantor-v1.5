@@ -27,7 +27,7 @@ export default function Sidebar() {
     { to: '/external-clusters', icon: Plug, label: 'External Clusters' },
     { to: '/federation', icon: Globe2, label: 'Federation' },
     { to: '/versions', icon: Package, label: 'Kafka Versions' },
-    // APB v1.4.0 #2 — Schema Registry now lives per-cluster (Cluster → Schema tab).
+    // v1.4.0 #2 — Schema Registry now lives per-cluster (Cluster → Schema tab).
     // The standalone sidebar entry was misleading because schemas are inherently
     // tied to one cluster's bootstrap servers.
     // Cross-cluster monitoring overview (deep-links into per-cluster

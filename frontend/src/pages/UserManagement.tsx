@@ -200,7 +200,7 @@ export default function UserManagement() {
                   <span className="font-medium text-gray-900">{user.username}</span>
                 </td>
                 <td className="px-6 py-4">
-                  {/* APB v1.4.0 #11 — show provenance so admins can tell at a
+                  {/* v1.4.0 #11 — show provenance so admins can tell at a
                       glance whether a user is local or LDAP-synced. */}
                   {user.auth_source === 'ldap' ? (
                     <span
@@ -273,7 +273,7 @@ export default function UserManagement() {
                         </button>
                       </div>
                     ) : (
-                      // APB v1.4.0 #11 — hide local password change for LDAP-synced users.
+                      // v1.4.0 #11 — hide local password change for LDAP-synced users.
                       user.auth_source === 'ldap' ? (
                         <span
                           className="p-1.5 text-gray-300 cursor-not-allowed"

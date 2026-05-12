@@ -312,7 +312,7 @@ def consume(
         raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
 
 
-# ── SSH-based lifecycle for externally-managed clusters (APB v1.3) ──────────
+# ── SSH-based lifecycle for externally-managed clusters (v1.3) ──────────
 # An external cluster is one Tantor didn't deploy, so by default we can't
 # start/restart it — we don't know where the brokers run or what the systemd
 # unit is called. The operator can opt in by registering broker hosts (which

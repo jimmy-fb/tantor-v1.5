@@ -225,7 +225,7 @@ def _deploy_cluster_inner(cluster_id: str, task_id: str, db: Session) -> None:
         log(f"WARNING: replication_factor={rf} exceeds broker count={broker_count}. Adjusting to {broker_count}.")
         cluster_config["replication_factor"] = broker_count
 
-    # Check 5b: Java pre-flight on every host (APB v1.4.3 #17). The
+    # Check 5b: Java pre-flight on every host (v1.4.3 #17). The
     # ansible playbook installs Java via apt/dnf, but if those package
     # repos aren't reachable (corporate proxy, RHEL not subscribed, etc.)
     # the install fails mid-deploy leaving a half-deployed cluster. Run
@@ -266,7 +266,7 @@ def _deploy_cluster_inner(cluster_id: str, task_id: str, db: Session) -> None:
         # Don't BLOCK on this — the playbook may still succeed if repos work.
         # But surface it so the operator knows what to expect.
 
-    # Check 5: Port-conflict pre-flight (APB v1.4.2). Catches the
+    # Check 5: Port-conflict pre-flight (v1.4.2). Catches the
     # collision-with-an-existing-cluster failure mode before ansible
     # binds and crashes silently.
     from app.services import port_preflight
@@ -529,7 +529,7 @@ def _run_ansible_deployment(
             apicurio_tgz = existing[-1].name
             log(f"Using Apicurio binary: {apicurio_tgz} ({existing[-1].stat().st_size // (1024*1024)} MB)")
 
-    # Generate playbook. Kafka paths are PER-CLUSTER (APB v1.2.0 #5) so two
+    # Generate playbook. Kafka paths are PER-CLUSTER (v1.2.0 #5) so two
     # managed clusters on the same host don't collide on /opt/kafka.
     playbook_path = ansible_runner.generate_playbook(work_dir, "deploy_kafka.yml.j2", {
         "kafka_install_dir": cluster_paths.install_dir(cluster),
@@ -636,7 +636,7 @@ def _run_ansible_deployment(
 
 
 def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: str) -> None:
-    """Add an Apicurio Schema Registry to an already-deployed cluster (APB v1.4.0 #2).
+    """Add an Apicurio Schema Registry to an already-deployed cluster (v1.4.0 #2).
 
     Runs in a background thread the same way deploy_cluster does. Uses
     deploy_schema_registry.yml.j2 — a compact playbook that ONLY touches
@@ -663,7 +663,7 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
 
         log(f"Adding Schema Registry to cluster '{cluster.name}' on {host.ip_address}:{port}")
 
-        # APB v1.4.2 — port pre-flight. Stops any existing SR on this
+        # v1.4.2 — port pre-flight. Stops any existing SR on this
         # host first (so a redeploy can reclaim its own port), then
         # checks that the SR port is actually free.
         try:
@@ -714,7 +714,7 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
         else:
             sr_svc.host_id = host_id
             sr_svc.status = "deploying"
-            # APB v1.4.1 — re-deploy idempotency: stop the old SR before
+            # v1.4.1 — re-deploy idempotency: stop the old SR before
             # re-running the playbook so two java processes don't fight
             # over port 8085.
             try:
@@ -779,7 +779,7 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
             apicurio_tgz = f"apicurio-registry-app-{settings.APICURIO_VERSION}-all.tar.gz"
             apicurio_tgz_path = str(_Path(apicurio_repo) / apicurio_tgz)
             url = f"https://github.com/Apicurio/apicurio-registry/releases/download/{settings.APICURIO_VERSION}/{apicurio_tgz}"
-            # APB v1.4.1 — retry with timeout so a flaky corp proxy or
+            # v1.4.1 — retry with timeout so a flaky corp proxy or
             # GitHub blip doesn't kill the deploy. urlretrieve has no
             # timeout, so we wrap urlopen + write ourselves.
             import urllib.request, socket

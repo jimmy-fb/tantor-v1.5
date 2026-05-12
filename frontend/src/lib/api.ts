@@ -127,7 +127,7 @@ export const checkPrereqs = (id: string) => api.post<PrereqResult>(`/hosts/${id}
 export const getClusters = () => api.get<Cluster[]>('/clusters').then(r => r.data);
 export const getCluster = (id: string) => api.get<ClusterDetail>(`/clusters/${id}`).then(r => r.data);
 export const createCluster = (data: ClusterCreate) => api.post<Cluster>('/clusters', data).then(r => r.data);
-// APB v1.4.2 — preflight port-check used by the create-cluster wizard.
+// v1.4.2 — preflight port-check used by the create-cluster wizard.
 export const preflightPorts = (host_ids: string[], ports: number[]) =>
   api.post<{
     ok: boolean;

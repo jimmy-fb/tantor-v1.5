@@ -6,7 +6,7 @@ from cryptography.fernet import Fernet
 
 # In-tree dev mode and the prod systemd unit both work: the unit sets
 # TANTOR_HOME / TANTOR_DATA / TANTOR_LOG when the operator used
-# `--install-dir` (APB v1.2.0 #1 / v1.1 #43). Falling back to
+# `--install-dir` (v1.2.0 #1 / v1.1 #43). Falling back to
 # Path(__file__).parent.parent keeps `python -m app.main` working in dev.
 _BASE_DIR = Path(os.environ.get("TANTOR_HOME", "")).resolve() if os.environ.get("TANTOR_HOME") else Path(__file__).parent.parent
 _DATA_DIR_ENV = os.environ.get("TANTOR_DATA", "").strip()

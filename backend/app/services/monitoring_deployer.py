@@ -92,7 +92,7 @@ class MonitoringDeployer:
         # JMX endpoints as scrape targets instead of broker hosts we own.
         try:
             if is_external:
-                # APB v1.4.3 #21 — pass cluster_id so the scrape config
+                # v1.4.3 #21 — pass cluster_id so the scrape config
                 # tags samples with {cluster=<id>}. Grafana dashboards
                 # filter by cluster label; without it the panels query
                 # for a value that doesn't exist on the samples and
@@ -226,7 +226,7 @@ if [ ! -f /opt/jmx_exporter/jmx_prometheus_javaagent.jar ]; then
     sudo curl -sL "{jmx_jar_url}" -o /opt/jmx_exporter/jmx_prometheus_javaagent.jar
 fi
 
-# Add JMX exporter to this cluster's Kafka systemd unit (per-cluster, APB v1.2.0 #5).
+# Add JMX exporter to this cluster's Kafka systemd unit (per-cluster, v1.2.0 #5).
 # JMX port is also per-cluster so two clusters on the same host don't both
 # try to bind 7071 — the JVM panics if you do.
 if ! grep -q "jmx_prometheus_javaagent" /etc/systemd/system/{kafka_unit} 2>/dev/null; then
@@ -235,7 +235,7 @@ if ! grep -q "jmx_prometheus_javaagent" /etc/systemd/system/{kafka_unit} 2>/dev/
     sudo systemctl restart {kafka_unit}
 fi
 
-# APB v1.2.0 #9: Capacity forecast was always empty because node_exporter
+# v1.2.0 #9: Capacity forecast was always empty because node_exporter
 # (the source of node_filesystem_*_bytes metrics) was never deployed —
 # Prometheus's scrape config referenced :9100 but nothing was listening.
 # Install node_exporter alongside JMX so disk metrics flow through.
@@ -356,7 +356,7 @@ curl -sf http://localhost:{port}/-/healthy && echo "PROM_OK" || echo "PROM_FAIL"
         The customer must expose JMX (or JMX exporter) themselves; the
         endpoints they give us go straight into the kafka-jmx scrape job.
 
-        APB v1.4.3 #21 — tag samples with `cluster=<id>` and `cluster_name=<name>`
+        v1.4.3 #21 — tag samples with `cluster=<id>` and `cluster_name=<name>`
         labels so Grafana dashboards filter correctly. Without the label,
         all the standard Grafana templates queried for a series the
         sample didn't have, returning "No data".
@@ -377,7 +377,7 @@ curl -sf http://localhost:{port}/-/healthy && echo "PROM_OK" || echo "PROM_FAIL"
         prometheus_yml = f"""global:
   scrape_interval: 15s
   evaluation_interval: 15s
-  # APB v1.4.3 #21 — global external_labels so all alert + remote_write
+  # v1.4.3 #21 — global external_labels so all alert + remote_write
   # streams carry the cluster identity even when a panel forgets.
   external_labels:
     cluster: "{cluster_id}"
@@ -580,7 +580,7 @@ done
             "overwrite": True,
         })
 
-        # APB-requested per-topic dashboard. Uses a Grafana variable `topic`
+        # customerrequested per-topic dashboard. Uses a Grafana variable `topic`
         # populated from `label_values(...)` on the JMX-exporter rewrite rule
         # that exposes a `topic` label on broker-topic metrics. Operators get
         # throughput, lag and partition count in one place per topic.

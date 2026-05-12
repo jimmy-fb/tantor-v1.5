@@ -15,7 +15,7 @@ type Props = {
  * customer-specific fields (host, db, credentials), and Tantor materializes
  * the rest of the Connect config from the template's `fixed` keys.
  *
- * APB asked for this in the requirements table — "Stream real-time database
+ * customer asked for this in the requirements table — "Stream real-time database
  * changes directly into Kafka topics via CDC pipelines".
  */
 export default function CdcWizard({ clusterId, onClose, onCreated }: Props) {

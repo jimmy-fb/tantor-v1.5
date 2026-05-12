@@ -48,7 +48,7 @@ def get_service_logs(
     hosts = {h.id: h for h in db.query(Host).all()}
     results = []
 
-    # APB v1.2.0 #5: pass per-cluster systemd unit + install dir so the
+    # v1.2.0 #5: pass per-cluster systemd unit + install dir so the
     # log fetch hits "kafka-prod-XYZ.service" / "/opt/kafka-prod-XYZ/logs"
     # not the legacy "kafka.service" / "/opt/kafka/logs".
     from app.services import cluster_paths

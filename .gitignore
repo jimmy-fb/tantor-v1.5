@@ -22,3 +22,6 @@ tantor-*.tar.gz
 .DS_Store
 backend/repo/kafka/*.tgz
 tantor-installer-*.bin
+
+# v1.4.4 — never track ansible runtime artifacts
+backend/ansible_work/

@@ -46,7 +46,7 @@ const fmtNum = (n: number): string =>
   n == null || isNaN(n) ? '—' : n >= 1000 ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : n.toFixed(1);
 
 /**
- * Per-cluster Monitoring tab — APB asked for detailed metrics inside the
+ * Per-cluster Monitoring tab — customer asked for detailed metrics inside the
  * cluster view, not on a global sidebar page. This component pulls a digest
  * from /api/monitoring/clusters/{id}/summary every 10s and renders:
  *   - Throughput (msgs/sec, bytes in/out)

@@ -14,7 +14,7 @@ export default function Dashboard() {
   }, []);
 
   const onlineHosts = hosts.filter(h => h.status === 'online').length;
-  // APB v1.2.0 #11 — Dashboard's running-cluster count was excluding external
+  // v1.2.0 #11 — Dashboard's running-cluster count was excluding external
   // clusters (which use state="connected" instead of "running"). Count both,
   // since they're equally healthy and equally manageable from this UI.
   const runningClusters = clusters.filter(c =>

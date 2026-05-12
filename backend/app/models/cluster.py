@@ -60,7 +60,7 @@ class Cluster(Base):
     # — it only runs systemctl on the customer-supplied unit name.
     external_broker_hosts_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    # ── Per-cluster Kafka paths (APB v1.2.0 #5: multi-cluster collision) ──
+    # ── Per-cluster Kafka paths (v1.2.0 #5: multi-cluster collision) ──
     # When two managed clusters target the same broker host, the old shared
     # /opt/kafka symlink + kafka.service unit collided. Each cluster now
     # owns its own install dir, data dir, and systemd unit so they coexist.

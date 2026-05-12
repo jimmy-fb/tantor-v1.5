@@ -73,7 +73,7 @@ def _write_secure(path: Path, data: bytes) -> None:
 # ── CA ─────────────────────────────────────────────────────────────────────
 
 
-# ── User-uploaded CA / certs (APB v1.4.0 #8) ───────────────────────────────
+# ── User-uploaded CA / certs (v1.4.0 #8) ───────────────────────────────
 
 
 def list_cluster_certificates(cluster: Cluster) -> dict:
@@ -115,7 +115,7 @@ def list_cluster_certificates(cluster: Cluster) -> dict:
 def upload_cluster_ca(cluster: Cluster, ca_cert_pem: bytes, ca_key_pem: bytes | None) -> dict:
     """Replace the cluster's CA with operator-supplied PEM material.
 
-    APB v1.4.0 #8 — instead of using Tantor's auto-generated CA the
+    v1.4.0 #8 — instead of using Tantor's auto-generated CA the
     operator can upload their own CA cert + key, and Tantor will sign
     broker certs with it. If only the cert is supplied (no key) we
     keep it as a truststore-only CA; broker keystores will still be

@@ -87,7 +87,7 @@ export default function ClusterLinking() {
   const fetchClusters = async () => {
     try {
       const { data } = await authApi.get<Cluster[]>('/clusters');
-      // APB v1.4.0 #4 — include external clusters too (they have
+      // v1.4.0 #4 — include external clusters too (they have
       // state="connected" / "ok", not "running"). Cluster linking on
       // an external destination is a real, supported flow.
       setClusters(data.filter(c =>
@@ -105,7 +105,7 @@ export default function ClusterLinking() {
     Promise.all([fetchLinks(), fetchClusters()]).finally(() => setLoading(false));
   }, []);
 
-  // APB v1.4.0 #3 — poll links + clusters every 10s so the link list
+  // v1.4.0 #3 — poll links + clusters every 10s so the link list
   // reflects status changes (a connector that fails on the source
   // cluster, a destination that goes offline) without the user having
   // to mash the refresh button.

@@ -16,7 +16,7 @@ def get_current_user(
 ) -> User:
     """Extracts and validates JWT from Authorization header.
 
-    APB v1.4.3 #22 — also verifies token_version matches the row.
+    v1.4.3 #22 — also verifies token_version matches the row.
     When an admin changes a user's role / deactivates them, we bump
     user.token_version so existing JWTs (carrying the old version) are
     rejected on next API call, forcing a fresh login.

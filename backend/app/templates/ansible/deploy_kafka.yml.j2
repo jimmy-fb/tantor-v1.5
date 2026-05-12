@@ -67,10 +67,10 @@
         mode: "0644"
 
     # ── Cleanup stale Kafka services ─────────────────────────────────
-    # APB v1.2.0 #5 — DO NOT wipe every kafka*.service unit. The previous
+    # v1.2.0 #5 — DO NOT wipe every kafka*.service unit. The previous
     # logic blew away neighboring Tantor clusters' units. Stop ONLY this
     # cluster's unit (idempotent: ignore-error if it doesn't exist yet).
-    # APB v1.4.3 #2 — first time a cluster deploys this unit doesn't
+    # v1.4.3 #2 — first time a cluster deploys this unit doesn't
     # exist yet, so `systemctl stop` would print a yellow warning.
     # Probe with `systemctl list-unit-files` first so we only call
     # stop when the unit really exists, keeping the deploy log clean.
@@ -129,7 +129,7 @@
         path: "{{ kafka_install_dir }}/bin/kafka-server-start.sh"
       register: kafka_bin
 
-    # APB v1.2.0 #5 — extract directly INTO the per-cluster install dir
+    # v1.2.0 #5 — extract directly INTO the per-cluster install dir
     # (NOT a symlink to a shared /opt/kafka_X.Y.Z). Two clusters on the
     # same host need two physical Kafka trees so their server.properties,
     # config/log4j2.yaml, and any other config edits don't share state.
@@ -211,7 +211,7 @@
         group: kafka
         mode: "0640"
 
-    # APB v1.4.0 #5 — ship a known-good log4j2.yaml. The tarball includes
+    # v1.4.0 #5 — ship a known-good log4j2.yaml. The tarball includes
     # one but we've seen extract-time permission glitches that cause
     # broker startup to dump StatusLogger reconfiguration errors into
     # journalctl. Owning the file ourselves removes that whole class of
@@ -283,7 +283,7 @@
         - existing_node_id.stdout != config_node_id.stdout
 
     # ── Upload systemd unit with JAVA_HOME ─────────────────────────
-    # Per-cluster unit name (APB v1.2.0 #5) so two clusters on the same
+    # Per-cluster unit name (v1.2.0 #5) so two clusters on the same
     # host don't fight over /etc/systemd/system/kafka.service.
     - name: Upload systemd unit
       copy:
@@ -305,7 +305,7 @@
       become_user: kafka
       environment:
         JAVA_HOME: "{{ '{{' }} discovered_java_home {{ '}}' }}"
-        # APB v1.4.0 #5 — point CLI tools at the tools-log4j2.yaml we ship
+        # v1.4.0 #5 — point CLI tools at the tools-log4j2.yaml we ship
         # so kafka-storage.sh format doesn't print "ERROR StatusLogger
         # No log4j2 configuration file found" during deploy.
         KAFKA_LOG4J_OPTS: "-Dlog4j2.configurationFile=file:{{ kafka_install_dir }}/config/tools-log4j2.yaml"

@@ -222,7 +222,7 @@ class ConfigManager:
     ) -> dict:
         """Apply a single config change to every broker in the cluster.
 
-        APB v1.4.0 #16. We loop the per-broker update so a failure on one
+        v1.4.0 #16. We loop the per-broker update so a failure on one
         broker doesn't roll back already-succeeded brokers — the customer
         operationally needs partial-success visibility (the UI can
         highlight failed brokers and let them retry).

@@ -32,12 +32,12 @@ export default function Clusters() {
   const [retrying, setRetrying] = useState<string | null>(null);
   const [quickDeploying, setQuickDeploying] = useState(false);
   const [quickDeployError, setQuickDeployError] = useState('');
-  // APB v1.4.3 #11 — manual Refresh button with visible spinner.
+  // v1.4.3 #11 — manual Refresh button with visible spinner.
   // Auto-poll still runs every 15s but the operator wanted explicit
   // feedback when they click refresh themselves.
   const [manualRefreshing, setManualRefreshing] = useState(false);
 
-  // APB v1.4.0 #6 — one-click deploy: spins up a cluster on every
+  // v1.4.0 #6 — one-click deploy: spins up a cluster on every
   // registered host with sane defaults and skips the wizard entirely.
   const handleQuickDeploy = async () => {
     if (!confirm('Quick-deploy a Kafka cluster on all registered hosts using the latest available version?')) return;
@@ -77,7 +77,7 @@ export default function Clusters() {
 
   useEffect(() => {
     fetchClusters();
-    // APB issue #5: UI was getting stale and required manual reload.
+    // customer issue #5: UI was getting stale and required manual reload.
     // Poll the list every 15s so cluster state changes (deploy → running,
     // restart, error) show up without the operator hitting refresh.
     const i = setInterval(() => {
@@ -135,7 +135,7 @@ export default function Clusters() {
           <p className="text-sm text-gray-500 mt-1">Your Kafka cluster deployments</p>
         </div>
         <div className="flex items-center gap-2">
-          {/* APB v1.4.3 #11 — manual refresh with visible spinner. */}
+          {/* v1.4.3 #11 — manual refresh with visible spinner. */}
           <button
             onClick={handleManualRefresh}
             disabled={manualRefreshing}

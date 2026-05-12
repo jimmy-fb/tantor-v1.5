@@ -31,7 +31,7 @@ VERSION="1.4.4"
 # Default paths follow FHS: code in /opt, mutable data in /var/lib, logs in /var/log.
 # `--install-dir <BASE>` collapses everything under BASE so customers with a
 # dedicated /data, /apps, etc. mountpoint don't need three separate paths
-# scattered across the system. APB asked for this in v1.2.0 #1 / v1.1 #43.
+# scattered across the system. customer asked for this in v1.2.0 #1 / v1.1 #43.
 #
 # We remember the operator's choice in /etc/tantor/install.conf so a later
 # `--reinstall` (or `--purge`) without --install-dir doesn't accidentally
@@ -172,7 +172,7 @@ while [[ $# -gt 0 ]]; do
             TANTOR_LOG="$BASE/log"
             shift 2
             ;;
-        # APB v1.4.0 #12 — wrap the Tantor UI in HTTPS. With no cert+key
+        # v1.4.0 #12 — wrap the Tantor UI in HTTPS. With no cert+key
         # paths supplied, the installer mints a self-signed cert valid
         # for the host's IP/hostname. Operators that already have a real
         # cert can pass --tls-cert and --tls-key.
@@ -248,7 +248,7 @@ detect_os() {
 # ─── Uninstall ───
 do_uninstall() {
     echo -e "${YELLOW}▶ Uninstalling Tantor...${NC}"
-    # APB v1.4.3 #14/#15 — enumerate every per-cluster Kafka unit. Prior
+    # v1.4.3 #14/#15 — enumerate every per-cluster Kafka unit. Prior
     # to this we only stopped the legacy `kafka.service`, leaving every
     # `kafka-<slug>-<id>.service` running and 15+ stale data dirs piling
     # up across reinstall cycles.
@@ -269,7 +269,7 @@ do_uninstall() {
 
     rm -f /etc/systemd/system/tantor-backend.service
     rm -f /etc/systemd/system/kafka.service
-    # APB v1.4.3 #14 — remove every per-cluster unit file.
+    # v1.4.3 #14 — remove every per-cluster unit file.
     rm -f /etc/systemd/system/kafka-*.service
     rm -f /etc/systemd/system/schema-registry.service
     rm -f /etc/systemd/system/prometheus.service
@@ -289,7 +289,7 @@ do_uninstall() {
     rm -rf "$TANTOR_HOME"
     rm -rf "$TANTOR_LOG"
     rm -rf /opt/kafka /opt/apicurio /opt/prometheus /opt/alertmanager /opt/jmx_exporter
-    # APB v1.4.3 #14 — per-cluster install dirs (kafka-<slug>-<id>).
+    # v1.4.3 #14 — per-cluster install dirs (kafka-<slug>-<id>).
     rm -rf /opt/kafka-*
     rm -rf /etc/kafka/ssl /etc/prometheus /etc/alertmanager
     rm -f /usr/local/bin/tantorctl
@@ -300,7 +300,7 @@ do_uninstall() {
         # too on --purge, otherwise stale meta.properties / KRaft cluster IDs
         # break the next deploy with "Invalid cluster.id".
         rm -rf /var/lib/kafka /var/log/kafka /var/lib/prometheus /var/lib/grafana /var/lib/alertmanager
-        # APB v1.4.3 #14 — per-cluster data dirs + log dirs.
+        # v1.4.3 #14 — per-cluster data dirs + log dirs.
         rm -rf /var/lib/kafka-* /var/log/kafka-*
         # Grafana ships as a deb/rpm package and its dpkg/rpm state survives
         # a plain `rm -rf` on its data dir — leaving its postinst convinced
@@ -517,7 +517,7 @@ chmod 440 /etc/sudoers.d/tantor
 
 # Persist install layout so future invocations of install.sh (e.g.
 # --reinstall, --purge) keep using the same paths instead of silently
-# reverting to /opt/tantor. APB hit this when their --reinstall created
+# reverting to /opt/tantor. customer hit this when their --reinstall created
 # a parallel install while the original was at /data/tantor.
 mkdir -p /etc/tantor
 cat > /etc/tantor/install.conf <<CONFEOF
@@ -586,7 +586,7 @@ echo -e "${BLUE}▶ Step 6/9: Installing frontend...${NC}"
 
 cp -r "$INSTALL_DIR/frontend/dist/"* "$TANTOR_HOME/frontend/dist/"
 
-# Validate. APB hit a case where --purge + reinstall left an empty dist/
+# Validate. customer hit a case where --purge + reinstall left an empty dist/
 # because of a network issue during npm ci — verify the bundle exists,
 # the assets directory has at least one .js file, and index.html mentions
 # at least one of those .js files. If any of these fail, abort with a
@@ -659,7 +659,7 @@ fi
 # ─── Step 8: Configure Services ───
 echo -e "${BLUE}▶ Step 8/9: Configuring services...${NC}"
 
-# APB v1.4.0 #12 — optionally generate / accept a TLS cert for the UI.
+# v1.4.0 #12 — optionally generate / accept a TLS cert for the UI.
 if [ "$TLS_ENABLE" = true ]; then
     TLS_DIR="/etc/tantor/tls"
     mkdir -p "$TLS_DIR"
@@ -691,7 +691,7 @@ fi
 # $remote_addr) literal; we sed-substitute __TANTOR_HOME__ afterwards so the
 # `--install-dir` override propagates without breaking nginx's own variables.
 if [ "$TLS_ENABLE" = true ]; then
-    NGINX_CONF='# APB v1.4.0 #12 — HTTPS for the Tantor UI. The :80 server
+    NGINX_CONF='# v1.4.0 #12 — HTTPS for the Tantor UI. The :80 server
 # unconditionally redirects to https so bookmarks keep working.
 server {
     listen 80 default_server;

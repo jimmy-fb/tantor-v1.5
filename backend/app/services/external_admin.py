@@ -171,7 +171,7 @@ def test_connection(cluster: Cluster) -> dict:
     """Open an admin client and call describe_cluster — fastest end-to-end probe.
 
     Returns {success, message, broker_count, controller_id, kafka_version}
-    so the UI can show what it's actually connected to. APB asked for the
+    so the UI can show what it's actually connected to. customer asked for the
     real broker version to appear instead of "unknown".
     """
     secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
@@ -477,7 +477,7 @@ def produce_message(cluster: Cluster, topic: str, key: str | None, value: str) -
             md = future.get(timeout=10)
             # Match the managed-cluster ProduceResponse shape exactly so the
             # /produce endpoint's response_model validation doesn't reject a
-            # successful produce with 500 "Internal server error". APB hit
+            # successful produce with 500 "Internal server error". customer hit
             # this every time they used the Produce tab on an external cluster.
             return {
                 "success": True,
@@ -688,7 +688,7 @@ def describe_broker_configs(cluster: Cluster) -> list[dict]:
 def alter_broker_config(cluster: Cluster, broker_id: int, configs: dict) -> dict:
     """Apply config changes to a specific broker.
 
-    APB v1.4.3 — REVERTED the strict hasattr() refusal I added in 1.4.1.
+    v1.4.3 — REVERTED the strict hasattr() refusal I added in 1.4.1.
     That check was returning False for the customer's kafka-python build
     (2.2.3 ships incremental_alter_configs but the attribute lookup was
     failing for reasons I never reproduced), so external Config edits

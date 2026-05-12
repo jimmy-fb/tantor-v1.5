@@ -103,7 +103,7 @@ export default function BrokerConfigManager({ clusterId }: Props) {
   const [saveError, setSaveError] = useState('');
   const [saveSuccess, setSaveSuccess] = useState<UpdateResult | null>(null);
 
-  // APB v1.4.0 #10 + #16 — add new key + apply-to-all-brokers modal state
+  // v1.4.0 #10 + #16 — add new key + apply-to-all-brokers modal state
   const [addModalOpen, setAddModalOpen] = useState(false);
   const [newConfigKey, setNewConfigKey] = useState('');
   const [newConfigValue, setNewConfigValue] = useState('');
@@ -357,7 +357,7 @@ export default function BrokerConfigManager({ clusterId }: Props) {
     }
   };
 
-  // APB v1.4.0 #10 + #16 — submit a brand-new config key, optionally
+  // v1.4.0 #10 + #16 — submit a brand-new config key, optionally
   // applying it to every broker in the cluster.
   const handleAddConfig = async () => {
     if (!newConfigKey.trim() || !newConfigValue.trim()) {
@@ -563,7 +563,7 @@ export default function BrokerConfigManager({ clusterId }: Props) {
               <RefreshCw size={14} className={configsLoading ? 'animate-spin' : ''} /> Refresh
             </button>
 
-            {/* Add Config (APB v1.4.0 #10 + #16) */}
+            {/* Add Config (v1.4.0 #10 + #16) */}
             <button
               onClick={() => {
                 setAddModalOpen(true);
@@ -922,7 +922,7 @@ export default function BrokerConfigManager({ clusterId }: Props) {
         </div>
       )}
 
-      {/* APB v1.4.0 #10 + #16 — Add Config modal */}
+      {/* v1.4.0 #10 + #16 — Add Config modal */}
       {addModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={() => !addSaving && setAddModalOpen(false)}>
           <div className="bg-white rounded-xl shadow-xl max-w-lg w-full p-6" onClick={e => e.stopPropagation()}>

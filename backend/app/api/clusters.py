@@ -42,7 +42,7 @@ def create_cluster(data: ClusterCreate, db: Session = Depends(get_db), _: User =
     db.add(cluster)
     db.flush()  # populate cluster.id before path assignment
 
-    # APB v1.2.0 #5 — give every new cluster its own Kafka install dir,
+    # v1.2.0 #5 — give every new cluster its own Kafka install dir,
     # data dir, and systemd unit name so two clusters on the same broker
     # host coexist instead of stomping on /opt/kafka + kafka.service.
     from app.services import cluster_paths
@@ -74,7 +74,7 @@ def get_cluster(cluster_id: str, db: Session = Depends(get_db), _: User = Depend
         raise HTTPException(status_code=404, detail="Cluster not found")
     services = db.query(Service).filter(Service.cluster_id == cluster_id).all()
 
-    # APB v1.2.0 #7: external clusters had an empty Overview tab because they
+    # v1.2.0 #7: external clusters had an empty Overview tab because they
     # have no Service rows. Synthesize one row per broker by calling
     # describe_cluster — purely cosmetic, gives the operator a list of
     # connected brokers + ids on the same Overview screen as managed clusters.
@@ -230,7 +230,7 @@ def get_cluster_status(cluster_id: str, db: Session = Depends(get_db), _: User =
     return cluster_manager.get_cluster_status(cluster_id, db)
 
 
-# ── One-click deploy (APB v1.4.0 #6) ─────────────────
+# ── One-click deploy (v1.4.0 #6) ─────────────────
 
 class QuickDeployRequest(BaseModel):
     """No required fields — the endpoint picks sensible defaults from
@@ -302,7 +302,7 @@ def quick_deploy(
     for i, h in enumerate(hosts, start=1):
         services.append(_SA(host_id=h.id, role="broker_controller", node_id=i))
 
-    # APB v1.4.2 — auto-pick a port set that doesn't collide with any
+    # v1.4.2 — auto-pick a port set that doesn't collide with any
     # existing cluster on the same host(s). The customer hit this when
     # quick-deploying twice on the same machine: second cluster failed
     # to bind 9093. Now we walk forward by 100 (9092→9192→9292…) until
@@ -417,7 +417,7 @@ def preflight_ports(
     }
 
 
-# ── Schema Registry deploy (APB v1.4.0 #2) ──────────
+# ── Schema Registry deploy (v1.4.0 #2) ──────────
 
 class SchemaRegistryDeployRequest(BaseModel):
     host_id: str

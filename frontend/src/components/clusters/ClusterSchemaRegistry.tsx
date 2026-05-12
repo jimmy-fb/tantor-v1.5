@@ -1,5 +1,5 @@
 /**
- * Per-cluster Schema Registry tab (APB v1.4.0 #2).
+ * Per-cluster Schema Registry tab (v1.4.0 #2).
  *
  * If the cluster already has an SR Service row, render the subjects list
  * with quick "register schema" + "view version" actions. If not, render

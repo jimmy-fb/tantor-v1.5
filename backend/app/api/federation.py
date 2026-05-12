@@ -1,6 +1,6 @@
 """Data Federation API.
 
-APB-requested feature: a single pane of glass that gives unified visibility
+customerrequested feature: a single pane of glass that gives unified visibility
 across every cluster Tantor manages, both Tantor-deployed (managed) and
 imported (external). Returns one row per cluster with topic count, broker
 count, lifecycle state, and environment tag, plus a global cross-cluster
@@ -31,7 +31,7 @@ logger = logging.getLogger("tantor.federation")
 router = APIRouter(prefix="/api/federation", tags=["federation"])
 
 
-# Topic-count cache. APB: "Data Federation takes excessive time to load".
+# Topic-count cache. customer: "Data Federation takes excessive time to load".
 # Per-cluster list_topics is the slow path (each call opens an admin
 # client + waits on metadata). We cache for 30s and fan out parallel
 # probes for any clusters whose count isn't cached. Manual refresh via
@@ -40,7 +40,7 @@ _TOPIC_COUNT_CACHE: dict[str, tuple[float, int | None]] = {}
 _TOPIC_COUNT_TTL = 30.0
 _TOPIC_COUNT_LOCK = threading.Lock()
 
-# APB v1.4.0 #1 — also cache an external cluster's broker count so the
+# v1.4.0 #1 — also cache an external cluster's broker count so the
 # Federation overview shows real numbers instead of "—" for imported
 # clusters. Same TTL + lock as topic count.
 _EXTERNAL_BROKER_COUNT: dict[str, tuple[float, int | None]] = {}
@@ -127,7 +127,7 @@ def federation_overview(
 
     rows = []
     for c in clusters:
-        # APB v1.4.0 #1 — external clusters now get a real broker count
+        # v1.4.0 #1 — external clusters now get a real broker count
         # from the cached metadata probe instead of always "—".
         if (c.kind or "managed") == "managed":
             broker_count: int | None = services_by_cluster.get(c.id, 0)

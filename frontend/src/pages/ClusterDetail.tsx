@@ -88,7 +88,7 @@ export default function ClusterDetail() {
 
   useEffect(() => {
     fetchDetail();
-    // APB issue #5: cluster detail header (state badge, version, services)
+    // customer issue #5: cluster detail header (state badge, version, services)
     // was stale until manual reload. Poll every 15s while the page is
     // visible so the operator never sees an out-of-date status.
     const interval = setInterval(() => {
@@ -228,7 +228,7 @@ export default function ClusterDetail() {
     { id: 'consumers', label: 'Groups', icon: <Users size={14} />, requiresRunning: true },
     { id: 'connect', label: 'Connect', icon: <Plug size={14} />, requiresRunning: true, requiresConnect: true, managedOnly: true },
     { id: 'ksqldb', label: 'ksqlDB', icon: <Database size={14} />, requiresRunning: true, requiresKsqldb: true, managedOnly: true },
-    // APB v1.4.0 #2 — Schema Registry per-cluster: deploy / browse subjects / register schemas.
+    // v1.4.0 #2 — Schema Registry per-cluster: deploy / browse subjects / register schemas.
     { id: 'schema-registry', label: 'Schema Registry', icon: <Database size={14} />, requiresRunning: true, managedOnly: true },
     // SCRAM users + ACLs work via kafka-python on external clusters too
     // (no SSH required); the TLS/mTLS sub-panel is hidden inside the

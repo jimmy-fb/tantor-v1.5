@@ -140,7 +140,7 @@ class LogManager:
         Used by the WebSocket endpoint for live tailing. Per-cluster
         unit_override / kafka_install_dir keep this working when the
         cluster's systemd unit isn't named "kafka.service" (multi-cluster
-        deployments — APB v1.2.0 #5).
+        deployments — v1.2.0 #5).
         """
         if unit_override:
             unit_name = unit_override.removesuffix(".service")

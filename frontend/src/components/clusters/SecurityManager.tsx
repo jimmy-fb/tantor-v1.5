@@ -92,7 +92,7 @@ export default function SecurityManager({ clusterId, isExternal = false }: Props
   const [auditFilter, setAuditFilter] = useState('');
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
 
-  // ── Certificates state (APB v1.4.0 #8) ──
+  // ── Certificates state (v1.4.0 #8) ──
   const [certs, setCerts] = useState<CertSummary | null>(null);
   const [certsLoading, setCertsLoading] = useState(false);
   const [certsError, setCertsError] = useState('');
@@ -991,7 +991,7 @@ export default function SecurityManager({ clusterId, isExternal = false }: Props
         </div>
       )}
 
-      {/* ══════════ CERTIFICATES TAB (APB v1.4.0 #8) ══════════ */}
+      {/* ══════════ CERTIFICATES TAB (v1.4.0 #8) ══════════ */}
       {activeTab === 'certificates' && (
         <div className="space-y-4">
           {certsError && (

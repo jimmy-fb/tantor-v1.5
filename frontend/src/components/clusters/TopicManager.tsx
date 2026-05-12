@@ -24,7 +24,7 @@ export default function TopicManager({ clusterId }: Props) {
   const [newPartitions, setNewPartitions] = useState(3);
   const [newRF, setNewRF] = useState(1);
 
-  // APB v1.4.3 #9 — separate visible (user-triggered) and silent
+  // v1.4.3 #9 — separate visible (user-triggered) and silent
   // (background poll) fetches so the page doesn't flash back into
   // the loading state every 10s.
   const fetchTopics = useCallback(async (silent = false) => {

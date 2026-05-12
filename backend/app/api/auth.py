@@ -38,7 +38,7 @@ def refresh(data: TokenRefreshRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.id == payload["sub"]).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="User not found or inactive")
-    # APB v1.4.3 #22 — also enforce token_version on refresh.
+    # v1.4.3 #22 — also enforce token_version on refresh.
     expected = getattr(user, "token_version", 0) or 0
     if payload.get("tv", 0) != expected:
         raise HTTPException(status_code=401, detail="Refresh token revoked — log in again")
@@ -94,14 +94,14 @@ def update_user(user_id: str, data: UserUpdate, db: Session = Depends(get_db), c
         # Prevent removing admin from yourself
         if user.id == current_user.id and data.role != "admin":
             raise HTTPException(status_code=400, detail="Cannot remove admin role from yourself")
-        # APB v1.4.3 #22 — bump token_version so the affected user's
+        # v1.4.3 #22 — bump token_version so the affected user's
         # in-flight JWTs get rejected on next API call.
         if user.role != data.role:
             user.token_version = (getattr(user, "token_version", 0) or 0) + 1
         user.role = data.role
 
     if data.password is not None:
-        # APB v1.4.0 #11 — LDAP-synced users authenticate against the
+        # v1.4.0 #11 — LDAP-synced users authenticate against the
         # directory; setting a local password would create two paths
         # (one of them shadowing LDAP) so we reject the change here.
         if user.auth_source == "ldap":
@@ -115,7 +115,7 @@ def update_user(user_id: str, data: UserUpdate, db: Session = Depends(get_db), c
         # Prevent deactivating yourself
         if user.id == current_user.id and not data.is_active:
             raise HTTPException(status_code=400, detail="Cannot deactivate yourself")
-        # APB v1.4.3 #22 — deactivation also bumps token_version so any
+        # v1.4.3 #22 — deactivation also bumps token_version so any
         # JWTs already issued are rejected immediately.
         if bool(user.is_active) != bool(data.is_active):
             user.token_version = (getattr(user, "token_version", 0) or 0) + 1

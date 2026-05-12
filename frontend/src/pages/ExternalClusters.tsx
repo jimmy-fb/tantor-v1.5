@@ -45,7 +45,7 @@ export default function ExternalClustersPage() {
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [topicsByCluster, setTopicsByCluster] = useState<Record<string, string[]>>({});
-  // APB v1.4.3 #12 — per-cluster button loading state. Was missing,
+  // v1.4.3 #12 — per-cluster button loading state. Was missing,
   // so the Test / List Topics buttons "felt broken" because they
   // gave no feedback while the kafka-python AdminClient probed.
   const [testingCluster, setTestingCluster] = useState<string | null>(null);

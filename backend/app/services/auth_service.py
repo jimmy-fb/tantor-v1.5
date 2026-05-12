@@ -31,7 +31,7 @@ class AuthService:
             "sub": user_id,
             "role": role,
             "type": "access",
-            # APB v1.4.3 #22 — embedded token_version. Auth dep rejects
+            # v1.4.3 #22 — embedded token_version. Auth dep rejects
             # tokens whose tv != user.token_version, which means an
             # admin role-change bumps token_version and forces re-login.
             "tv": token_version,
@@ -75,7 +75,7 @@ class AuthService:
         # Determine role from group membership
         role = LdapService.determine_role(result.get("groups", []), ldap_config)
 
-        # Find or create local user record. APB v1.4.0 #11 — store the
+        # Find or create local user record. v1.4.0 #11 — store the
         # LDAP DN so the User Management page can hide the password
         # change UI and label the row with its source.
         ldap_dn = result.get("dn")

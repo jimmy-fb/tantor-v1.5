@@ -30,7 +30,7 @@ class UserResponse(BaseModel):
     username: str
     role: str
     is_active: bool
-    auth_source: str = "local"  # APB v1.4.0 #11 — local | ldap
+    auth_source: str = "local"  # v1.4.0 #11 — local | ldap
     ldap_dn: str | None = None
     created_at: datetime
     last_login: datetime | None

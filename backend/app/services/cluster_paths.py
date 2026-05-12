@@ -1,6 +1,6 @@
 """Per-cluster Kafka path helper.
 
-APB v1.2.0 #5 — running two Tantor-managed clusters on the same broker
+v1.2.0 #5 — running two Tantor-managed clusters on the same broker
 host used to collide on a shared `/opt/kafka` symlink + `kafka.service`
 unit. Each cluster now owns its own install dir, data dir, and systemd
 unit. This module centralizes the resolution so callers don't sprinkle

@@ -42,7 +42,7 @@ def _log(task_id: str, message: str):
 
 
 def _validate_bootstrap_address(addr: str) -> bool:
-    """APB v1.4.1 — sanity-check bootstrap addresses before MM2 sees them.
+    """v1.4.1 — sanity-check bootstrap addresses before MM2 sees them.
 
     MM2 fails late and silently on a missing port or IPv6 unbracketed.
     """
@@ -64,12 +64,12 @@ def _validate_bootstrap_address(addr: str) -> bool:
 def _get_broker_addresses(cluster_id: str, db: Session) -> list[str]:
     """Get bootstrap server addresses for a cluster.
 
-    APB v1.4.0 #4 — external clusters have no Service rows, so we fall
+    v1.4.0 #4 — external clusters have no Service rows, so we fall
     back to their saved `bootstrap_servers` field. Without this fix
     cluster-linking refused to create any link involving an external
     cluster ("Source cluster has no brokers").
 
-    APB v1.4.1 — also validates each address has a port + correct shape.
+    v1.4.1 — also validates each address has a port + correct shape.
     Caller raises ValueError on empty list, surfacing the bad input
     before MM2 starts and fails opaquely.
     """
@@ -102,7 +102,7 @@ def _get_broker_addresses(cluster_id: str, db: Session) -> list[str]:
 
 
 def _security_block(prefix: str, cluster: "Cluster | None") -> str:
-    """APB v1.4.1 — emit per-cluster security.protocol / SASL / SSL
+    """v1.4.1 — emit per-cluster security.protocol / SASL / SSL
     properties for MM2 so external clusters using SASL_SSL or SSL
     actually authenticate.
 
@@ -238,7 +238,7 @@ class ClusterLinkingManager:
         source_brokers = _get_broker_addresses(source_cluster_id, db)
         dest_brokers = _get_broker_addresses(dest_cluster_id, db)
 
-        # APB v1.4.3 #20 — distinguish "no brokers at all" from "external
+        # v1.4.3 #20 — distinguish "no brokers at all" from "external
         # cluster has malformed bootstrap_servers". The customer reported
         # external clusters showing 1 broker in overview but link create
         # failing — root cause was bootstrap_servers without a :port
@@ -270,7 +270,7 @@ class ClusterLinkingManager:
         #   1. A broker host from the source cluster (managed)
         #   2. A broker host from the destination cluster (managed)
         #   3. ANY Tantor-registered host (we just need somewhere to run MM2)
-        # APB v1.4.0 #4 — without this, an external→external or
+        # v1.4.0 #4 — without this, an external→external or
         # external→managed link fails with "no deploy host configured".
         deploy_host_id = None
         for cid in (source_cluster_id, dest_cluster_id):

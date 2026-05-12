@@ -110,7 +110,7 @@ RULE_TEMPLATES: dict[str, dict] = {
         "summary": "Consumer lag > 100k on {{ $labels.consumergroup }}",
         "description": "Consumer group {{ $labels.consumergroup }} is lagging by {{ $value }} messages.",
     },
-    # APB-requested intelligent consumer alerting: detect stalled consumers
+    # customerrequested intelligent consumer alerting: detect stalled consumers
     # (lag is not decreasing — group exists but isn't catching up) and failed
     # consumers (zero live members on a previously-active group).
     "consumer_stalled": {

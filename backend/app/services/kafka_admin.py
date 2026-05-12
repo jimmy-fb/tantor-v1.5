@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from app.models.user import User
 
 
-# APB v1.4.3 follow-up — per-cluster topic-list cache. kafka-topics.sh
+# v1.4.3 follow-up — per-cluster topic-list cache. kafka-topics.sh
 # --describe over SSH takes 3-4 s (JVM startup dominates). With the
 # Topics tab polling every 10s the UI showed a spinner for ~3s every
 # tick. 5s TTL cache means at most 1-in-2 calls hits Kafka while keeping
@@ -78,7 +78,7 @@ class KafkaAdmin:
         """Find a running broker and return (host, bootstrap_servers).
 
         Kept for backward compat — new code should use _get_broker_with_paths
-        so it picks up the per-cluster Kafka install dir (APB v1.2.0 #5).
+        so it picks up the per-cluster Kafka install dir (v1.2.0 #5).
         """
         host, bootstrap, _ = KafkaAdmin._get_broker_with_paths(cluster_id, db)
         return host, bootstrap
@@ -119,7 +119,7 @@ class KafkaAdmin:
     def _list_topics_via_kafka_python(bootstrap: str) -> list[dict]:
         """Fast path: hit the broker over TCP with kafka-python.
 
-        APB v1.4.4 — kafka-topics.sh over SSH was 3-4s of JVM cold start
+        v1.4.4 — kafka-topics.sh over SSH was 3-4s of JVM cold start
         per call and that latency was visible in the UI ("topic load is
         still slow"). The same metadata is available via TCP in ~50-200ms.
         Use KafkaConsumer.partitions_for_topic + a single
@@ -134,7 +134,7 @@ class KafkaAdmin:
             bootstrap_servers=bootstrap,
             client_id="tantor-list-topics",
             request_timeout_ms=10000,
-            # APB v1.4.4 — set api_version explicitly so kafka-python
+            # v1.4.4 — set api_version explicitly so kafka-python
             # skips the auto-detect handshake (saves ~500ms per call).
             # 4.0.0 / 4.1.0 brokers speak the same protocol surface for
             # describe_topics so this is safe; the fallback SSH path
@@ -345,7 +345,7 @@ class KafkaAdmin:
         if exit_code != 0:
             raise ValueError(f"Failed to list consumer groups: {stderr}")
 
-        # APB issue v1.2.0 #4 — kafka-consumer-groups.sh occasionally interleaves
+        # customer issue v1.2.0 #4 — kafka-consumer-groups.sh occasionally interleaves
         # log lines, warnings, or "Error:" stderr into stdout. Without filtering,
         # these end up in the UI as if they were group IDs (e.g. "[2024-01-05
         # 10:00:00,123] WARN..." appears as a group). Restrict to lines that
@@ -511,7 +511,7 @@ class KafkaAdmin:
             safe_gid = group_id.replace("'", "'\\''")
             cmd_parts.append(f"--group '{safe_gid}'")
 
-        # APB v1.4.3 #8 — redirect kafka-console-consumer stderr to
+        # v1.4.3 #8 — redirect kafka-console-consumer stderr to
         # /dev/null. Kafka 4.x's console-consumer occasionally prints
         # log4j2 StatusLogger warnings + "Reconfiguration failed"
         # noise to stderr even on healthy consumes; SSH merged

@@ -1,6 +1,6 @@
 """Manages running Kafka clusters — start, stop, status.
 
-APB v1.4.3 — fixed the per-cluster systemd unit regression that caused
+v1.4.3 — fixed the per-cluster systemd unit regression that caused
 "refresh stops cluster" and Start/Stop being unresponsive. Every probe
 now resolves the kafka unit name via cluster_paths.unit_name(cluster)
 the same way rolling_restart_manager + log_manager do.
@@ -60,7 +60,7 @@ class ClusterManager:
             unit_name = _unit_for(cluster, svc.role)
             try:
                 with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                    # APB v1.4.3 — use sudo -n. The SSH user generally can't start
+                    # v1.4.3 — use sudo -n. The SSH user generally can't start
                     # systemd units without elevation; without -n we'd block on a
                     # password prompt.
                     exit_code, stdout, stderr = SSHManager.exec_command(client, f"sudo -n systemctl start {unit_name}", timeout=60)
@@ -121,7 +121,7 @@ class ClusterManager:
     def get_cluster_status(cluster_id: str, db: Session) -> list[dict]:
         """Get live status of all services in a cluster.
 
-        APB v1.4.3 — uses the per-cluster systemd unit. Previously this
+        v1.4.3 — uses the per-cluster systemd unit. Previously this
         always probed `kafka.service` so the UI refresh ALWAYS reported
         every kafka service as stopped (#3/#4/#5/#10), which then made
         Start fail because cluster.state was set to "error" and the UI
