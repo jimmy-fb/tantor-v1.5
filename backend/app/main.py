@@ -29,7 +29,7 @@ from app.models.alert_incident import AlertIncident  # noqa: F401 - ensure table
 from app.services.auth_service import AuthService
 from app.services.migrations import apply_runtime_migrations
 
-APP_VERSION = "1.4.3"
+APP_VERSION = "1.4.4"
 
 # Configure logging
 logging.basicConfig(

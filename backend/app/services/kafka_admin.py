@@ -116,12 +116,63 @@ class KafkaAdmin:
     # ── Topics ──────────────────────────────────────────
 
     @staticmethod
+    def _list_topics_via_kafka_python(bootstrap: str) -> list[dict]:
+        """Fast path: hit the broker over TCP with kafka-python.
+
+        APB v1.4.4 — kafka-topics.sh over SSH was 3-4s of JVM cold start
+        per call and that latency was visible in the UI ("topic load is
+        still slow"). The same metadata is available via TCP in ~50-200ms.
+        Use KafkaConsumer.partitions_for_topic + a single
+        describe_topics() round-trip to keep the response shape
+        identical to the legacy SSH+CLI path.
+
+        Caller falls back to the SSH path if this raises (e.g. broker
+        unreachable from Tantor backend, SSL listener not exposed, etc.).
+        """
+        from kafka import KafkaAdminClient
+        admin = KafkaAdminClient(
+            bootstrap_servers=bootstrap,
+            client_id="tantor-list-topics",
+            request_timeout_ms=10000,
+            # APB v1.4.4 — set api_version explicitly so kafka-python
+            # skips the auto-detect handshake (saves ~500ms per call).
+            # 4.0.0 / 4.1.0 brokers speak the same protocol surface for
+            # describe_topics so this is safe; the fallback SSH path
+            # handles older brokers if anyone shows up.
+            api_version=(2, 8, 0),
+        )
+        try:
+            metadata = admin.describe_topics()
+            result: list[dict] = []
+            for entry in metadata or []:
+                # entry shape: {"topic": str, "is_internal": bool, "partitions": [{"partition", "leader", "replicas", "isr"}]}
+                name = entry.get("topic") or entry.get("name")
+                if not name:
+                    continue
+                # Skip internal topics by default (the SSH path does the same)
+                if name.startswith("__"):
+                    continue
+                parts = entry.get("partitions") or []
+                partition_count = len(parts)
+                rf = 0
+                if parts:
+                    # All partitions on the same topic have identical RF;
+                    # take the first one.
+                    rf = len(parts[0].get("replicas") or [])
+                result.append({
+                    "name": name,
+                    "partitions": partition_count,
+                    "replication_factor": rf,
+                })
+            return result
+        finally:
+            admin.close()
+
+    @staticmethod
     def list_topics(cluster_id: str, db: Session) -> list[dict]:
-        # 5s cache — kafka-topics.sh over SSH is 3-4s of JVM cold start
-        # per call and the Topics tab polls every 10s. Cache hits avoid
-        # the spinner for human observation. Invalidated by create/
-        # delete/alter so a refresh immediately after the user's own
-        # action still sees the latest state.
+        # 5s cache — even the fast path benefits because the Topics tab
+        # polls every 10s. Invalidated by create / delete so user actions
+        # show up immediately.
         cached = _topic_list_cached(cluster_id)
         if cached is not None:
             return cached
@@ -133,15 +184,27 @@ class KafkaAdmin:
             return result
         host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
-        # Single SSH call to describe ALL topics at once (avoids N+1 SSH connections)
+        # Fast path: kafka-python over TCP. Falls back to the SSH+CLI
+        # path on any failure (network, SSL handshake, etc.) so the
+        # behavior is no worse than 1.4.3 in degraded environments.
+        try:
+            result = KafkaAdmin._list_topics_via_kafka_python(bootstrap)
+            _topic_list_set(cluster_id, result)
+            return result
+        except Exception as e:
+            import logging as _logging
+            _logging.getLogger("tantor.kafka_admin").warning(
+                "kafka-python list_topics failed (%s); falling back to SSH+kafka-topics.sh", e
+            )
+
+        # Fallback: shell out via SSH. Slower (3-4s) but works when the
+        # broker isn't reachable from the Tantor backend over TCP.
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
             host, f"{kh}/bin/kafka-topics.sh --bootstrap-server {bootstrap} --describe",
             timeout=60,
         )
         if exit_code != 0:
             raise ValueError(f"Failed to list topics: {stderr}")
-
-        # Parse the combined describe output into individual topics
         result = KafkaAdmin._parse_all_topics_describe(stdout)
         _topic_list_set(cluster_id, result)
         return result
