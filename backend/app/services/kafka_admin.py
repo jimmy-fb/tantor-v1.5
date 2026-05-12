@@ -1,6 +1,8 @@
 import json
 import re
 import secrets
+import threading
+import time
 from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
@@ -17,6 +19,36 @@ from app.services.crypto import encrypt
 
 if TYPE_CHECKING:
     from app.models.user import User
+
+
+# APB v1.4.3 follow-up — per-cluster topic-list cache. kafka-topics.sh
+# --describe over SSH takes 3-4 s (JVM startup dominates). With the
+# Topics tab polling every 10s the UI showed a spinner for ~3s every
+# tick. 5s TTL cache means at most 1-in-2 calls hits Kafka while keeping
+# the data fresh enough for human observation.
+_TOPIC_LIST_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_TOPIC_LIST_CACHE_TTL = 5.0
+_TOPIC_LIST_CACHE_LOCK = threading.Lock()
+
+
+def _topic_list_cached(cluster_id: str) -> list[dict] | None:
+    with _TOPIC_LIST_CACHE_LOCK:
+        entry = _TOPIC_LIST_CACHE.get(cluster_id)
+        if entry and (time.time() - entry[0]) < _TOPIC_LIST_CACHE_TTL:
+            return entry[1]
+    return None
+
+
+def _topic_list_set(cluster_id: str, topics: list[dict]) -> None:
+    with _TOPIC_LIST_CACHE_LOCK:
+        _TOPIC_LIST_CACHE[cluster_id] = (time.time(), topics)
+
+
+def _topic_list_invalidate(cluster_id: str) -> None:
+    """Called from create/delete/alter so the UI sees the change
+    immediately on the next fetch instead of waiting 5s."""
+    with _TOPIC_LIST_CACHE_LOCK:
+        _TOPIC_LIST_CACHE.pop(cluster_id, None)
 
 
 def _is_external(cluster_id: str, db: Session) -> Cluster | None:
@@ -85,9 +117,20 @@ class KafkaAdmin:
 
     @staticmethod
     def list_topics(cluster_id: str, db: Session) -> list[dict]:
+        # 5s cache — kafka-topics.sh over SSH is 3-4s of JVM cold start
+        # per call and the Topics tab polls every 10s. Cache hits avoid
+        # the spinner for human observation. Invalidated by create/
+        # delete/alter so a refresh immediately after the user's own
+        # action still sees the latest state.
+        cached = _topic_list_cached(cluster_id)
+        if cached is not None:
+            return cached
+
         ext = _is_external(cluster_id, db)
         if ext:
-            return external_admin.list_topics(ext)
+            result = external_admin.list_topics(ext)
+            _topic_list_set(cluster_id, result)
+            return result
         host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         # Single SSH call to describe ALL topics at once (avoids N+1 SSH connections)
@@ -99,7 +142,9 @@ class KafkaAdmin:
             raise ValueError(f"Failed to list topics: {stderr}")
 
         # Parse the combined describe output into individual topics
-        return KafkaAdmin._parse_all_topics_describe(stdout)
+        result = KafkaAdmin._parse_all_topics_describe(stdout)
+        _topic_list_set(cluster_id, result)
+        return result
 
     @staticmethod
     def get_topic_detail(cluster_id: str, topic_name: str, db: Session) -> dict:
@@ -120,7 +165,9 @@ class KafkaAdmin:
     def create_topic(cluster_id: str, name: str, partitions: int, replication_factor: int, config: dict, db: Session) -> dict:
         ext = _is_external(cluster_id, db)
         if ext:
-            return external_admin.create_topic(ext, name, partitions, replication_factor)
+            r = external_admin.create_topic(ext, name, partitions, replication_factor)
+            _topic_list_invalidate(cluster_id)
+            return r
         host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         cmd = (
@@ -134,13 +181,16 @@ class KafkaAdmin:
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(host, cmd)
         if exit_code != 0:
             raise ValueError(f"Failed to create topic: {stderr}")
+        _topic_list_invalidate(cluster_id)
         return {"topic": name, "created": True, "message": stdout or "Topic created"}
 
     @staticmethod
     def delete_topic(cluster_id: str, name: str, db: Session) -> dict:
         ext = _is_external(cluster_id, db)
         if ext:
-            return external_admin.delete_topic(ext, name)
+            r = external_admin.delete_topic(ext, name)
+            _topic_list_invalidate(cluster_id)
+            return r
         host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(
@@ -148,6 +198,7 @@ class KafkaAdmin:
         )
         if exit_code != 0:
             raise ValueError(f"Failed to delete topic: {stderr}")
+        _topic_list_invalidate(cluster_id)
         return {"topic": name, "deleted": True}
 
     # ── Topic Settings ───────────────────────────────────
