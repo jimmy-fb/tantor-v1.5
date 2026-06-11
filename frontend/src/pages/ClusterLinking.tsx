@@ -39,6 +39,7 @@ interface LinkMetrics {
   connectors: string[];
   replication_lag: number | null;
   error: string | null;
+  warnings?: string[];
   mm2_consumer_groups?: string[];
   connector_statuses?: Array<Record<string, unknown>>;
 }
@@ -54,13 +55,17 @@ export default function ClusterLinking() {
   const [links, setLinks] = useState<ClusterLinkInfo[]>([]);
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [showCreate, setShowCreate] = useState(false);
   const [expandedLink, setExpandedLink] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<Record<string, LinkMetrics>>({});
   const [deployingLink, setDeployingLink] = useState<string | null>(null);
+  const [failedDeployLink, setFailedDeployLink] = useState<string | null>(null);
   const [deployTaskId, setDeployTaskId] = useState<string | null>(null);
   const [deployLogs, setDeployLogs] = useState<string[]>([]);
+  const [deployErrorByLink, setDeployErrorByLink] = useState<Record<string, string>>({});
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+
   const [error, setError] = useState('');
   const admin = isAdmin();
 
@@ -126,17 +131,29 @@ export default function ClusterLinking() {
         setDeployLogs(data.logs || []);
         if (data.status !== 'running') {
           clearInterval(interval);
+          if (data.status === 'error' && deployingLink) {
+            const logs = data.logs || [];
+            const message = data.error_message || logs[logs.length - 1] || 'Deployment failed';
+            setFailedDeployLink(deployingLink);
+            setDeployErrorByLink(prev => ({ ...prev, [deployingLink]: message }));
+          } else {
+            setFailedDeployLink(null);
+          }
           setDeployingLink(null);
           setDeployTaskId(null);
           fetchLinks();
         }
       } catch {
         clearInterval(interval);
+        if (deployingLink) {
+          setFailedDeployLink(deployingLink);
+          setDeployErrorByLink(prev => ({ ...prev, [deployingLink]: 'Lost connection while polling deploy task' }));
+        }
         setDeployingLink(null);
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [deployTaskId]);
+  }, [deployTaskId, deployingLink]);
 
   useEffect(() => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
@@ -168,7 +185,13 @@ export default function ClusterLinking() {
 
   const handleDeploy = async (linkId: string) => {
     setDeployingLink(linkId);
+    setFailedDeployLink(null);
     setDeployLogs([]);
+    setDeployErrorByLink(prev => {
+      const next = { ...prev };
+      delete next[linkId];
+      return next;
+    });
     try {
       const { data } = await authApi.post(`/cluster-linking/links/${linkId}/deploy`);
       setDeployTaskId(data.task_id);
@@ -199,8 +222,19 @@ export default function ClusterLinking() {
     try {
       const { data } = await authApi.get<LinkMetrics>(`/cluster-linking/links/${linkId}/metrics`);
       setMetrics(prev => ({ ...prev, [linkId]: data }));
-    } catch {
-      // ignore
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail || 'Failed to refresh metrics';
+      setMetrics(prev => ({
+        ...prev,
+        [linkId]: {
+          link_id: linkId,
+          link_name: '',
+          state: 'unknown',
+          connectors: [],
+          replication_lag: null,
+          error: msg,
+        },
+      }));
     }
   }, []);
 
@@ -233,10 +267,15 @@ export default function ClusterLinking() {
         </div>
         <div className="flex items-center gap-2">
           <button
-            onClick={() => { fetchLinks(); fetchClusters(); }}
-            className="flex items-center gap-2 px-3 py-2 text-gray-600 hover:text-gray-900 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors"
+            onClick={async () => {
+              setIsRefreshing(true);
+              await Promise.all([fetchLinks(), fetchClusters()]);
+              setIsRefreshing(false);
+            }}
+            disabled={isRefreshing}
+            className="flex items-center gap-2 px-3 py-2 text-gray-600 hover:text-gray-900 border border-gray-300 rounded-lg hover:bg-gray-50 transition-colors disabled:opacity-50"
           >
-            <RefreshCw size={16} /> Refresh
+            <RefreshCw size={16} className={isRefreshing ? 'animate-spin' : ''} /> Refresh
           </button>
           {admin && (
             <button
@@ -401,8 +440,14 @@ export default function ClusterLinking() {
                 </div>
               </div>
 
+              {deployErrorByLink[link.id] && (
+                <div className="border-t border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+                  {deployErrorByLink[link.id]}
+                </div>
+              )}
+
               {/* Deploy logs */}
-              {deployingLink === link.id && deployLogs.length > 0 && (
+              {(deployingLink === link.id || failedDeployLink === link.id) && deployLogs.length > 0 && (
                 <div className="border-t border-gray-100 bg-gray-900 p-4 max-h-48 overflow-y-auto">
                   <pre ref={logRef} className="text-xs text-gray-300 font-mono whitespace-pre-wrap">
                     {deployLogs.join('\n')}
@@ -442,6 +487,16 @@ export default function ClusterLinking() {
                         <div className="flex items-center gap-2 text-xs text-yellow-700 bg-yellow-50 border border-yellow-200 rounded-lg p-2">
                           <AlertTriangle size={14} />
                           {metrics[link.id].error}
+                        </div>
+                      )}
+                      {metrics[link.id].warnings && metrics[link.id].warnings!.length > 0 && (
+                        <div className="space-y-1">
+                          {metrics[link.id].warnings!.map((warning, idx) => (
+                            <div key={idx} className="flex items-center gap-2 text-xs text-yellow-700 bg-yellow-50 border border-yellow-200 rounded-lg p-2">
+                              <AlertTriangle size={14} />
+                              {warning}
+                            </div>
+                          ))}
                         </div>
                       )}
                       <button onClick={() => fetchMetrics(link.id)}

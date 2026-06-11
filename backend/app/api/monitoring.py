@@ -104,7 +104,7 @@ def get_cluster_metrics(
             # per-cluster systemd unit + install path + listener port
             # instead of the legacy /opt/kafka + kafka.service + 9092.
             "kafka": _get_kafka_metrics(host, cluster, svc),
-            "disk": _get_disk_metrics(host),
+            "disk": _get_disk_metrics(host, cluster=cluster),
         }
         seen_hosts[host.id] = node_metrics
         nodes.append(node_metrics)
@@ -178,11 +178,11 @@ def _external_cluster_metrics(cluster: Cluster, db: Session) -> dict:
             "node_id": bid,
             "status": "connected",
             "external": True,
-            "kafka": dict(cluster_kafka, port=b.get("port")),
+            "kafka": dict(cluster_kafka, port=b.get("port"), status="active"),
         }
         if host_obj:
             node["system"] = _get_system_metrics(host_obj)
-            node["disk"] = _get_disk_metrics(host_obj)
+            node["disk"] = _get_disk_metrics(host_obj, cluster=cluster)
         else:
             node["system"] = {"unavailable": "external cluster — register broker host for SSH metrics"}
             node["disk"] = {"unavailable": "external cluster — register broker host for SSH metrics"}
@@ -403,12 +403,28 @@ echo "KAFKA_CONNECTIONS:$CONNECTIONS"
         return {"error": str(e)}
 
 
-def _get_disk_metrics(host: Host) -> dict:
+def _get_disk_metrics(host: Host, cluster: Cluster | None = None) -> dict:
     """Get disk usage for Kafka data and root partitions."""
+    cluster_data_dir = ""
+    if cluster:
+        from app.services.cluster_paths import data_dir
+        cluster_data_dir = data_dir(cluster)
+
     cmd = """bash -c '
-df -m / 2>/dev/null | tail -1 | awk "{print \\"ROOT_TOTAL_MB:\\"\\$2\\"\\nROOT_USED_MB:\\"\\$3\\"\\nROOT_AVAIL_MB:\\"\\$4\\"\\nROOT_USE_PCT:\\"\\$5}"
-df -m /var/lib/kafka/data 2>/dev/null | tail -1 | awk "{print \\"DATA_TOTAL_MB:\\"\\$2\\"\\nDATA_USED_MB:\\"\\$3\\"\\nDATA_AVAIL_MB:\\"\\$4\\"\\nDATA_USE_PCT:\\"\\$5}"
-'"""
+ROOT_STATS=$(df -mP / 2>/dev/null | tail -1)
+echo "ROOT_TOTAL_MB:$(echo "$ROOT_STATS" | awk "{print \\$2}")"
+echo "ROOT_USED_MB:$(echo "$ROOT_STATS" | awk "{print \\$3}")"
+echo "ROOT_AVAIL_MB:$(echo "$ROOT_STATS" | awk "{print \\$4}")"
+echo "ROOT_USE_PCT:$(echo "$ROOT_STATS" | awk "{print \\$5}")"
+
+DATA_DIR=$(ls -d __CLUSTER_DATA_DIR__ /var/lib/kafka/data /tmp/kafka-logs /opt/kafka/data 2>/dev/null | grep -v "^$" | head -1)
+if [ -z "$DATA_DIR" ]; then DATA_DIR="/"; fi
+DATA_STATS=$(df -mP "$DATA_DIR" 2>/dev/null | tail -1)
+echo "DATA_TOTAL_MB:$(echo "$DATA_STATS" | awk "{print \\$2}")"
+echo "DATA_USED_MB:$(echo "$DATA_STATS" | awk "{print \\$3}")"
+echo "DATA_AVAIL_MB:$(echo "$DATA_STATS" | awk "{print \\$4}")"
+echo "DATA_USE_PCT:$(echo "$DATA_STATS" | awk "{print \\$5}")"
+'""".replace("__CLUSTER_DATA_DIR__", cluster_data_dir)
     output = _ssh_exec(host, cmd, timeout=10)
     if not output:
         return {"error": "unreachable"}

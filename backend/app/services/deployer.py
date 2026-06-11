@@ -466,6 +466,11 @@ def _run_ansible_deployment(
             service_type, remote_config, kafka_dir, settings.KSQLDB_INSTALL_DIR,
             unit_name=cluster_paths.unit_name(cluster) if service_type == "kafka" else None,
             kafka_log_dir=settings.KAFKA_LOG_DIR,
+            cpu_quota=cluster_config.get("cpu_quota"),
+            memory_max=cluster_config.get("memory_max"),
+            jvm_performance_opts=cluster_config.get("jvm_performance_opts"),
+            jmx_port=cluster_config.get("jmx_port"),
+            gc_logging_enabled=cluster_config.get("gc_logging_enabled", False),
         )
         unit_name = f"{ip}_{nid}_{service_type}.service"
         systemd_units[unit_name] = unit_content
@@ -580,6 +585,85 @@ def _run_ansible_deployment(
             svc.status = "running"
         cluster.state = "running"
         db.commit()
+
+        # ── Apply initial ACLs (v1.4.6) ──────────────────────────────────
+        # The operator may have specified ACLs in the wizard. We apply them
+        # now, after Ansible exits 0, once we confirm the broker is actually
+        # accepting TCP connections. kafka-acls.sh needs --bootstrap-server
+        # to be reachable — the JVM typically takes 5-15 s after systemctl
+        # start to bind the port, so we poll with a timeout instead of
+        # hitting it immediately.
+        try:
+            from app.models.cluster import Cluster as _Cluster
+            _cluster_fresh = db.query(_Cluster).filter(_Cluster.id == cluster.id).first()
+            cfg_for_acl = json.loads(_cluster_fresh.config_json or "{}") if _cluster_fresh else {}
+            acl_port = cfg_for_acl.get("listener_port", 9092)
+
+            # Resolve the first broker host for the readiness check
+            broker_svc = next(
+                (s for s in services if s.role in ("broker", "broker_controller")), None
+            )
+            broker_host = hosts.get(broker_svc.host_id) if broker_svc else None
+
+            # Parse initial_acls out of the task's stored payload.
+            # The deployer doesn't receive ClusterCreate directly, so we
+            # stash initial_acls in the DeploymentTask row's logs under a
+            # sentinel line "INITIAL_ACLS:<json>" written by the API layer.
+            # Retrieve and remove it so it doesn't clutter the log display.
+            _acl_task_row = db.query(DeploymentTask).filter(DeploymentTask.id == task_id).first()
+            initial_acls: list[dict] = []
+            if _acl_task_row:
+                try:
+                    _logs = json.loads(_acl_task_row.logs or "[]")
+                    _clean_logs = []
+                    for _line in _logs:
+                        if isinstance(_line, str) and _line.startswith("INITIAL_ACLS:"):
+                            try:
+                                initial_acls = json.loads(_line[len("INITIAL_ACLS:"):])
+                            except Exception:
+                                pass
+                        else:
+                            _clean_logs.append(_line)
+                    _acl_task_row.logs = json.dumps(_clean_logs)
+                    db.commit()
+                except Exception:
+                    pass
+
+            if initial_acls and broker_host:
+                import socket, time
+                log(f"Waiting for broker at {broker_host.ip_address}:{acl_port} to accept connections...")
+                _deadline = time.monotonic() + 60
+                _ready = False
+                while time.monotonic() < _deadline:
+                    try:
+                        with socket.create_connection((broker_host.ip_address, acl_port), timeout=3):
+                            _ready = True
+                            break
+                    except OSError:
+                        time.sleep(3)
+
+                if not _ready:
+                    log(f"WARNING: Broker did not become reachable within 60 s — skipping initial ACLs. Apply them manually from the Security tab.")
+                else:
+                    log(f"Broker is reachable. Applying {len(initial_acls)} initial ACL rule(s)...")
+                    from app.services.kafka_admin import KafkaAdmin
+                    applied = 0
+                    skipped = 0
+                    for _acl in initial_acls:
+                        try:
+                            KafkaAdmin.create_acl(cluster.id, _acl, db, actor=None)
+                            principal = _acl.get("principal", "?")
+                            resource = f"{_acl.get('resource_type','?')}:{_acl.get('resource_name','?')}"
+                            ops = ",".join(_acl.get("operations") or [])
+                            log(f"  ACL applied — {principal} → {resource} [{ops}]")
+                            applied += 1
+                        except Exception as _acl_err:
+                            log(f"  WARNING: ACL apply failed ({_acl}): {_acl_err}")
+                            skipped += 1
+                    log(f"Initial ACLs: {applied} applied, {skipped} failed (see warnings above).")
+        except Exception as _acl_outer_err:
+            # Never let ACL application break the deployment success state.
+            log(f"WARNING: Initial ACL phase encountered an unexpected error: {_acl_outer_err}")
 
         # Auto-deploy monitoring + alerting on the same host as the first broker.
         # Best-effort — if monitoring deploy fails the cluster is still usable;
@@ -759,6 +843,11 @@ def deploy_schema_registry(cluster_id: str, host_id: str, port: int, task_id: st
             cluster_paths.install_dir(cluster), settings.KSQLDB_INSTALL_DIR,
             bootstrap_servers=bs_str or "127.0.0.1:9092",
             schema_registry_port=port,
+            cpu_quota=cluster_config.get("cpu_quota"),
+            memory_max=cluster_config.get("memory_max"),
+            jvm_performance_opts=cluster_config.get("jvm_performance_opts"),
+            jmx_port=cluster_config.get("jmx_port"),
+            gc_logging_enabled=cluster_config.get("gc_logging_enabled", False),
         )
 
         configs = {f"{host.ip_address}_{sr_svc.node_id}_apicurio.properties": sr_config}

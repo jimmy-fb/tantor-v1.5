@@ -26,7 +26,7 @@
 
 set -e
 
-VERSION="1.4.4"
+VERSION="1.4.5"
 
 # Default paths follow FHS: code in /opt, mutable data in /var/lib, logs in /var/log.
 # `--install-dir <BASE>` collapses everything under BASE so customers with a

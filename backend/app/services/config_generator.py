@@ -68,6 +68,7 @@ class ConfigGenerator:
             # Fernet-decrypted password so the property file on disk has the
             # real value (Kafka can't read env vars from server.properties).
             ssl_keystore_password=cluster_config.get("_ssl_keystore_password", ""),
+            retention_hours=cluster_config.get("retention_hours", 168),
         )
 
     @staticmethod
@@ -158,6 +159,11 @@ class ConfigGenerator:
         kafka_log_dir: str = "/var/log/kafka",
         bootstrap_servers: str = "127.0.0.1:9092",
         schema_registry_port: int = 8085,
+        cpu_quota: str | None = None,
+        memory_max: str | None = None,
+        jvm_performance_opts: str | None = None,
+        jmx_port: int | None = None,
+        gc_logging_enabled: bool = False,
     ) -> str:
         """Generate a systemd unit file for a Kafka service.
 
@@ -181,6 +187,11 @@ class ConfigGenerator:
             kafka_log_dir=kafka_log_dir,
             bootstrap_servers=bootstrap_servers,
             schema_registry_port=schema_registry_port,
+            cpu_quota=cpu_quota,
+            memory_max=memory_max,
+            jvm_performance_opts=jvm_performance_opts,
+            jmx_port=jmx_port,
+            gc_logging_enabled=gc_logging_enabled,
         )
 
     @staticmethod

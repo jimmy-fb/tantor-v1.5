@@ -13,7 +13,13 @@ Environment="JAVA_HOME={{ java_home }}"
 # properties on the command line. The application.properties file
 # stays around for human inspection / future use.
 Environment="QUARKUS_CONFIG_LOCATIONS={{ config_path }}"
-{% if heap_opts %}Environment="JAVA_OPTS={{ heap_opts }}"
+{% set sr_java_opts = [] %}
+{% if heap_opts %}{% set _ = sr_java_opts.append(heap_opts) %}{% endif %}
+{% if jvm_performance_opts %}{% set _ = sr_java_opts.append(jvm_performance_opts) %}{% endif %}
+{% if gc_logging_enabled %}{% set _ = sr_java_opts.append("-Xlog:gc*:file=/var/log/kafka/gc-schema-registry.log:time,level,tags:filecount=10,filesize=10M") %}{% endif %}
+{% if jmx_port %}{% set _ = sr_java_opts.append("-Dcom.sun.management.jmxremote -Dcom.sun.management.jmxremote.port=" ~ jmx_port ~ " -Dcom.sun.management.jmxremote.rmi.port=" ~ jmx_port ~ " -Dcom.sun.management.jmxremote.authenticate=false -Dcom.sun.management.jmxremote.ssl=false") %}{% endif %}
+{% if sr_java_opts %}
+Environment="JAVA_OPTS={{ sr_java_opts | join(' ') }}"
 {% endif %}
 # Apicurio 3.1+ ships quarkus-run.jar at the tarball root after our
 # strip-components extract. The legacy quarkus-app/ subdir layout was
@@ -26,6 +32,12 @@ RestartSec=5
 # "service failed" while still failing fast on a real bug.
 TimeoutStartSec=300
 LimitNOFILE=65536
+{% if cpu_quota %}
+CPUQuota={{ cpu_quota }}
+{% endif %}
+{% if memory_max %}
+MemoryMax={{ memory_max }}
+{% endif %}
 
 [Install]
 WantedBy=multi-user.target

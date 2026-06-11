@@ -84,9 +84,9 @@ export default function SecurityScan() {
 
   useEffect(() => {
     authApi.get<Cluster[]>('/clusters').then(r => {
-      const running = r.data.filter(c => c.state === 'running');
-      setClusters(running);
-      if (running.length > 0) setSelectedCluster(running[0].id);
+      const scannable = r.data.filter(c => c.state === 'running' || (c.kind === 'external' && c.state === 'connected'));
+      setClusters(scannable);
+      if (scannable.length > 0) setSelectedCluster(scannable[0].id);
     });
   }, []);
 
@@ -155,9 +155,11 @@ export default function SecurityScan() {
               onChange={e => setSelectedCluster(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
             >
-              {clusters.length === 0 && <option value="">No running clusters</option>}
+              {clusters.length === 0 && <option value="">No scannable clusters</option>}
               {clusters.map(c => (
-                <option key={c.id} value={c.id}>{c.name} — Kafka {c.kafka_version}</option>
+                <option key={c.id} value={c.id}>
+                  {c.name} ({c.kind === 'external' ? 'external' : 'managed'}) - Kafka {c.kafka_version}
+                </option>
               ))}
             </select>
           </div>
@@ -353,7 +355,7 @@ export default function SecurityScan() {
           <Shield size={40} className="mx-auto text-gray-400 mb-4" />
           <h3 className="font-semibold text-gray-700">No Scan Results</h3>
           <p className="text-sm text-gray-500 mt-2">
-            Select a running cluster and click "Run Security Scan" to assess your Kafka cluster's security posture.
+            Select a running managed cluster or connected external cluster and click "Run Security Scan" to assess your Kafka cluster's security posture.
           </p>
         </div>
       )}

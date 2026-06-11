@@ -1,48 +1,29 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Globe2, Search, RefreshCw, Loader2, AlertTriangle, ChevronRight } from 'lucide-react';
-import { getFederationOverview, federationTopicSearch } from '../lib/api';
-
-type Cluster = {
-  id: string;
-  name: string;
-  kind: 'managed' | 'external';
-  state: string;
-  environment: string;
-  kafka_version: string;
-  mode: string;
-  broker_count: number | null;
-  topic_count: number | null;
-  bootstrap_servers: string | null;
-};
-
-type Match = {
-  cluster_id: string;
-  cluster_name: string;
-  cluster_kind: 'managed' | 'external';
-  environment: string;
-  topic: string;
-  partitions: number;
-  replication_factor: number;
-};
+import { Globe2, Search, RefreshCw, Loader2, AlertTriangle, Edit2, X} from 'lucide-react';
+import { getFederationOverview, federationTopicSearch, patchCluster, type FederationCluster, type FederationMatch } from '../lib/api';
 
 const ENV_BADGE: Record<string, string> = {
-  prod: 'bg-red-50 text-red-700 border-red-200',
+  prod: 'bg-red-100 text-red-800 border-red-300',
   staging: 'bg-amber-50 text-amber-700 border-amber-200',
   qa: 'bg-blue-50 text-blue-700 border-blue-200',
   dev: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  fdr: 'bg-purple-100 text-purple-800 border-purple-300',
 };
 
 export default function Federation() {
   const [overview, setOverview] = useState<{
-    clusters: Cluster[]; total: number; managed: number; external: number;
+    clusters: FederationCluster[]; total: number; managed: number; external: number;
   } | null>(null);
   const [loading, setLoading] = useState(true);
+  const [envFilter, setEnvFilter] = useState<string>('all');
+  const [editingEnv, setEditingEnv] = useState<{ clusterId: string; currentEnv: string } | null>(null);
+  const [newEnv, setNewEnv] = useState('');
 
   const [q, setQ] = useState('');
   const [searching, setSearching] = useState(false);
   const [searchResult, setSearchResult] = useState<{
-    matches: Match[]; match_count: number; skipped: Array<{ name: string; reason: string }>;
+    matches: FederationMatch[]; match_count: number; skipped: Array<{ name: string; reason: string }>;
   } | null>(null);
 
   const fetchOverview = async () => {
@@ -56,6 +37,28 @@ export default function Federation() {
   };
 
   useEffect(() => { fetchOverview(); }, []);
+
+  const handleEnvEdit = (clusterId: string, currentEnv: string) => {
+    setEditingEnv({ clusterId, currentEnv });
+    setNewEnv(currentEnv || '');
+  };
+
+  const handleEnvSave = async () => {
+    if (!editingEnv) return;
+    try {
+      await patchCluster(editingEnv.clusterId, { environment: newEnv });
+      await fetchOverview();
+      setEditingEnv(null);
+      setNewEnv('');
+    } catch (error) {
+      console.error('Failed to update environment:', error);
+    }
+  };
+
+  const handleEnvCancel = () => {
+    setEditingEnv(null);
+    setNewEnv('');
+  };
 
   const onSearch = async () => {
     if (!q.trim()) return;
@@ -73,7 +76,7 @@ export default function Federation() {
       <div className="flex items-center justify-between mb-4">
         <div>
           <h1 className="text-xl font-semibold flex items-center gap-2">
-            <Globe2 size={20} className="text-blue-600" /> Data Federation
+            <Globe2 size={20} className="text-blue-600" /> Cluster Overview
           </h1>
           <p className="text-sm text-gray-500 mt-1">
             Single pane of glass across every cluster Tantor manages — managed and external.
@@ -98,6 +101,22 @@ export default function Federation() {
             <Stat label="External" value={overview.external.toString()} />
           </div>
 
+          <div className="flex items-center gap-3 mb-4">
+            <label className="text-sm font-medium text-gray-700">Filter by Environment:</label>
+            <select
+              value={envFilter}
+              onChange={e => setEnvFilter(e.target.value)}
+              className="px-3 py-1.5 border rounded-lg text-sm bg-white"
+            >
+              <option value="all">All Environments</option>
+              <option value="dev">dev</option>
+              <option value="qa">qa</option>
+              <option value="staging">staging</option>
+              <option value="prod">prod</option>
+              <option value="fdr">fdr</option>
+            </select>
+          </div>
+
           <div className="border rounded-lg overflow-hidden mb-6">
             <table className="w-full text-sm">
               <thead className="bg-gray-50 border-b">
@@ -107,16 +126,18 @@ export default function Federation() {
                   <th className="text-left px-3 py-2 font-medium">State</th>
                   <th className="text-left px-3 py-2 font-medium">Env</th>
                   <th className="text-left px-3 py-2 font-medium">Brokers</th>
-                  <th className="text-left px-3 py-2 font-medium">Topics</th>
-                  <th></th>
                 </tr>
               </thead>
               <tbody>
                 {overview.clusters.length === 0 ? (
-                  <tr><td colSpan={7} className="px-3 py-6 text-center text-gray-500 italic">No clusters yet</td></tr>
-                ) : overview.clusters.map(c => (
+                  <tr><td colSpan={5} className="px-3 py-6 text-center text-gray-500 italic">No clusters yet</td></tr>
+                ) : overview.clusters.filter(c => envFilter === 'all' || c.environment?.toLowerCase() === envFilter).map(c => (
                   <tr key={c.id} className="border-t hover:bg-gray-50">
-                    <td className="px-3 py-2 font-medium">{c.name}</td>
+                    <td className="px-3 py-2 font-medium">
+                      <Link to={`/clusters/${c.id}`} className="text-blue-600 hover:underline">
+                        {c.name}
+                      </Link>
+                    </td>
                     <td className="px-3 py-2">
                       <span className={`px-2 py-0.5 rounded text-xs ${c.kind === 'managed' ? 'bg-blue-50 text-blue-700' : 'bg-purple-50 text-purple-700'}`}>
                         {c.kind}
@@ -130,19 +151,47 @@ export default function Federation() {
                       }`}>{c.state}</span>
                     </td>
                     <td className="px-3 py-2">
-                      {c.environment ? (
-                        <span className={`px-2 py-0.5 rounded text-xs border ${ENV_BADGE[c.environment.toLowerCase()] || 'bg-gray-50 text-gray-600 border-gray-200'}`}>
-                          {c.environment}
-                        </span>
-                      ) : <span className="text-gray-400 text-xs">—</span>}
+                      {editingEnv?.clusterId === c.id ? (
+                        <div className="flex items-center gap-1">
+                          <select
+                            value={newEnv}
+                            onChange={e => setNewEnv(e.target.value)}
+                            className="px-2 py-1 text-xs border rounded"
+                          >
+                            <option value="">—</option>
+                            <option value="dev">dev</option>
+                            <option value="qa">qa</option>
+                            <option value="staging">staging</option>
+                            <option value="prod">prod</option>
+                            <option value="fdr">fdr</option>
+                          </select>
+                          <button onClick={handleEnvSave} className="p-1 text-green-600 hover:bg-green-50 rounded">
+                            <Edit2 size={12} />
+                          </button>
+                          <button onClick={handleEnvCancel} className="p-1 text-red-600 hover:bg-red-50 rounded">
+                            <X size={12} />
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1">
+                          {c.environment ? (
+                            <span className={`px-2 py-0.5 rounded text-xs border ${ENV_BADGE[c.environment.toLowerCase()] || 'bg-gray-50 text-gray-600 border-gray-200'}`}>
+                              {c.environment}
+                            </span>
+                          ) : <span className="text-gray-400 text-xs">—</span>}
+                          {c.kind === 'external' && (
+                            <button
+                              onClick={() => handleEnvEdit(c.id, c.environment || '')}
+                              className="p-0.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded"
+                              title="Edit environment"
+                            >
+                              <Edit2 size={11} />
+                            </button>
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="px-3 py-2">{c.broker_count ?? '—'}</td>
-                    <td className="px-3 py-2">{c.topic_count ?? <span className="text-gray-400 italic">unreachable</span>}</td>
-                    <td className="px-3 py-2 text-right">
-                      <Link to={`/clusters/${c.id}`} className="text-blue-600 hover:underline text-xs inline-flex items-center gap-0.5">
-                        Open <ChevronRight size={12} />
-                      </Link>
-                    </td>
                   </tr>
                 ))}
               </tbody>

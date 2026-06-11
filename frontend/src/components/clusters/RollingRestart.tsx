@@ -15,6 +15,7 @@ authApi.interceptors.request.use((config) => {
 
 interface Props {
   clusterId: string;
+  isExternal?: boolean;
 }
 
 interface BrokerCheck {
@@ -51,7 +52,7 @@ const SCOPE_OPTIONS: { value: RestartScope; label: string; description: string }
   { value: 'all', label: 'All Services', description: 'Restart all services: controllers, brokers, then extras' },
 ];
 
-export default function RollingRestart({ clusterId }: Props) {
+export default function RollingRestart({ clusterId, isExternal = false }: Props) {
   const [preCheck, setPreCheck] = useState<PreCheckResult | null>(null);
   const [preCheckLoading, setPreCheckLoading] = useState(false);
   const [preCheckError, setPreCheckError] = useState('');
@@ -60,7 +61,7 @@ export default function RollingRestart({ clusterId }: Props) {
   const [showConfirm, setShowConfirm] = useState(false);
   const [starting, setStarting] = useState(false);
 
-  const [_taskId, setTaskId] = useState<string | null>(null);
+  const [, setTaskId] = useState<string | null>(null);
   const [task, setTask] = useState<RestartTask | null>(null);
   const [showLogs, setShowLogs] = useState(true);
 
@@ -88,7 +89,10 @@ export default function RollingRestart({ clusterId }: Props) {
     setPreCheckLoading(true);
     setPreCheckError('');
     try {
-      const res = await authApi.get(`/rolling-restart/clusters/${clusterId}/pre-check`);
+      const preCheckUrl = isExternal
+        ? `/rolling-restart/external/${clusterId}/pre-check`
+        : `/rolling-restart/clusters/${clusterId}/pre-check`;
+      const res = await authApi.get(preCheckUrl);
       setPreCheck(res.data);
     } catch (err: unknown) {
       if (axios.isAxiosError(err)) {
@@ -99,7 +103,7 @@ export default function RollingRestart({ clusterId }: Props) {
     } finally {
       setPreCheckLoading(false);
     }
-  }, [clusterId]);
+  }, [clusterId, isExternal]);
 
   // Run pre-check on mount
   useEffect(() => {
@@ -126,7 +130,10 @@ export default function RollingRestart({ clusterId }: Props) {
     setStarting(true);
     setShowConfirm(false);
     try {
-      const res = await authApi.post(`/rolling-restart/clusters/${clusterId}`, { scope });
+      const startUrl = isExternal
+        ? `/rolling-restart/external/${clusterId}`
+        : `/rolling-restart/clusters/${clusterId}`;
+      const res = await authApi.post(startUrl, isExternal ? {} : { scope });
       const id = res.data.task_id;
       setTaskId(id);
       setTask({ status: 'running', logs: [], progress: { current: 0, total: 0, current_broker: null } });
@@ -264,7 +271,8 @@ export default function RollingRestart({ clusterId }: Props) {
             <h3 className="text-lg font-semibold text-gray-900">Rolling Restart</h3>
           </div>
 
-          {/* Scope selector */}
+          {/* Scope selector — hidden for external clusters (brokers only) */}
+          {!isExternal && (
           <div className="mb-6">
             <label className="block text-sm font-medium text-gray-700 mb-2">Restart Scope</label>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
@@ -286,6 +294,7 @@ export default function RollingRestart({ clusterId }: Props) {
               ))}
             </div>
           </div>
+          )}
 
           {/* Start button */}
           <div className="flex items-center gap-3">

@@ -301,5 +301,214 @@ class RollingRestartManager:
             "checks": checks,
         }
 
+    # ── External cluster rolling restart ─────────────────────────────────
+    # External clusters don't have Service rows. Instead, the operator
+    # registers broker hosts + systemd unit names in
+    # cluster.external_broker_hosts_json. The logic below mirrors the
+    # managed-cluster rolling restart but reads from that JSON blob.
+
+    def _read_external_broker_hosts(self, cluster: Cluster) -> list[dict]:
+        """Parse the external_broker_hosts_json stored on the cluster."""
+        if not cluster.external_broker_hosts_json:
+            return []
+        try:
+            return json.loads(cluster.external_broker_hosts_json)
+        except Exception:
+            return []
+
+    def rolling_restart_external(self, cluster_id: str, task_id: str, db: Session):
+        """Perform a rolling restart on an external cluster's brokers."""
+        task = _restart_tasks.get(task_id)
+        if not task:
+            return
+
+        def log(msg: str):
+            task["logs"].append(msg)
+            logger.info(f"[{task_id[:8]}] {msg}")
+
+        try:
+            cluster = db.query(Cluster).filter(
+                Cluster.id == cluster_id, Cluster.kind == "external"
+            ).first()
+            if not cluster:
+                log("ERROR: External cluster not found")
+                task["status"] = "error"
+                return
+
+            entries = self._read_external_broker_hosts(cluster)
+            if not entries:
+                log("ERROR: No broker hosts registered for this external cluster")
+                task["status"] = "error"
+                return
+
+            hosts = {h.id: h for h in db.query(Host).all()}
+            task["progress"]["total"] = len(entries)
+
+            # Determine the Kafka listener port from bootstrap_servers
+            ext_port = 9092
+            if cluster.bootstrap_servers:
+                try:
+                    first = cluster.bootstrap_servers.split(",")[0].strip()
+                    ext_port = int(first.rpartition(":")[2])
+                except (ValueError, IndexError):
+                    pass
+
+            log(f"Starting rolling restart of {len(entries)} external broker(s)")
+            log(f"Cluster: {cluster.name}")
+            log("")
+
+            for idx, entry in enumerate(entries):
+                host = hosts.get(entry["host_id"])
+                if not host:
+                    log(f"⚠ Skipping broker — host {entry['host_id'][:8]} not found")
+                    continue
+
+                unit = entry.get("kafka_unit", "kafka.service")
+                broker_label = f"broker {entry.get('broker_id', '?')} on {host.ip_address}"
+                task["progress"]["current"] = idx + 1
+                task["progress"]["current_broker"] = f"Broker {entry.get('broker_id', '?')} ({host.ip_address})"
+
+                log(f"━━━ [{idx+1}/{len(entries)}] Restarting {broker_label} ━━━")
+
+                try:
+                    with SSHManager.connect(
+                        host.ip_address, host.ssh_port, host.username,
+                        host.auth_type, host.encrypted_credential,
+                    ) as client:
+                        # Step 1: Pre-restart health check
+                        log("  Pre-restart health check...")
+                        port_ok = self._check_kafka_port(client, ext_port)
+                        if not port_ok:
+                            log("  ⚠ Broker port not reachable before restart, proceeding anyway")
+
+                        # Step 2: Stop the service
+                        log(f"  Stopping {unit}...")
+                        exit_code, stdout, stderr = SSHManager.exec_command(
+                            client, f"sudo systemctl stop {unit}", timeout=60
+                        )
+                        if exit_code != 0:
+                            log(f"  ⚠ Stop warning: {stderr[:200]}")
+
+                        # Wait for graceful shutdown
+                        log("  Waiting for graceful shutdown...")
+                        for i in range(30):
+                            exit_code, stdout, _ = SSHManager.exec_command(
+                                client, f"systemctl is-active {unit}", timeout=10
+                            )
+                            if stdout.strip() != "active":
+                                break
+                            time.sleep(1)
+
+                        log("  Service stopped")
+
+                        # Step 3: Start the service
+                        log(f"  Starting {unit}...")
+                        exit_code, stdout, stderr = SSHManager.exec_command(
+                            client, f"sudo systemctl start {unit}", timeout=60
+                        )
+                        if exit_code != 0:
+                            log(f"  ✗ Start failed: {stderr[:200]}")
+                            task["status"] = "error"
+                            return
+
+                        # Step 4: Wait for service to become healthy
+                        log("  Waiting for service to become healthy...")
+                        healthy = False
+                        for attempt in range(60):
+                            time.sleep(1)
+                            if self._check_service_running(client, unit):
+                                if self._check_kafka_port(client, ext_port):
+                                    healthy = True
+                                    break
+
+                        if healthy:
+                            log(f"  ✓ {broker_label} restarted successfully")
+                        else:
+                            log(f"  ✗ {broker_label} failed health check after restart")
+                            task["status"] = "error"
+                            return
+
+                        # Step 5: Brief stabilization pause before next broker
+                        log("  Stabilization pause (15s)...")
+                        time.sleep(15)
+
+                        log("")
+
+                except Exception as e:
+                    log(f"  ✗ Error: {str(e)}")
+                    task["status"] = "error"
+                    return
+
+            log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            log(f"✓ Rolling restart completed successfully — {len(entries)} broker(s) restarted")
+            task["status"] = "completed"
+
+        except Exception as e:
+            log(f"ERROR: {str(e)}")
+            task["status"] = "error"
+
+    def get_pre_restart_check_external(self, cluster_id: str, db: Session) -> dict:
+        """Run pre-restart health checks for an external cluster."""
+        cluster = db.query(Cluster).filter(
+            Cluster.id == cluster_id, Cluster.kind == "external"
+        ).first()
+        if not cluster:
+            raise ValueError("External cluster not found")
+
+        entries = self._read_external_broker_hosts(cluster)
+        hosts = {h.id: h for h in db.query(Host).all()}
+
+        # Determine the Kafka listener port from bootstrap_servers
+        ext_port = 9092
+        if cluster.bootstrap_servers:
+            try:
+                first = cluster.bootstrap_servers.split(",")[0].strip()
+                ext_port = int(first.rpartition(":")[2])
+            except (ValueError, IndexError):
+                pass
+
+        checks = []
+        for entry in entries:
+            host = hosts.get(entry["host_id"])
+            if not host:
+                checks.append({
+                    "broker_id": entry.get("broker_id"),
+                    "host": "unknown",
+                    "healthy": False,
+                    "message": "Host not found",
+                })
+                continue
+            try:
+                with SSHManager.connect(
+                    host.ip_address, host.ssh_port, host.username,
+                    host.auth_type, host.encrypted_credential,
+                ) as client:
+                    unit = entry.get("kafka_unit", "kafka.service")
+                    svc_running = self._check_service_running(client, unit)
+                    port_ok = self._check_kafka_port(client, ext_port)
+                    healthy = svc_running and port_ok
+                    checks.append({
+                        "broker_id": entry.get("broker_id"),
+                        "host": host.ip_address,
+                        "healthy": healthy,
+                        "message": "Healthy" if healthy else "Unhealthy",
+                    })
+            except Exception as e:
+                checks.append({
+                    "broker_id": entry.get("broker_id"),
+                    "host": host.ip_address,
+                    "healthy": False,
+                    "message": str(e),
+                })
+
+        all_healthy = all(c["healthy"] for c in checks) if checks else False
+        return {
+            "cluster_name": cluster.name,
+            "broker_count": len(entries),
+            "all_healthy": all_healthy,
+            "checks": checks,
+        }
+
 
 rolling_restart_manager = RollingRestartManager()
+

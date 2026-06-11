@@ -1,13 +1,13 @@
 import { useState } from 'react';
 import { X } from 'lucide-react';
-import type { Host } from '../../types';
+import type { Host, HostAuthType } from '../../types';
 
 interface HostUpdate {
   hostname?: string;
   ip_address?: string;
   ssh_port?: number;
   username?: string;
-  auth_type?: 'password' | 'key';
+  auth_type?: HostAuthType;
   credential?: string;
 }
 
@@ -27,6 +27,12 @@ export default function EditHostModal({ host, onSubmit, onClose }: Props) {
     credential: '',
   });
   const [loading, setLoading] = useState(false);
+  const isKeyAuth = form.auth_type === 'key';
+  const credentialLabel = form.auth_type === 'key'
+    ? 'New Private Key'
+    : form.auth_type === 'arcos'
+      ? 'New ARCOS Password / Token'
+      : 'New Password';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -104,33 +110,34 @@ export default function EditHostModal({ host, onSubmit, onClose }: Props) {
             <label className="block text-sm font-medium text-gray-700 mb-1">Authentication</label>
             <select
               value={form.auth_type}
-              onChange={e => setForm({ ...form, auth_type: e.target.value as 'password' | 'key' })}
+              onChange={e => setForm({ ...form, auth_type: e.target.value as HostAuthType })}
               className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
             >
               <option value="password">Password</option>
               <option value="key">SSH Key</option>
+              <option value="arcos">ARCOS</option>
             </select>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
-              {form.auth_type === 'password' ? 'New Password' : 'New Private Key'}
+              {credentialLabel}
               <span className="text-gray-400 font-normal ml-1">(leave blank to keep current)</span>
             </label>
-            {form.auth_type === 'password' ? (
-              <input
-                type="password"
-                placeholder="Leave blank to keep current password"
-                value={form.credential}
-                onChange={e => setForm({ ...form, credential: e.target.value })}
-                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              />
-            ) : (
+            {isKeyAuth ? (
               <textarea
                 rows={4}
                 placeholder="Leave blank to keep current key"
                 value={form.credential}
                 onChange={e => setForm({ ...form, credential: e.target.value })}
                 className="w-full px-3 py-2 border rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+            ) : (
+              <input
+                type="password"
+                placeholder={form.auth_type === 'arcos' ? 'Leave blank to keep current ARCOS credential' : 'Leave blank to keep current password'}
+                value={form.credential}
+                onChange={e => setForm({ ...form, credential: e.target.value })}
+                className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               />
             )}
           </div>

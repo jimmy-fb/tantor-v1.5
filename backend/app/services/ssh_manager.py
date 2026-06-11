@@ -1,4 +1,5 @@
 import io
+import socket
 import time
 import threading
 from contextlib import contextmanager
@@ -13,8 +14,8 @@ _pool_lock = threading.Lock()
 _POOL_TTL = 120  # seconds to keep idle connections
 
 
-def _pool_key(ip: str, port: int, username: str) -> str:
-    return f"{username}@{ip}:{port}"
+def _pool_key(ip: str, port: int, username: str, auth_type: str) -> str:
+    return f"{auth_type}:{username}@{ip}:{port}"
 
 
 def _cleanup_pool():
@@ -31,13 +32,53 @@ def _cleanup_pool():
 
 class SSHManager:
     @staticmethod
+    def _parse_private_key(credential: str) -> paramiko.PKey:
+        last_error: Exception | None = None
+        key_classes = [
+            key_class
+            for key_class in (
+                getattr(paramiko, "RSAKey", None),
+                getattr(paramiko, "ECDSAKey", None),
+                getattr(paramiko, "Ed25519Key", None),
+                getattr(paramiko, "DSSKey", None),
+            )
+            if key_class is not None
+        ]
+        for key_class in key_classes:
+            try:
+                return key_class.from_private_key(io.StringIO(credential))
+            except Exception as exc:
+                last_error = exc
+        raise paramiko.SSHException(f"Unsupported or invalid private key: {last_error}")
+
+    @staticmethod
+    def _connect_arcos(client: paramiko.SSHClient, ip_address: str, port: int, username: str, credential: str):
+        """Connect to ARCOS/PAM-backed SSH using keyboard-interactive auth."""
+        sock = socket.create_connection((ip_address, port), timeout=15)
+        try:
+            transport = paramiko.Transport(sock)
+            transport.start_client(timeout=15)
+
+            def handler(title: str, instructions: str, prompt_list: list[tuple[str, bool]]) -> list[str]:
+                return [credential for _prompt, _echo in prompt_list]
+
+            transport.auth_interactive(username, handler)
+            if not transport.is_authenticated():
+                raise paramiko.AuthenticationException("ARCOS interactive authentication was not accepted")
+            client._transport = transport
+        except Exception:
+            sock.close()
+            raise
+
+    @staticmethod
     @contextmanager
     def connect(ip_address: str, port: int, username: str, auth_type: str, encrypted_credential: str):
         """Context manager that yields a connected Paramiko SSHClient.
 
         Uses a connection pool to reuse existing connections for up to 120s.
         """
-        key = _pool_key(ip_address, port, username)
+        normalized_auth_type = (auth_type or "").lower()
+        key = _pool_key(ip_address, port, username, normalized_auth_type)
 
         # Step 1: try to grab a live pooled connection. If the keepalive
         # ping fails the connection is dead — drop it and fall through to
@@ -70,19 +111,32 @@ class SSHManager:
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
             credential = decrypt(encrypted_credential)
             try:
-                if auth_type == "password":
+                if normalized_auth_type == "password":
                     client.connect(
                         hostname=ip_address, port=port, username=username,
                         password=credential, timeout=15,
                         look_for_keys=False, allow_agent=False,
                     )
-                else:
-                    pkey = paramiko.RSAKey.from_private_key(io.StringIO(credential))
+                elif normalized_auth_type == "key":
+                    pkey = SSHManager._parse_private_key(credential)
                     client.connect(
                         hostname=ip_address, port=port, username=username,
                         pkey=pkey, timeout=15,
                         look_for_keys=False, allow_agent=False,
                     )
+                elif normalized_auth_type == "arcos":
+                    try:
+                        SSHManager._connect_arcos(client, ip_address, port, username, credential)
+                    except paramiko.BadAuthenticationType as exc:
+                        if "password" not in getattr(exc, "allowed_types", []):
+                            raise
+                        client.connect(
+                            hostname=ip_address, port=port, username=username,
+                            password=credential, timeout=15,
+                            look_for_keys=False, allow_agent=False,
+                        )
+                else:
+                    raise paramiko.SSHException(f"Unsupported SSH auth type: {auth_type}")
             except Exception:
                 client.close()
                 raise
@@ -118,6 +172,8 @@ class SSHManager:
                 _, os_info, _ = SSHManager.exec_command(client, "cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"'")
                 return True, "Connection successful", os_info or None
         except paramiko.AuthenticationException:
+            if (auth_type or "").lower() == "arcos":
+                return False, "ARCOS authentication failed. Check the ARCOS password/token and interactive SSH policy.", None
             return False, "Authentication failed. Check credentials.", None
         except paramiko.SSHException as e:
             return False, f"SSH error: {e}", None

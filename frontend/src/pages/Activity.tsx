@@ -16,9 +16,10 @@ export default function ActivityPage() {
   const [kind, setKind] = useState<'all' | 'security' | 'config'>('all');
   const [query, setQuery] = useState('');
   const [page, setPage] = useState(0);
-  const [hasMore, setHasMore] = useState(false);
+  const [totalCount, setTotalCount] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const hasNext = (page + 1) * PAGE_SIZE < totalCount;
 
   useEffect(() => {
     getClusters()
@@ -39,12 +40,12 @@ export default function ActivityPage() {
           offset: page * PAGE_SIZE,
         });
         setEntries(resp.entries);
-        setHasMore(resp.has_more);
+        setTotalCount(resp.count);
       } catch (err: unknown) {
         const e = err as { response?: { data?: { detail?: string } } };
         setError(e.response?.data?.detail || 'Failed to load activity');
         setEntries([]);
-        setHasMore(false);
+        setTotalCount(0);
       } finally {
         setLoading(false);
       }
@@ -206,8 +207,8 @@ export default function ActivityPage() {
       {/* Pagination */}
       <div className="flex justify-between items-center mt-4 text-sm text-gray-600">
         <div>
-          Page {page + 1} · {entries.length} entries on this page
-          {hasMore && ' · more available'}
+          Page {page + 1} · {entries.length} entries on this page · {totalCount} total
+          {hasNext && ' · more available'}
         </div>
         <div className="flex gap-2">
           <button
@@ -219,7 +220,7 @@ export default function ActivityPage() {
           </button>
           <button
             onClick={() => setPage((p) => p + 1)}
-            disabled={!hasMore || loading}
+            disabled={!hasNext || loading}
             className="px-3 py-1.5 border rounded disabled:opacity-50"
           >
             Next

@@ -45,6 +45,27 @@ const fmtBytes = (b: number): string => {
 const fmtNum = (n: number): string =>
   n == null || isNaN(n) ? '—' : n >= 1000 ? n.toLocaleString(undefined, { maximumFractionDigits: 0 }) : n.toFixed(1);
 
+const validateExternalJmxEndpoints = (value: string): string | null => {
+  const endpoints = value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!endpoints.length) {
+    return 'Enter at least one broker JMX endpoint before deploying monitoring.';
+  }
+
+  for (const endpoint of endpoints) {
+    const [host, port] = endpoint.split(/:(?=[^:]*$)/);
+    const normalizedHost = host.replace(/^\[|\]$/g, '').toLowerCase();
+    const portNumber = Number(port);
+    if (!host || !port || !/^\d+$/.test(port) || portNumber < 1 || portNumber > 65535) {
+      return `JMX endpoint "${endpoint}" must be a valid host:port value.`;
+    }
+    if (normalizedHost === 'localhost' || normalizedHost === '0.0.0.0' || normalizedHost === '::1' || normalizedHost.startsWith('127.')) {
+      return `JMX endpoint "${endpoint}" points to the monitoring host itself. Use the broker IP/hostname reachable from the selected Tantor host.`;
+    }
+  }
+
+  return null;
+};
+
 /**
  * Per-cluster Monitoring tab — customer asked for detailed metrics inside the
  * cluster view, not on a global sidebar page. This component pulls a digest
@@ -71,7 +92,7 @@ export default function ClusterMonitoring({ clusterId, isExternal }: Props) {
   const [loading, setLoading] = useState(true);
   const [showDeploy, setShowDeploy] = useState(false);
   const [deployHost, setDeployHost] = useState('');
-  const [deployJmx, setDeployJmx] = useState('127.0.0.1:7071');
+  const [deployJmx, setDeployJmx] = useState('');
   const [deploying, setDeploying] = useState(false);
   const [deployResult, setDeployResult] = useState<string | null>(null);
 
@@ -85,6 +106,7 @@ export default function ClusterMonitoring({ clusterId, isExternal }: Props) {
         getFiringAlerts(clusterId).catch(() => ({ count: 0, alerts: [] })),
         getMonitoringSummary(clusterId).catch(() => ({ available: false })),
         getAlertIncidents(clusterId, undefined, 10).catch(() => []),
+        new Promise(resolve => setTimeout(resolve, 500)) // Ensure spinner is visible for at least 500ms
       ]);
       setStatus(s);
       setHosts(h);
@@ -109,6 +131,13 @@ export default function ClusterMonitoring({ clusterId, isExternal }: Props) {
 
   const onDeploy = async () => {
     if (!deployHost) return;
+    if (isExternal) {
+      const validationError = validateExternalJmxEndpoints(deployJmx);
+      if (validationError) {
+        setDeployResult(`error: ${validationError}`);
+        return;
+      }
+    }
     setDeploying(true);
     setDeployResult(null);
     try {
@@ -176,6 +205,7 @@ export default function ClusterMonitoring({ clusterId, isExternal }: Props) {
                   <input type="text" value={deployJmx} onChange={e => setDeployJmx(e.target.value)}
                     placeholder="broker1.acme.com:7071, broker2.acme.com:7071"
                     className="w-full px-2.5 py-1.5 border rounded text-sm font-mono" />
+                  <div className="text-[11px] text-amber-700 mt-1">Do not use localhost or 127.0.0.1; Prometheus runs on the selected Tantor host and must reach the broker address over the network.</div>
                   <div className="text-[11px] text-gray-500 mt-1">Your brokers must expose JMX (or JMX exporter) — Tantor doesn't own them.</div>
                 </div>
               )}
@@ -184,7 +214,7 @@ export default function ClusterMonitoring({ clusterId, isExternal }: Props) {
               )}
               <div className="flex justify-end gap-2">
                 <button onClick={() => setShowDeploy(false)} className="px-3 py-1.5 text-xs border rounded hover:bg-gray-50">Cancel</button>
-                <button onClick={onDeploy} disabled={deploying || !deployHost}
+                <button onClick={onDeploy} disabled={deploying || !deployHost || (isExternal && !deployJmx.trim())}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 text-white text-xs rounded-lg hover:bg-blue-700 disabled:opacity-50">
                   {deploying && <Loader2 size={14} className="animate-spin" />} Deploy
                 </button>
@@ -209,8 +239,8 @@ export default function ClusterMonitoring({ clusterId, isExternal }: Props) {
           <span className="text-sm text-green-700 inline-flex items-center gap-1">
             <CheckCircle2 size={14} /> deployed
           </span>
-          <button onClick={refresh} className="flex items-center gap-1.5 px-3 py-1.5 text-xs border rounded-lg hover:bg-gray-50">
-            <RefreshCw size={13} /> Refresh
+          <button onClick={refresh} disabled={loading} className="flex items-center gap-1.5 px-3 py-1.5 text-xs border rounded-lg hover:bg-gray-50 disabled:opacity-50">
+            <RefreshCw size={13} className={loading ? "animate-spin" : ""} /> Refresh
           </button>
         </div>
       </div>

@@ -52,3 +52,34 @@ def pre_restart_check(
         return rolling_restart_manager.get_pre_restart_check(cluster_id, db)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# ── External cluster rolling restart ────────────────────────────────────
+
+
+@router.post("/external/{cluster_id}")
+def start_external_rolling_restart(
+    cluster_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db), _: User = Depends(require_admin),
+):
+    """Start a rolling restart for an external cluster."""
+    task_id = str(uuid.uuid4())
+    init_restart_task(task_id)
+    background_tasks.add_task(
+        rolling_restart_manager.rolling_restart_external, cluster_id, task_id, db
+    )
+    return {"task_id": task_id, "status": "running"}
+
+
+@router.get("/external/{cluster_id}/pre-check")
+def pre_restart_check_external(
+    cluster_id: str, db: Session = Depends(get_db),
+    _: User = Depends(require_monitor_or_above),
+):
+    """Run pre-restart validation checks for an external cluster."""
+    try:
+        return rolling_restart_manager.get_pre_restart_check_external(cluster_id, db)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+

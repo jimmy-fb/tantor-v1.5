@@ -8,12 +8,27 @@ User=kafka
 Group=kafka
 Environment="JAVA_HOME={{ java_home }}"
 Environment="KAFKA_HEAP_OPTS={{ heap_opts | default('-Xmx1G -Xms1G') }}"
+{% if jvm_performance_opts %}
+Environment="KAFKA_JVM_PERFORMANCE_OPTS={{ jvm_performance_opts }}"
+{% endif %}
+{% if jmx_port %}
+Environment="JMX_PORT={{ jmx_port }}"
+{% endif %}
+{% if gc_logging_enabled %}
+Environment="KAFKA_GC_LOG_OPTS=-Xlog:gc*:file=/var/log/kafka/gc-connect.log:time,level,tags:filecount=10,filesize=10M"
+{% endif %}
 ExecStartPre=/bin/bash -c 'test -x {{ java_home }}/bin/java || (echo "JAVA_HOME invalid: {{ java_home }}" && exit 1)'
 ExecStart={{ kafka_home }}/bin/connect-distributed.sh {{ config_path }}
 Restart=on-failure
 RestartSec=10
 TimeoutStopSec=60
 LimitNOFILE=100000
+{% if cpu_quota %}
+CPUQuota={{ cpu_quota }}
+{% endif %}
+{% if memory_max %}
+MemoryMax={{ memory_max }}
+{% endif %}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=kafka-connect

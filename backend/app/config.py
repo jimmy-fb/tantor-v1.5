@@ -42,6 +42,16 @@ elif _DATA_DIR_ENV:
 else:
     _PROD_SECRETS = Path("/var/lib/tantor/secrets")
     _DATA_SECRETS = _PROD_SECRETS if _PROD_SECRETS.parent.exists() else (_BASE_DIR / ".secrets")
+    
+# _DATA_CERTS must be resolved in every branch — TANTOR_DATA is set by the
+# systemd unit in production, so the else branch above is never reached there.
+# Bug (pre-v1.4.5): _DATA_CERTS was only defined in the else branch, causing
+# NameError on production installs where TANTOR_DATA env var is set.
+if _DATA_DIR_ENV:
+    _DATA_CERTS = Path(_DATA_DIR_ENV) / "certs"
+else:
+    _PROD_CERTS = Path("/var/lib/tantor/certs")
+    _DATA_CERTS = _PROD_CERTS if _PROD_CERTS.parent.exists() else (_BASE_DIR / "certs")
 
 _DEFAULT_FERNET_KEY = _load_or_generate_key(_DATA_SECRETS / "fernet.key")
 _DEFAULT_JWT_KEY = _load_or_generate_key(_DATA_SECRETS / "jwt.key")
@@ -51,6 +61,7 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite:///./tantor.db"
     FERNET_KEY: str = _DEFAULT_FERNET_KEY
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost", "http://localhost:80"]
+    CERTS_DIR: str = str(_DATA_CERTS)
 
     # JWT Auth
     JWT_SECRET_KEY: str = _DEFAULT_JWT_KEY
@@ -103,5 +114,5 @@ class Settings(BaseSettings):
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
-
+#added this comment
 settings = Settings()

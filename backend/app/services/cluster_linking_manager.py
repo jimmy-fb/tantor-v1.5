@@ -1,4 +1,5 @@
 import logging
+import shlex
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -9,6 +10,7 @@ from app.models.cluster_link import ClusterLink
 from app.models.host import Host
 from app.models.service import Service
 from app.services.ssh_manager import SSHManager
+from app.services import cluster_paths
 
 logger = logging.getLogger("tantor.cluster_linking")
 
@@ -26,6 +28,7 @@ def init_link_task(task_id: str):
         "task_id": task_id,
         "status": "running",
         "logs": [],
+        "error_message": None,
     }
 
 
@@ -39,6 +42,14 @@ def _log(task_id: str, message: str):
         task["logs"].append(message)
     if message.strip():
         logger.info("[%s] %s", task_id[:8], message)
+
+
+def _fail_task(task_id: str, message: str):
+    task = _link_tasks.get(task_id)
+    if task is not None:
+        task["status"] = "error"
+        task["error_message"] = message
+    _log(task_id, f"ERROR: {message}")
 
 
 def _validate_bootstrap_address(addr: str) -> bool:
@@ -190,7 +201,7 @@ tasks.max = 4
     return config
 
 
-def _generate_systemd_unit() -> str:
+def _generate_systemd_unit(install_dir: str, config_path: str) -> str:
     """Generate systemd unit file for MirrorMaker 2."""
     return f"""[Unit]
 Description=Kafka MirrorMaker 2
@@ -199,13 +210,64 @@ After=network.target
 [Service]
 Type=simple
 User=kafka
-ExecStart={KAFKA_INSTALL_DIR}/bin/connect-mirror-maker.sh {MM2_CONFIG_PATH}
+ExecStart={install_dir}/bin/connect-mirror-maker.sh {config_path}
 Restart=on-failure
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def _mm2_paths_for_link(link: ClusterLink, db: Session) -> tuple[str, str]:
+    """Resolve the Kafka install/config path for the host running MM2."""
+    deploy_host_id = link.deploy_host_id
+    if deploy_host_id:
+        for cluster_id in (link.source_cluster_id, link.destination_cluster_id):
+            cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
+            if not cluster or (cluster.kind or "managed") == "external":
+                continue
+            svc = db.query(Service).filter(
+                Service.cluster_id == cluster_id,
+                Service.host_id == deploy_host_id,
+                Service.role.in_(["broker", "broker_controller"]),
+            ).first()
+            if svc:
+                install_dir = cluster_paths.install_dir(cluster)
+                return install_dir, f"{install_dir}/config/mm2.properties"
+    return KAFKA_INSTALL_DIR, MM2_CONFIG_PATH
+
+
+def _remote_write_mm2_config(client, content: str, remote_path: str, link_id: str) -> None:
+    """Write MM2 config through /tmp, then sudo-move into the final location."""
+    config_dir = remote_path.rsplit("/", 1)[0]
+    tmp_path = f"/tmp/tantor-mm2-{link_id[:8]}.properties"
+    SSHManager.upload_content(client, content, tmp_path)
+    cmd = (
+        f"sudo mkdir -p {shlex.quote(config_dir)} && "
+        f"sudo mv {shlex.quote(tmp_path)} {shlex.quote(remote_path)}"
+    )
+    exit_code, _, stderr = SSHManager.exec_command(client, cmd)
+    if exit_code != 0:
+        raise RuntimeError(f"Failed to install MM2 config at {remote_path}: {stderr or 'unknown error'}")
+
+
+def _validate_mm2_runtime(client, install_dir: str) -> None:
+    mm2_bin = f"{install_dir}/bin/connect-mirror-maker.sh"
+    exit_code, _, _ = SSHManager.exec_command(client, f"test -x {shlex.quote(mm2_bin)}")
+    if exit_code != 0:
+        raise RuntimeError(
+            f"MirrorMaker 2 binary not found or not executable at {mm2_bin}. "
+            "Choose a deploy host with Kafka installed, or deploy MM2 to a managed broker host."
+        )
+
+
+def _expected_mm2_connectors(link: ClusterLink) -> list[str]:
+    connectors = ["source->target.MirrorSourceConnector"]
+    if link.sync_consumer_offsets:
+        connectors.append("source->target.MirrorCheckpointConnector")
+    connectors.append("source->target.MirrorHeartbeatConnector")
+    return connectors
 
 
 class ClusterLinkingManager:
@@ -306,53 +368,54 @@ class ClusterLinkingManager:
         """Deploy MirrorMaker 2 on the target host. Runs as background task."""
         link = db.query(ClusterLink).filter(ClusterLink.id == link_id).first()
         if not link:
-            _log(task_id, "ERROR: Cluster link not found")
-            _link_tasks[task_id]["status"] = "error"
+            _fail_task(task_id, "Cluster link not found")
             return
 
         if not link.deploy_host_id:
-            _log(task_id, "ERROR: No deploy host configured for this link")
-            _link_tasks[task_id]["status"] = "error"
+            _fail_task(task_id, "No deploy host configured for this link")
             link.state = "error"
             db.commit()
             return
 
         host = db.query(Host).filter(Host.id == link.deploy_host_id).first()
         if not host:
-            _log(task_id, "ERROR: Deploy host not found")
-            _link_tasks[task_id]["status"] = "error"
+            _fail_task(task_id, "Deploy host not found")
             link.state = "error"
             db.commit()
             return
 
+        install_dir, mm2_config_path = _mm2_paths_for_link(link, db)
         _log(task_id, f"Deploying MirrorMaker 2 for link '{link.name}' on {host.hostname} ({host.ip_address})")
+        _log(task_id, f"Using Kafka install dir: {install_dir}")
 
         try:
             with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
+                _log(task_id, "Validating MirrorMaker 2 runtime")
+                _validate_mm2_runtime(client, install_dir)
+
                 # Step 1: Write MM2 config
-                _log(task_id, f"Writing MM2 config to {MM2_CONFIG_PATH}")
+                _log(task_id, f"Writing MM2 config to {mm2_config_path}")
                 mm2_config = link.mm2_config or ""
-                SSHManager.upload_content(client, mm2_config, MM2_CONFIG_PATH)
+                _remote_write_mm2_config(client, mm2_config, mm2_config_path, link.id)
                 _log(task_id, "MM2 config written successfully")
 
                 # Step 2: Set ownership
                 _log(task_id, "Setting file ownership")
-                exit_code, _, stderr = SSHManager.exec_command(client, f"sudo chown kafka:kafka {MM2_CONFIG_PATH}")
+                exit_code, _, stderr = SSHManager.exec_command(client, f"sudo chown kafka:kafka {shlex.quote(mm2_config_path)}")
                 if exit_code != 0:
                     _log(task_id, f"WARNING: Could not set ownership: {stderr}")
 
                 # Step 3: Create systemd unit
-                unit_content = _generate_systemd_unit()
+                unit_content = _generate_systemd_unit(install_dir, mm2_config_path)
                 unit_path = f"/etc/systemd/system/{MM2_SYSTEMD_UNIT}"
                 _log(task_id, f"Creating systemd unit: {unit_path}")
 
                 # Write unit file via temp then move with sudo
                 tmp_unit = "/tmp/mm2.service"
                 SSHManager.upload_content(client, unit_content, tmp_unit)
-                exit_code, _, stderr = SSHManager.exec_command(client, f"sudo mv {tmp_unit} {unit_path}")
+                exit_code, _, stderr = SSHManager.exec_command(client, f"sudo mv {shlex.quote(tmp_unit)} {shlex.quote(unit_path)}")
                 if exit_code != 0:
-                    _log(task_id, f"ERROR: Failed to install systemd unit: {stderr}")
-                    _link_tasks[task_id]["status"] = "error"
+                    _fail_task(task_id, f"Failed to install systemd unit: {stderr}")
                     link.state = "error"
                     db.commit()
                     return
@@ -373,8 +436,7 @@ class ClusterLinkingManager:
                 _log(task_id, "Starting MirrorMaker 2 service")
                 exit_code, _, stderr = SSHManager.exec_command(client, f"sudo systemctl start {MM2_SYSTEMD_UNIT}", timeout=60)
                 if exit_code != 0:
-                    _log(task_id, f"ERROR: Failed to start MirrorMaker 2: {stderr}")
-                    _link_tasks[task_id]["status"] = "error"
+                    _fail_task(task_id, f"Failed to start MirrorMaker 2: {stderr}")
                     link.state = "error"
                     db.commit()
                     return
@@ -396,7 +458,7 @@ class ClusterLinkingManager:
         except Exception as e:
             logger.exception("Failed to deploy MM2 for link %s", link_id)
             _log(task_id, f"FATAL ERROR: {e}")
-            _link_tasks[task_id]["status"] = "error"
+            _fail_task(task_id, str(e))
             link.state = "error"
 
         db.commit()
@@ -416,11 +478,13 @@ class ClusterLinkingManager:
             raise ValueError("Deploy host not found")
 
         try:
+            install_dir, mm2_config_path = _mm2_paths_for_link(link, db)
             with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
+                _validate_mm2_runtime(client, install_dir)
                 # Re-upload config in case it was updated
                 if link.mm2_config:
-                    SSHManager.upload_content(client, link.mm2_config, MM2_CONFIG_PATH)
-                    SSHManager.exec_command(client, f"sudo chown kafka:kafka {MM2_CONFIG_PATH}")
+                    _remote_write_mm2_config(client, link.mm2_config, mm2_config_path, link.id)
+                    SSHManager.exec_command(client, f"sudo chown kafka:kafka {shlex.quote(mm2_config_path)}")
 
                 exit_code, _, stderr = SSHManager.exec_command(client, f"sudo systemctl start {MM2_SYSTEMD_UNIT}", timeout=60)
                 if exit_code == 0:
@@ -567,12 +631,13 @@ class ClusterLinkingManager:
             host = db.query(Host).filter(Host.id == link.deploy_host_id).first()
             if host:
                 try:
+                    _, mm2_config_path = _mm2_paths_for_link(link, db)
                     with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
                         SSHManager.exec_command(client, f"sudo systemctl stop {MM2_SYSTEMD_UNIT}")
                         SSHManager.exec_command(client, f"sudo systemctl disable {MM2_SYSTEMD_UNIT}")
                         SSHManager.exec_command(client, f"sudo rm -f /etc/systemd/system/{MM2_SYSTEMD_UNIT}")
                         SSHManager.exec_command(client, "sudo systemctl daemon-reload")
-                        SSHManager.exec_command(client, f"sudo rm -f {MM2_CONFIG_PATH}")
+                        SSHManager.exec_command(client, f"sudo rm -f {shlex.quote(mm2_config_path)}")
                 except Exception:
                     pass  # Best effort cleanup
 
@@ -642,10 +707,12 @@ class ClusterLinkingManager:
             "link_id": link.id,
             "link_name": link.name,
             "state": link.state,
-            "connectors": [],
+            "connectors": _expected_mm2_connectors(link),
             "replication_lag": None,
             "throughput": None,
             "error": None,
+            "warnings": [],
+            "mode": "connect-mirror-maker",
         }
 
         if link.state != "running" or not link.deploy_host_id:
@@ -658,62 +725,49 @@ class ClusterLinkingManager:
             return metrics
 
         try:
+            install_dir, _ = _mm2_paths_for_link(link, db)
+            source_brokers = _get_broker_addresses(link.source_cluster_id, db)
+            source_bootstrap = ",".join(source_brokers)
             with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                # Query MM2 Connect REST API for connector status
-                rest_url = f"http://localhost:{link.mm2_port}"
-
-                # Get connectors list
-                exit_code, stdout, stderr = SSHManager.exec_command(
-                    client, f"curl -s {rest_url}/connectors", timeout=10
-                )
-                if exit_code == 0 and stdout:
-                    try:
-                        import json
-                        connectors = json.loads(stdout)
-                        metrics["connectors"] = connectors if isinstance(connectors, list) else []
-                    except (json.JSONDecodeError, ValueError):
-                        metrics["connectors"] = []
-
-                # Get connector statuses
-                connector_statuses = []
-                for connector_name in metrics["connectors"]:
-                    exit_code, stdout, _ = SSHManager.exec_command(
-                        client, f"curl -s {rest_url}/connectors/{connector_name}/status", timeout=10
-                    )
-                    if exit_code == 0 and stdout:
-                        try:
-                            import json
-                            status = json.loads(stdout)
-                            connector_statuses.append(status)
-                        except (json.JSONDecodeError, ValueError):
-                            pass
-
-                metrics["connector_statuses"] = connector_statuses
+                metrics["connector_statuses"] = [
+                    {"name": name, "connector": {"state": link.state.upper(), "worker_id": host.hostname}, "tasks": []}
+                    for name in metrics["connectors"]
+                ]
 
                 # Try to get lag information from consumer group offsets
                 # MM2 creates internal consumer groups for tracking
-                exit_code, stdout, stderr = SSHManager.exec_command(
-                    client,
-                    f"{KAFKA_INSTALL_DIR}/bin/kafka-consumer-groups.sh "
-                    f"--bootstrap-server localhost:9092 --list",
-                    timeout=15,
-                )
-                if exit_code == 0:
-                    groups = [g for g in stdout.strip().split("\n") if g.strip()]
-                    mm2_groups = [g for g in groups if "mirror" in g.lower() or "mm2" in g.lower()]
-                    metrics["mm2_consumer_groups"] = mm2_groups
+                if source_bootstrap:
+                    consumer_groups_bin = f"{install_dir}/bin/kafka-consumer-groups.sh"
+                    exit_code, stdout, stderr = SSHManager.exec_command(
+                        client,
+                        f"{shlex.quote(consumer_groups_bin)} "
+                        f"--bootstrap-server {shlex.quote(source_bootstrap)} --list",
+                        timeout=15,
+                    )
+                    if exit_code == 0:
+                        groups = [g for g in stdout.strip().split("\n") if g.strip()]
+                        mm2_markers = {"mirror", "mm2", "source", "target", link.name.lower()}
+                        mm2_groups = [
+                            g for g in groups
+                            if any(marker and marker in g.lower() for marker in mm2_markers)
+                        ]
+                        metrics["mm2_consumer_groups"] = mm2_groups
 
-                    # Get lag for first MM2 group if any
-                    total_lag = 0
-                    if mm2_groups:
-                        exit_code, stdout, _ = SSHManager.exec_command(
-                            client,
-                            f"{KAFKA_INSTALL_DIR}/bin/kafka-consumer-groups.sh "
-                            f"--bootstrap-server localhost:9092 "
-                            f"--describe --group {mm2_groups[0]}",
-                            timeout=15,
-                        )
-                        if exit_code == 0 and stdout:
+                        # Get lag for every MM2 group we can identify.
+                        total_lag = 0
+                        described_any = False
+                        for group in mm2_groups:
+                            exit_code, stdout, stderr = SSHManager.exec_command(
+                                client,
+                                f"{shlex.quote(consumer_groups_bin)} "
+                                f"--bootstrap-server {shlex.quote(source_bootstrap)} "
+                                f"--describe --group {shlex.quote(group)}",
+                                timeout=15,
+                            )
+                            if exit_code != 0:
+                                metrics["warnings"].append(f"Could not describe MM2 group {group}: {stderr or stdout}")
+                                continue
+                            described_any = True
                             for line in stdout.strip().split("\n")[1:]:  # Skip header
                                 parts = line.split()
                                 if len(parts) >= 6:
@@ -722,7 +776,12 @@ class ClusterLinkingManager:
                                         total_lag += lag
                                     except (ValueError, IndexError):
                                         pass
+                        if described_any:
                             metrics["replication_lag"] = total_lag
+                    else:
+                        metrics["warnings"].append(f"Could not list source consumer groups at {source_bootstrap}: {stderr or stdout}")
+                else:
+                    metrics["warnings"].append("Source bootstrap servers could not be resolved for lag metrics")
 
                 # Check MM2 service uptime as throughput proxy
                 exit_code, stdout, _ = SSHManager.exec_command(

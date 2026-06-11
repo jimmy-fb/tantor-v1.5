@@ -37,6 +37,33 @@ const blankForm = (): FormState => ({
   ssl_key_pem: '',
 });
 
+const validateBootstrapServers = (value: string): string | null => {
+  const servers = value.split(',').map((s) => s.trim()).filter(Boolean);
+  if (!servers.length) {
+    return 'Bootstrap servers are required';
+  }
+
+  for (const server of servers) {
+    if (!server.includes(':')) {
+      return `Bootstrap server "${server}" must include a port, for example ${server}:9092`;
+    }
+    if (server.includes(':') && server.split(':').length > 2 && !server.startsWith('[')) {
+      return `Bootstrap server "${server}" must use [ipv6]:port format for IPv6 addresses`;
+    }
+
+    const [host, port] = server.split(/:(?=[^:]*$)/);
+    if (server.startsWith('[') && !host.endsWith(']')) {
+      return `Bootstrap server "${server}" must use [ipv6]:port format for IPv6 addresses`;
+    }
+    const portNumber = Number(port);
+    if (!host || !port || !/^\d+$/.test(port) || portNumber < 1 || portNumber > 65535) {
+      return `Bootstrap server "${server}" must include a valid port between 1 and 65535`;
+    }
+  }
+
+  return null;
+};
+
 export default function ExternalClustersPage() {
   const admin = isAdmin();
   const [list, setList] = useState<ExternalCluster[]>([]);
@@ -45,9 +72,6 @@ export default function ExternalClustersPage() {
   const [error, setError] = useState('');
   const [info, setInfo] = useState('');
   const [topicsByCluster, setTopicsByCluster] = useState<Record<string, string[]>>({});
-  // v1.4.3 #12 — per-cluster button loading state. Was missing,
-  // so the Test / List Topics buttons "felt broken" because they
-  // gave no feedback while the kafka-python AdminClient probed.
   const [testingCluster, setTestingCluster] = useState<string | null>(null);
   const [listingCluster, setListingCluster] = useState<string | null>(null);
 
@@ -55,7 +79,11 @@ export default function ExternalClustersPage() {
     setLoading(true);
     setError('');
     try {
-      setList(await listExternalClusters());
+      const [data] = await Promise.all([
+        listExternalClusters(),
+        new Promise(r => setTimeout(r, 500)) // Ensure spinner is visible for at least 500ms
+      ]);
+      setList(data);
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string } } };
       setError(err.response?.data?.detail || 'Failed to load');
@@ -86,8 +114,13 @@ export default function ExternalClustersPage() {
 
   const onSave = async () => {
     if (!editing) return;
-    if (!editing.name.trim() || !editing.bootstrap_servers.trim()) {
-      setError('Name and bootstrap_servers are required');
+    if (!editing.name.trim()) {
+      setError('Display name is required');
+      return;
+    }
+    const bootstrapError = validateBootstrapServers(editing.bootstrap_servers);
+    if (bootstrapError) {
+      setError(bootstrapError);
       return;
     }
     setError('');
@@ -293,7 +326,8 @@ export default function ExternalClustersPage() {
       {editing && (
         <ConnectModal
           form={editing}
-          onChange={(p) => setEditing({ ...editing, ...p })}
+          error={error}
+          onChange={(p) => { setError(''); setEditing({ ...editing, ...p }); }}
           onClose={() => { setEditing(null); setError(''); setInfo(''); }}
           onSave={onSave}
           onTest={onTestUnsaved}
@@ -304,9 +338,10 @@ export default function ExternalClustersPage() {
 }
 
 function ConnectModal({
-  form, onChange, onClose, onSave, onTest,
+  form, error, onChange, onClose, onSave, onTest,
 }: {
   form: FormState;
+  error: string;
   onChange: (p: Partial<FormState>) => void;
   onClose: () => void;
   onSave: () => void;
@@ -322,6 +357,11 @@ function ConnectModal({
           <button onClick={onClose} className="text-gray-400 hover:text-gray-600"><X size={18} /></button>
         </div>
         <div className="p-6 space-y-3">
+          {error && (
+            <div className="bg-red-50 border border-red-200 text-red-700 px-3 py-2 rounded text-sm">
+              {error}
+            </div>
+          )}
           <div>
             <label className="block text-xs font-medium text-gray-700 mb-1">Display name</label>
             <input value={form.name} onChange={(e) => onChange({ name: e.target.value })}
@@ -332,6 +372,7 @@ function ConnectModal({
             <input value={form.bootstrap_servers} onChange={(e) => onChange({ bootstrap_servers: e.target.value })}
               className="w-full px-3 py-2 border rounded text-sm font-mono"
               placeholder="broker-1.example.com:9092,broker-2.example.com:9092" />
+            <p className="mt-1 text-[11px] text-gray-500">Each server must include a port, for example broker.example.com:9092.</p>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>

@@ -249,21 +249,46 @@ export const getMonitoringSummary = (clusterId: string) =>
   api.get<MonitoringSummary>(`/monitoring/clusters/${clusterId}/summary`).then(r => r.data);
 
 // Data Federation — single pane across all clusters
+export interface FederationCluster {
+  id: string;
+  name: string;
+  kind: 'managed' | 'external';
+  state: string;
+  environment: string;
+  kafka_version: string;
+  mode: string;
+  broker_count: number | null;
+  topic_count: number | null;
+  bootstrap_servers: string | null;
+}
+export interface FederationMatch {
+  cluster_id: string;
+  cluster_name: string;
+  cluster_kind: 'managed' | 'external';
+  environment: string;
+  topic: string;
+  partitions: number;
+  replication_factor: number;
+}
 export const getFederationOverview = () =>
-  api.get<{ clusters: any[]; total: number; managed: number; external: number }>('/federation/overview').then(r => r.data);
+  api.get<{ clusters: FederationCluster[]; total: number; managed: number; external: number }>('/federation/overview').then(r => r.data);
 export const federationTopicSearch = (q: string) =>
-  api.get<{ query: string; matches: any[]; match_count: number; skipped: Array<{ cluster_id: string; name: string; reason: string }> }>(
+  api.get<{ query: string; matches: FederationMatch[]; match_count: number; skipped: Array<{ cluster_id: string; name: string; reason: string }> }>(
     `/federation/topics/search?q=${encodeURIComponent(q)}`
   ).then(r => r.data);
 
 // External cluster SSH-based lifecycle (start/stop/restart)
 export const getExternalBrokerHosts = (clusterId: string) =>
-  api.get<Array<{ host_id: string; kafka_unit: string; hostname?: string; ip_address?: string; online?: boolean }>>(
+  api.get<Array<{ host_id: string; kafka_unit: string; broker_id?: number | null; hostname?: string; ip_address?: string; online?: boolean }>>(
     `/external-clusters/${clusterId}/broker-hosts`,
   ).then(r => r.data);
-export const setExternalBrokerHosts = (clusterId: string, hosts: Array<{ host_id: string; kafka_unit: string }>) =>
-  api.put<Array<{ host_id: string; kafka_unit: string; hostname?: string; ip_address?: string; online?: boolean }>>(
+export const setExternalBrokerHosts = (clusterId: string, hosts: Array<{ host_id: string; kafka_unit: string; broker_id?: number | null }>) =>
+  api.put<Array<{ host_id: string; kafka_unit: string; broker_id?: number | null; hostname?: string; ip_address?: string; online?: boolean }>>(
     `/external-clusters/${clusterId}/broker-hosts`, { hosts },
+  ).then(r => r.data);
+export const getExternalLiveBrokers = (clusterId: string) =>
+  api.get<Array<{ node_id: number; host: string; port: number; rack?: string | null }>>(
+    `/external-clusters/${clusterId}/live-brokers`,
   ).then(r => r.data);
 export const externalLifecycleAction = (clusterId: string, action: 'start' | 'stop' | 'restart') =>
   api.post<{ results: Array<{ host_id: string; hostname?: string; kafka_unit?: string; exit_code?: number; ok: boolean; message: string }> }>(
@@ -614,7 +639,7 @@ export const downloadCaCertUrl = (clusterId: string) =>
   `/api/clusters/${clusterId}/security/tls/ca`;
 export const listClientCerts = (clusterId: string) =>
   api.get<ClientCertSummary[]>(`/clusters/${clusterId}/security/tls/clients`).then(r => r.data);
-export const issueClientCert = (clusterId: string, common_name: string, ttl_days = 365) =>
-  api.post<ClientCertBundle>(`/clusters/${clusterId}/security/tls/clients`, { common_name, ttl_days }).then(r => r.data);
+export const issueClientCert = (clusterId: string, common_name: string, ttl_days = 365, force_rotate = false) =>
+  api.post<ClientCertBundle>(`/clusters/${clusterId}/security/tls/clients`, { common_name, ttl_days, force_rotate }).then(r => r.data);
 export const revokeClientCert = (clusterId: string, common_name: string) =>
   api.delete(`/clusters/${clusterId}/security/tls/clients/${encodeURIComponent(common_name)}`).then(r => r.data);

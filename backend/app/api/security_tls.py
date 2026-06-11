@@ -49,6 +49,7 @@ class TLSToggleRequest(BaseModel):
 class ClientCertCreate(BaseModel):
     common_name: str = Field(min_length=1, max_length=120)
     ttl_days: int = Field(default=365, ge=1, le=3650)
+    force_rotate: bool = False
 
 
 class ClientCertSummary(BaseModel):
@@ -139,7 +140,9 @@ def issue_client_cert(
     if not cluster.ssl_enabled:
         raise HTTPException(status_code=400, detail="Enable SSL on the cluster first")
     try:
-        bundle = cert_manager.issue_client_cert(cluster, db, body.common_name, body.ttl_days)
+        bundle = cert_manager.issue_client_cert(
+            cluster, db, body.common_name, body.ttl_days, force_rotate=body.force_rotate
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return ClientCertBundle(**bundle)

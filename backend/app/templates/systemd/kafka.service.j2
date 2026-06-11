@@ -15,6 +15,15 @@ Environment="KAFKA_HEAP_OPTS={{ heap_opts | default('-Xmx1G -Xms1G') }}"
 # log4j-1.x bridge.
 Environment="KAFKA_LOG4J_OPTS=-Dlog4j2.configurationFile=file:{{ kafka_home }}/config/log4j2.yaml"
 Environment="LOG_DIR={{ kafka_log_dir | default('/var/log/kafka') }}"
+{% if jvm_performance_opts %}
+Environment="KAFKA_JVM_PERFORMANCE_OPTS={{ jvm_performance_opts }}"
+{% endif %}
+{% if jmx_port %}
+Environment="JMX_PORT={{ jmx_port }}"
+{% endif %}
+{% if gc_logging_enabled %}
+Environment="KAFKA_GC_LOG_OPTS=-Xlog:gc*:file={{ kafka_log_dir | default('/var/log/kafka') }}/gc.log:time,level,tags:filecount=10,filesize=10M"
+{% endif %}
 ExecStartPre=/bin/bash -c 'test -x {{ java_home }}/bin/java || (echo "JAVA_HOME invalid: {{ java_home }}" && exit 1)'
 ExecStart={{ kafka_home }}/bin/kafka-server-start.sh {{ config_path }}
 ExecStop={{ kafka_home }}/bin/kafka-server-stop.sh
@@ -23,6 +32,12 @@ RestartSec=10
 TimeoutStopSec=60
 LimitNOFILE=100000
 LimitNPROC=8192
+{% if cpu_quota %}
+CPUQuota={{ cpu_quota }}
+{% endif %}
+{% if memory_max %}
+MemoryMax={{ memory_max }}
+{% endif %}
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=kafka

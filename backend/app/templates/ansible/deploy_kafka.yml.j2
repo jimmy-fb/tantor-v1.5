@@ -28,9 +28,9 @@
       when: ansible_os_family == "Debian"
 
     - name: Install Java (RHEL/Rocky/CentOS)
-      dnf:
-        name: java-17-openjdk-headless
-        state: present
+      command: dnf install -y java-17-openjdk-headless --disablerepo=pgdg13
+      register: java_install_rhel
+      changed_when: "'already installed' not in java_install_rhel.stdout"
       when: ansible_os_family == "RedHat"
 
     # ── Discover real JAVA_HOME (critical: don't trust env vars) ─────
@@ -391,7 +391,7 @@
       command: systemctl is-active {{ kafka_unit_name }}
       register: kafka_status
       changed_when: false
-      failed_when: kafka_status.stdout != "active"
+      failed_when: kafka_status.stdout not in ["active", "activating"]
 {% endif %}
 
 {% if has_controllers %}
@@ -453,7 +453,7 @@
     - name: Upload systemd unit
       copy:
         src: "{{ systemd_dir }}/{{ '{{' }} ansible_host {{ '}}' }}_{{ '{{' }} node_id {{ '}}' }}_kafka-kraft-controller.service"
-        dest: /etc/systemd/system/kafka-kraft-controller.service
+        dest: /etc/systemd/system/{{ kafka_unit_name }}
         mode: "0644"
 
     - name: Reload systemd
@@ -472,7 +472,7 @@
 
     - name: Enable and start controller
       systemd:
-        name: kafka-kraft-controller
+        name: "{{ kafka_unit_name }}"
         enabled: true
         state: started
 
@@ -484,7 +484,7 @@
         delay: 5
 
     - name: Verify controller process is running
-      command: systemctl is-active kafka-kraft-controller
+      command: systemctl is-active {{ kafka_unit_name }}
       register: ctrl_status
       changed_when: false
       failed_when: ctrl_status.stdout != "active"

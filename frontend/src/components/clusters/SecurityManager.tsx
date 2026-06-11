@@ -11,7 +11,7 @@ import type {
 import {
   getKafkaUsers, createKafkaUser, deleteKafkaUser, rotateKafkaUserPassword,
   getAcls, createAcl, deleteAcl,
-  getAuditLog,
+  getAuditLog, getExternalBrokerHosts,
 } from '../../lib/api';
 import axios from 'axios';
 import { getAccessToken } from '../../lib/auth';
@@ -91,6 +91,12 @@ export default function SecurityManager({ clusterId, isExternal = false }: Props
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditFilter, setAuditFilter] = useState('');
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
+
+  // ── External cluster SSH broker hosts (v1.4.5) ──
+  // When isExternal=true we check whether the operator has registered SSH
+  // broker hosts on the Lifecycle tab. If yes we enable full SCRAM management
+  // (via SSH fallback). If not we show a prompt to register them.
+  const [sshHostsRegistered, setSshHostsRegistered] = useState<boolean | null>(null); // null = loading
 
   // ── Certificates state (v1.4.0 #8) ──
   const [certs, setCerts] = useState<CertSummary | null>(null);
@@ -194,6 +200,16 @@ export default function SecurityManager({ clusterId, isExternal = false }: Props
       setUploading(false);
     }
   };
+
+  // On mount — if this is an external cluster, check for registered SSH hosts.
+  // This drives the conditional SCRAM UI (full UI vs "register hosts" prompt).
+  useEffect(() => {
+    if (isExternal) {
+      getExternalBrokerHosts(clusterId)
+        .then(hosts => setSshHostsRegistered(Array.isArray(hosts) && hosts.length > 0))
+        .catch(() => setSshHostsRegistered(false));
+    }
+  }, [clusterId, isExternal]);
 
   useEffect(() => {
     if (activeTab === 'users') fetchUsers();
@@ -451,10 +467,14 @@ export default function SecurityManager({ clusterId, isExternal = false }: Props
           <div className="flex items-center gap-2 mb-4">
             <button
               onClick={() => { setShowCreateUser(true); setCreatedUser(null); setRotatedResult(null); }}
-              disabled={isExternal}
-              title={isExternal
-                ? 'SCRAM user admin not supported for externally-connected clusters — kafka-python AdminClient gap. Manage users on the source cluster.'
-                : ''}
+              disabled={isExternal && sshHostsRegistered !== true}
+              title={
+                isExternal && sshHostsRegistered === false
+                  ? 'Register SSH broker hosts on the Lifecycle tab to enable SCRAM management'
+                  : isExternal && sshHostsRegistered === null
+                  ? 'Checking broker host configuration...'
+                  : ''
+              }
               className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Plus size={14} /> Create User
@@ -467,11 +487,45 @@ export default function SecurityManager({ clusterId, isExternal = false }: Props
               <RefreshCw size={14} className={usersLoading ? 'animate-spin' : ''} /> Refresh
             </button>
           </div>
-          {isExternal && (
-            <div className="mb-4 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 px-3">
-              ⓘ SCRAM user creation, deletion and password rotation are not supported on
-              externally-connected clusters (kafka-python AdminClient gap). Manage users
-              directly on your source cluster via <code className="bg-white px-1 rounded">kafka-configs.sh</code>.
+          {/* Three-state SCRAM banner for external clusters:
+               null  = still loading SSH host info
+               true  = SSH hosts registered → full SCRAM via SSH enabled
+               false = no SSH hosts → guide operator to Lifecycle tab */}
+          {isExternal && sshHostsRegistered === null && (
+            <div className="mb-4 p-3 bg-gray-50 border border-gray-200 rounded-xl text-xs text-gray-500">
+              Checking broker host configuration...
+            </div>
+          )}
+
+          {isExternal && sshHostsRegistered === true && (
+            <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-xl">
+              <p className="text-xs text-green-800">
+                SSH broker hosts are registered for this cluster. SCRAM user management
+                is fully available — Tantor runs{' '}
+                <code className="bg-white px-1 rounded font-mono">kafka-configs.sh</code>{' '}
+                over SSH on your broker host to create, rotate, and delete users.
+              </p>
+            </div>
+          )}
+
+          {isExternal && sshHostsRegistered === false && (
+            <div className="mb-4 p-4 bg-amber-50 border border-amber-200 rounded-xl">
+              <p className="text-sm font-semibold text-amber-900 mb-1">
+                Register SSH broker hosts to enable SCRAM management
+              </p>
+              <p className="text-xs text-amber-800 mb-2">
+                Tantor can manage SCRAM users on external clusters by running{' '}
+                <code className="bg-white px-1 rounded font-mono">kafka-configs.sh</code>{' '}
+                over SSH — but no broker hosts have been registered yet.
+                Go to the <strong>Lifecycle tab</strong> and add at least one broker host,
+                then return here to manage users from the UI.
+              </p>
+              <p className="text-xs text-amber-700 mb-1">
+                Alternatively, manage users directly on the broker:
+              </p>
+              <pre className="text-xs bg-white border border-amber-100 rounded p-2 font-mono text-gray-700 overflow-x-auto whitespace-pre-wrap">
+{`kafka-configs.sh --bootstrap-server <host>:<port> --alter --add-config 'SCRAM-SHA-512=[password=<pass>]' --entity-type users --entity-name <username>`}
+              </pre>
             </div>
           )}
 
@@ -655,6 +709,20 @@ export default function SecurityManager({ clusterId, isExternal = false }: Props
       {/* ══════════ ACLS TAB ══════════ */}
       {activeTab === 'acls' && (
         <div>
+          {/* External cluster info banner */}
+          {isExternal && (
+            <div className="mb-4 p-3 bg-green-50 border border-green-200 rounded-xl">
+              <p className="text-xs text-green-800">
+                ACL management is fully supported for external clusters via the Kafka AdminClient API
+                (no SSH required). List, create, and delete ACLs directly from this panel.
+                Changes take effect on the remote cluster immediately.
+                Note: the broker must have an ACL authorizer configured —
+                if you see an error, enable <code className="bg-white px-1 rounded font-mono">authorizer.class.name</code> in
+                server.properties.
+              </p>
+            </div>
+          )}
+
           {/* Error banner */}
           {aclsError && (
             <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4 text-sm text-red-700">

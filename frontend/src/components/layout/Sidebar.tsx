@@ -25,7 +25,7 @@ export default function Sidebar() {
     { to: '/clusters', icon: Network, label: 'Clusters' },
     { to: '/clusters/new', icon: Plus, label: 'New Cluster', adminOnly: true },
     { to: '/external-clusters', icon: Plug, label: 'External Clusters' },
-    { to: '/federation', icon: Globe2, label: 'Federation' },
+    { to: '/federation', icon: Globe2, label: 'Cluster Overview' },
     { to: '/versions', icon: Package, label: 'Kafka Versions' },
     // v1.4.0 #2 — Schema Registry now lives per-cluster (Cluster → Schema tab).
     // The standalone sidebar entry was misleading because schemas are inherently

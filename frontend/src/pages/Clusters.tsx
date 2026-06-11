@@ -87,7 +87,7 @@ export default function Clusters() {
   }, []);
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Delete this cluster? This does not stop running services.')) return;
+    if (!confirm('Delete this cluster? Tantor will stop deployed services and release their ports first.')) return;
     await deleteCluster(id);
     fetchClusters();
   };
@@ -99,7 +99,7 @@ export default function Clusters() {
     try {
       await deployCluster(cluster.id);
       fetchClusters();
-    } catch (e) {
+    } catch {
       alert('Retry failed — check the deploy log under Cluster Detail.');
     } finally {
       setRetrying(null);

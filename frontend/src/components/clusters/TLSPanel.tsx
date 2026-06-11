@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Lock, Download, Plus, Trash2, AlertCircle, ShieldCheck, RefreshCw, Copy } from 'lucide-react';
 import {
   getTlsState, setTlsState, listClientCerts, issueClientCert, revokeClientCert,
@@ -19,7 +19,7 @@ export default function TLSPanel({ clusterId, clusterRunning }: Props) {
   const [newCertCN, setNewCertCN] = useState('');
   const [newCertTtl, setNewCertTtl] = useState(365);
 
-  const reload = async () => {
+  const reload = useCallback(async () => {
     try {
       const [s, cs] = await Promise.all([getTlsState(clusterId), listClientCerts(clusterId).catch(() => [])]);
       setState(s); setCerts(cs);
@@ -27,9 +27,9 @@ export default function TLSPanel({ clusterId, clusterRunning }: Props) {
       const err = e as { response?: { data?: { detail?: string } } };
       setError(err.response?.data?.detail || 'Failed to load TLS state');
     }
-  };
+  }, [clusterId]);
 
-  useEffect(() => { reload(); }, [clusterId]);
+  useEffect(() => { reload(); }, [reload]);
 
   const toggle = async (ssl: boolean, mtls: boolean) => {
     setError(''); setInfo('');
@@ -51,12 +51,32 @@ export default function TLSPanel({ clusterId, clusterRunning }: Props) {
     if (!newCertCN.trim()) { setError('Common name is required'); return; }
     setIssuing(true); setError('');
     try {
-      const b = await issueClientCert(clusterId, newCertCN.trim(), newCertTtl);
+      const b = await issueClientCert(clusterId, newCertCN.trim(), newCertTtl, false);
       setBundle(b); setNewCertCN(''); await reload();
     } catch (e: unknown) {
       const err = e as { response?: { data?: { detail?: string } } };
       setError(err.response?.data?.detail || 'Issue failed');
     } finally { setIssuing(false); }
+  };
+
+  const rotate = async (cn: string) => {
+    const rawTtl = prompt(`Rotate certificate for "${cn}"? Enter TTL in days:`, '365');
+    if (!rawTtl) return;
+    const ttl = parseInt(rawTtl, 10);
+    if (isNaN(ttl) || ttl < 1 || ttl > 3650) {
+      setError('Invalid TTL for rotation. Must be between 1 and 3650 days.');
+      return;
+    }
+    setError(''); setInfo('');
+    try {
+      const b = await issueClientCert(clusterId, cn, ttl, true);
+      setBundle(b);
+      await reload();
+      setInfo(`Successfully rotated certificate for "${cn}". Download the new bundle below.`);
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } } };
+      setError(err.response?.data?.detail || 'Rotation failed');
+    }
   };
 
   const revoke = async (cn: string) => {
@@ -175,7 +195,7 @@ export default function TLSPanel({ clusterId, clusterRunning }: Props) {
                   <th className="px-3 py-2 w-[180px]">Issued</th>
                   <th className="px-3 py-2 w-[180px]">Expires</th>
                   <th className="px-3 py-2 w-[120px]">Serial</th>
-                  {admin && <th className="px-3 py-2 w-[80px]"></th>}
+                  {admin && <th className="px-3 py-2 w-[110px]"></th>}
                 </tr>
               </thead>
               <tbody>
@@ -189,9 +209,15 @@ export default function TLSPanel({ clusterId, clusterRunning }: Props) {
                     <td className="px-3 py-2 text-xs text-gray-600">{new Date(c.expires_at).toLocaleString()}</td>
                     <td className="px-3 py-2 font-mono text-xs text-gray-500 truncate">{c.serial_number.slice(0, 16)}…</td>
                     {admin && (
-                      <td className="px-3 py-2">
+                      <td className="px-3 py-2 text-right space-x-1">
+                        <button onClick={() => rotate(c.common_name)}
+                          title="Rotate certificate (replace with a new one)"
+                          className="px-2 py-1 text-xs border rounded text-blue-600 hover:bg-blue-50 inline-flex items-center">
+                          <RefreshCw size={12} />
+                        </button>
                         <button onClick={() => revoke(c.common_name)}
-                          className="px-2 py-1 text-xs border rounded text-red-600 hover:bg-red-50">
+                          title="Revoke certificate"
+                          className="px-2 py-1 text-xs border rounded text-red-600 hover:bg-red-50 inline-flex items-center">
                           <Trash2 size={12} />
                         </button>
                       </td>

@@ -84,6 +84,31 @@ def list_acls(
         return AclListResponse(acls=acls, count=len(acls))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        err = str(e)
+        # Kafka returns a TopicAuthorizationFailedException or
+        # ClusterAuthorizationException when the ACL authorizer is not
+        # configured on the broker (common on default installs) or when
+        # the connecting user lacks the DescribeAcls permission.
+        # Return a clean 400 instead of a 500 so the UI can show a
+        # helpful message rather than "Internal server error".
+        acl_keywords = (
+            "ClusterAuthorization", "SecurityDisabled",
+            "PolicyViolation", "AuthorizationException",
+            "authorizer", "SECURITY_DISABLED", "acl",
+            "NoBrokersAvailable", "KafkaConnectionError",
+        )
+        if any(k.lower() in err.lower() for k in acl_keywords):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "ACLs are not enabled on this cluster. "
+                    "Set 'authorizer.class.name=org.apache.kafka.metadata.authorizer.StandardAuthorizer' "
+                    "in server.properties and restart the broker to enable ACL support. "
+                    f"Broker error: {err}"
+                ),
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to list ACLs: {err}")
 
 
 @router.post("/acls", response_model=AclCreateResponse)

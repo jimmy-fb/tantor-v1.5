@@ -17,6 +17,7 @@ from app.schemas.cluster import (
 from app.schemas.service import ServiceActionResponse
 from app.services.deployer import deploy_cluster, get_task, init_task, deploy_schema_registry
 from app.services.cluster_manager import cluster_manager
+from app.services.ssh_manager import ssh_manager
 from app.api.deps import require_admin, require_monitor_or_above
 from app.models.user import User
 
@@ -42,10 +43,25 @@ def create_cluster(data: ClusterCreate, db: Session = Depends(get_db), _: User =
     db.add(cluster)
     db.flush()  # populate cluster.id before path assignment
 
-    # v1.2.0 #5 — give every new cluster its own Kafka install dir,
-    # data dir, and systemd unit name so two clusters on the same broker
-    # host coexist instead of stomping on /opt/kafka + kafka.service.
+    # ── Custom deploy paths (v1.4.5) ─────────────────────────────────────
+    # The operator may supply explicit kafka_install_dir / kafka_data_dir in
+    # ClusterConfig. Pydantic already validated them (absolute path, safe
+    # chars, no traversal). We write them to the Cluster row NOW, before
+    # assign_paths_for_new_cluster() runs, so the idempotency guard
+    # ("if not cluster.kafka_install_dir") preserves the operator's values
+    # instead of auto-deriving from the UUID.
+    #
+    # Validators normalise empty strings to None, so a truthy check is safe.
     from app.services import cluster_paths
+    if data.config.kafka_install_dir:
+        cluster.kafka_install_dir = data.config.kafka_install_dir
+    if data.config.kafka_data_dir:
+        cluster.kafka_data_dir = data.config.kafka_data_dir
+
+    # v1.2.0 #5 — give every new cluster its own Kafka install dir, data dir,
+    # and systemd unit name so two clusters on the same broker host coexist
+    # instead of stomping on /opt/kafka + kafka.service.
+    # Any columns set above are left untouched (idempotent).
     cluster_paths.assign_paths_for_new_cluster(cluster)
 
     for svc_data in data.services:
@@ -59,6 +75,19 @@ def create_cluster(data: ClusterCreate, db: Session = Depends(get_db), _: User =
 
     db.commit()
     db.refresh(cluster)
+
+    # Stash initial_acls so the deployer can apply them after broker starts.
+    # Done here at creation so start_deployment() needs no request body.
+    if data.initial_acls:
+        # We don't have a task_id yet — store on the cluster row instead.
+        # Use config_json as the carrier: add "_initial_acls" key (stripped
+        # by deployer after first use so it doesn't linger).
+        import json as _json
+        cfg = _json.loads(cluster.config_json or "{}")
+        cfg["_initial_acls"] = [a.model_dump() for a in data.initial_acls]
+        cluster.config_json = _json.dumps(cfg)
+        db.commit()
+
     return cluster
 
 
@@ -73,6 +102,8 @@ def get_cluster(cluster_id: str, db: Session = Depends(get_db), _: User = Depend
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
     services = db.query(Service).filter(Service.cluster_id == cluster_id).all()
+    if cluster_manager.sync_cluster_state_from_services(cluster, services):
+        db.commit()
 
     # v1.2.0 #7: external clusters had an empty Overview tab because they
     # have no Service rows. Synthesize one row per broker by calling
@@ -109,6 +140,21 @@ def delete_cluster(cluster_id: str, db: Session = Depends(get_db), _: User = Dep
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
+
+    # Stop every unit the cluster owns and verify its ports are free before the
+    # DB row disappears. Otherwise the UI says "deleted" while Kafka/ksqlDB/etc.
+    # keep holding ports and the next deploy fails with a bind conflict.
+    cleanup = cluster_manager.cleanup_cluster(cluster_id, db, remove_units=True)
+    failures = [r for r in cleanup if not r.get("success")]
+    if failures:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Cluster cleanup failed; not deleting while services may still be running",
+                "failures": failures,
+            },
+        )
+
     db.query(Service).filter(Service.cluster_id == cluster_id).delete()
     db.delete(cluster)
     db.commit()
@@ -140,7 +186,12 @@ def patch_cluster(
 
 
 @router.post("/{cluster_id}/deploy", response_model=DeploymentTaskResponse)
-def start_deployment(cluster_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def start_deployment(
+    cluster_id: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
     cluster = db.query(Cluster).filter(Cluster.id == cluster_id).first()
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
@@ -151,6 +202,23 @@ def start_deployment(cluster_id: str, background_tasks: BackgroundTasks, db: Ses
 
     task_id = str(uuid.uuid4())
     init_task(task_id, cluster_id)
+
+    # If initial_acls were stored in config_json at creation time,
+    # move them into the task log now (deployer reads from there).
+    import json as _json
+    cfg = _json.loads(cluster.config_json or "{}")
+    initial_acls = cfg.pop("_initial_acls", None)
+    if initial_acls:
+        cluster.config_json = _json.dumps(cfg)
+        db.commit()
+        from app.models.deployment_task import DeploymentTask as _DT
+        _row = db.query(_DT).filter(_DT.id == task_id).first()
+        if _row:
+            _logs = _json.loads(_row.logs or "[]")
+            _logs.append(f"INITIAL_ACLS:{_json.dumps(initial_acls)}")
+            _row.logs = _json.dumps(_logs)
+            db.commit()
+
     # The deploy worker opens its own DB session — never pass the request's
     # session into a background task, that one closes when the response sends.
     background_tasks.add_task(deploy_cluster, cluster_id, task_id)
@@ -463,11 +531,25 @@ def add_services(cluster_id: str, services: list[ServiceAssignment], db: Session
 
     # Validate hosts exist
     host_ids = {s.host_id for s in services}
-    existing = db.query(Host.id).filter(Host.id.in_(host_ids)).all()
-    existing_ids = {h.id for h in existing}
+    existing_hosts = db.query(Host).filter(Host.id.in_(host_ids)).all()
+    hosts_by_id = {h.id: h for h in existing_hosts}
+    existing_ids = set(hosts_by_id)
     missing = host_ids - existing_ids
     if missing:
         raise HTTPException(status_code=400, detail=f"Hosts not found: {', '.join(missing)}")
+
+    for host in hosts_by_id.values():
+        success, message, os_info = ssh_manager.test_connection(
+            host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential
+        )
+        if not success:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot add node on {host.hostname} ({host.ip_address}): {message}",
+            )
+        if os_info:
+            host.os_info = os_info
+            host.status = "online"
 
     created = []
     for svc_data in services:
@@ -543,21 +625,14 @@ def remove_service(cluster_id: str, service_id: str, force: bool = False, db: Se
                 detail="Cannot remove the last broker: ksqlDB/Connect services depend on it. Use force=true to override.",
             )
 
-    # If the service was running, try to stop it first
-    if target.status == "running":
-        host = db.query(Host).filter(Host.id == target.host_id).first()
-        if host:
-            try:
-                from app.services.cluster_manager import ClusterManager
-                unit_name = ClusterManager._get_systemd_name(target.role)
-                from app.services.ssh_manager import SSHManager
-                with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                    SSHManager.exec_command(client, f"sudo systemctl stop {unit_name}")
-                    SSHManager.exec_command(client, f"sudo systemctl disable {unit_name}")
-                    SSHManager.exec_command(client, f"sudo rm -f /etc/systemd/system/{unit_name}")
-                    SSHManager.exec_command(client, "sudo systemctl daemon-reload")
-            except Exception:
-                pass  # Best effort cleanup
+    host = db.query(Host).filter(Host.id == target.host_id).first()
+    if host:
+        cleanup = cluster_manager.cleanup_service(cluster, target, host, remove_unit=True)
+        if not cleanup.get("success") and not force:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Service cleanup failed: {cleanup.get('message')}. Use force=true to remove the DB row anyway.",
+            )
 
     db.delete(target)
     db.commit()

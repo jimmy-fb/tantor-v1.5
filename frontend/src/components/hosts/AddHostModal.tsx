@@ -1,22 +1,30 @@
 import { useState } from 'react';
 import { X } from 'lucide-react';
-import type { HostCreate } from '../../types';
+import type { HostAuthType, HostCreate } from '../../types';
 
 interface Props {
   onSubmit: (data: HostCreate) => Promise<void>;
   onClose: () => void;
+  initialIpAddress?: string;
+  initialHostname?: string;
 }
 
-export default function AddHostModal({ onSubmit, onClose }: Props) {
+export default function AddHostModal({ onSubmit, onClose, initialIpAddress = '', initialHostname = '' }: Props) {
   const [form, setForm] = useState<HostCreate>({
-    hostname: '',
-    ip_address: '',
+    hostname: initialHostname,
+    ip_address: initialIpAddress,
     ssh_port: 22,
     username: 'root',
     auth_type: 'password',
     credential: '',
   });
   const [loading, setLoading] = useState(false);
+  const isKeyAuth = form.auth_type === 'key';
+  const credentialLabel = form.auth_type === 'key'
+    ? 'Private Key'
+    : form.auth_type === 'arcos'
+      ? 'ARCOS Password / Token'
+      : 'Password';
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -86,33 +94,34 @@ export default function AddHostModal({ onSubmit, onClose }: Props) {
             <label className="block text-sm font-medium text-gray-700 mb-1">Authentication</label>
             <select
               value={form.auth_type}
-              onChange={e => setForm({ ...form, auth_type: e.target.value as 'password' | 'key' })}
+              onChange={e => setForm({ ...form, auth_type: e.target.value as HostAuthType })}
               className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
             >
               <option value="password">Password</option>
               <option value="key">SSH Key</option>
+              <option value="arcos">ARCOS</option>
             </select>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
-              {form.auth_type === 'password' ? 'Password' : 'Private Key'}
+              {credentialLabel}
             </label>
-            {form.auth_type === 'password' ? (
+            {isKeyAuth ? (
+              <textarea
+                required
+                rows={4}
+                placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+                value={form.credential}
+                onChange={e => setForm({ ...form, credential: e.target.value })}
+                className="w-full px-3 py-2 border rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+            ) : (
               <input
                 type="password"
                 required
                 value={form.credential}
                 onChange={e => setForm({ ...form, credential: e.target.value })}
                 className="w-full px-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-              />
-            ) : (
-              <textarea
-                required
-                rows={4}
-                placeholder="-----BEGIN RSA PRIVATE KEY-----"
-                value={form.credential}
-                onChange={e => setForm({ ...form, credential: e.target.value })}
-                className="w-full px-3 py-2 border rounded-lg text-sm font-mono focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
               />
             )}
           </div>

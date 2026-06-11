@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useParams } from 'react-router-dom';
 import {
   Play, Square, RefreshCw, Rocket, Loader2,
   List, Users, Send, Plug, Monitor, ScrollText, Download, Shield,
   ShieldCheck, PlusCircle, Trash2, AlertTriangle, CheckCircle, XCircle, Database,
-  Settings, RotateCw, ArrowUpCircle, Shuffle, TrendingUp,
+  Settings, RotateCw, ArrowUpCircle, Shuffle, TrendingUp, FolderOpen,
 } from 'lucide-react';
 import type { ClusterDetail as ClusterDetailType, ServiceStatus, ValidationStep, Host } from '../types';
 import {
@@ -37,6 +37,7 @@ const ROLE_LABELS: Record<string, string> = {
   zookeeper: 'ZooKeeper',
   ksqldb: 'ksqlDB',
   kafka_connect: 'Kafka Connect',
+  schema_registry: 'Schema Registry',
 };
 
 const ROLE_COLORS: Record<string, string> = {
@@ -46,6 +47,7 @@ const ROLE_COLORS: Record<string, string> = {
   zookeeper: 'bg-gray-100 text-gray-800',
   ksqldb: 'bg-orange-100 text-orange-800',
   kafka_connect: 'bg-teal-100 text-teal-800',
+  schema_registry: 'bg-indigo-100 text-indigo-800',
 };
 
 const ROLES = [
@@ -82,9 +84,12 @@ export default function ClusterDetail() {
   const [removingService, setRemovingService] = useState<string | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
 
-  const fetchDetail = () => {
-    if (id) getCluster(id).then(setDetail);
-  };
+  const fetchDetail = useCallback(async () => {
+    if (!id) return null;
+    const next = await getCluster(id);
+    setDetail(next);
+    return next;
+  }, [id]);
 
   useEffect(() => {
     fetchDetail();
@@ -95,7 +100,7 @@ export default function ClusterDetail() {
       if (!document.hidden) fetchDetail();
     }, 15000);
     return () => clearInterval(interval);
-  }, [id]);
+  }, [fetchDetail]);
 
   const [activeDeployTaskId, setActiveDeployTaskId] = useState<string | null>(null);
 
@@ -118,7 +123,8 @@ export default function ClusterDetail() {
     try {
       const task = await deployCluster(id);
       setActiveDeployTaskId(task.task_id);
-      fetchDetail();
+      setLiveStatus([]);
+      await fetchDetail();
     } finally {
       setActionLoading(null);
     }
@@ -129,7 +135,8 @@ export default function ClusterDetail() {
     setActionLoading('start');
     try {
       await startCluster(id);
-      fetchDetail();
+      setLiveStatus([]);
+      await fetchDetail();
     } finally {
       setActionLoading(null);
     }
@@ -140,7 +147,8 @@ export default function ClusterDetail() {
     setActionLoading('stop');
     try {
       await stopCluster(id);
-      fetchDetail();
+      setLiveStatus([]);
+      await fetchDetail();
     } finally {
       setActionLoading(null);
     }
@@ -152,6 +160,7 @@ export default function ClusterDetail() {
     try {
       const statuses = await getClusterStatus(id);
       setLiveStatus(statuses);
+      await fetchDetail();
     } finally {
       setActionLoading(null);
     }
@@ -188,7 +197,8 @@ export default function ClusterDetail() {
       await addServices(id, [{ host_id: addHostId, role: addRole, node_id: addNodeId }]);
       setShowAddNode(false);
       setAddHostId('');
-      fetchDetail();
+      setLiveStatus([]);
+      await fetchDetail();
     } finally {
       setAddingNode(false);
     }
@@ -201,7 +211,8 @@ export default function ClusterDetail() {
     setRemoveError(null);
     try {
       await removeService(id, serviceId, force);
-      fetchDetail();
+      setLiveStatus([]);
+      await fetchDetail();
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
       setRemoveError(msg || 'Failed to remove service');
@@ -239,9 +250,9 @@ export default function ClusterDetail() {
     // for external clusters; the audit-log + rollback rows persist locally.
     { id: 'config', label: 'Config', icon: <Settings size={14} />, requiresRunning: true },
     { id: 'rebalance', label: 'Rebalance', icon: <Shuffle size={14} />, requiresRunning: true, managedOnly: true },
-    { id: 'restart', label: 'Restart', icon: <RotateCw size={14} />, requiresRunning: true, managedOnly: true },
+    { id: 'restart', label: 'Restart', icon: <RotateCw size={14} />, requiresRunning: true },
     { id: 'upgrade', label: 'Upgrade', icon: <ArrowUpCircle size={14} />, managedOnly: true },
-    { id: 'monitoring', label: 'Monitoring', icon: <Monitor size={14} /> },
+    { id: 'monitoring', label: 'Monitoring', icon: <Monitor size={14} />, requiresRunning: true },
     { id: 'lifecycle', label: 'Lifecycle', icon: <Play size={14} />, externalOnly: true },
     { id: 'capacity', label: 'Capacity', icon: <TrendingUp size={14} />, requiresRunning: true },
     { id: 'service-logs', label: 'Service Logs', icon: <ScrollText size={14} />, requiresRunning: true, managedOnly: true },
@@ -484,6 +495,58 @@ export default function ClusterDetail() {
               </tbody>
             </table>
           </div>
+
+          {/* ── Deployment Paths (v1.4.5) ─────────────────────────────
+               Surfaces resolved kafka_install_dir / kafka_data_dir /
+               kafka_unit_name from the Cluster row so operators can
+               confirm where binaries and data landed on broker hosts.
+               Hidden for external clusters — they have no deploy paths. */}
+          {!isExternal && (
+            <div className="bg-white border rounded-xl overflow-hidden mt-6">
+              <div className="flex items-center gap-2 px-5 py-3 border-b bg-gray-50">
+                <FolderOpen size={14} className="text-gray-500" />
+                <span className="text-sm font-semibold text-gray-700">Deployment Paths</span>
+                <span className="ml-auto text-xs text-gray-400">
+                  Where Kafka is installed on broker hosts
+                </span>
+              </div>
+              <dl className="divide-y text-sm">
+                <div className="flex items-center px-5 py-3 gap-4">
+                  <dt className="w-40 shrink-0 text-gray-500">Install Directory</dt>
+                  <dd className="font-mono text-xs text-gray-800 break-all">
+                    {cluster.kafka_install_dir ?? (
+                      <span className="text-gray-400 font-sans italic">
+                        /opt/kafka{" "}
+                        <span className="text-gray-300 not-italic">(legacy default)</span>
+                      </span>
+                    )}
+                  </dd>
+                </div>
+                <div className="flex items-center px-5 py-3 gap-4">
+                  <dt className="w-40 shrink-0 text-gray-500">Data Directory</dt>
+                  <dd className="font-mono text-xs text-gray-800 break-all">
+                    {cluster.kafka_data_dir ?? (
+                      <span className="text-gray-400 font-sans italic">
+                        /var/lib/kafka/data{" "}
+                        <span className="text-gray-300 not-italic">(legacy default)</span>
+                      </span>
+                    )}
+                  </dd>
+                </div>
+                <div className="flex items-center px-5 py-3 gap-4">
+                  <dt className="w-40 shrink-0 text-gray-500">systemd Unit</dt>
+                  <dd className="font-mono text-xs text-gray-800 break-all">
+                    {cluster.kafka_unit_name ?? (
+                      <span className="text-gray-400 font-sans italic">
+                        kafka.service{" "}
+                        <span className="text-gray-300 not-italic">(legacy default)</span>
+                      </span>
+                    )}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+          )}
         </>
       )}
 
@@ -503,7 +566,7 @@ export default function ClusterDetail() {
         <ClusterSchemaRegistry clusterId={id} clusterHostIds={Array.from(clusterHostIds)} />
       )}
       {activeTab === 'config' && id && <BrokerConfigManager clusterId={id} />}
-      {activeTab === 'restart' && id && <RollingRestart clusterId={id} />}
+      {activeTab === 'restart' && id && <RollingRestart clusterId={id} isExternal={isExternal} />}
       {activeTab === 'rebalance' && id && <PartitionRebalance clusterId={id} />}
       {activeTab === 'upgrade' && id && <UpgradeManager clusterId={id} currentVersion={cluster.kafka_version} />}
       {activeTab === 'capacity' && id && <CapacityForecast clusterId={id} />}
@@ -600,3 +663,4 @@ export default function ClusterDetail() {
     </div>
   );
 }
+

@@ -39,6 +39,7 @@ router = APIRouter(prefix="/api/federation", tags=["federation"])
 _TOPIC_COUNT_CACHE: dict[str, tuple[float, int | None]] = {}
 _TOPIC_COUNT_TTL = 30.0
 _TOPIC_COUNT_LOCK = threading.Lock()
+_TOPIC_COUNT_INFLIGHT: set[str] = set()
 
 # v1.4.0 #1 — also cache an external cluster's broker count so the
 # Federation overview shows real numbers instead of "—" for imported
@@ -76,6 +77,37 @@ def _fetch_topic_count(cluster_id: str) -> tuple[str, int | None]:
         db.close()
 
 
+def _refresh_topic_counts_background(cluster_ids: list[str]) -> None:
+    """Refresh stale topic counts without blocking the overview response."""
+    try:
+        with ThreadPoolExecutor(max_workers=min(8, len(cluster_ids))) as ex:
+            for cid, count in ex.map(_fetch_topic_count, cluster_ids):
+                with _TOPIC_COUNT_LOCK:
+                    _TOPIC_COUNT_CACHE[cid] = (time.time(), count)
+                    _TOPIC_COUNT_INFLIGHT.discard(cid)
+    finally:
+        with _TOPIC_COUNT_LOCK:
+            for cid in cluster_ids:
+                _TOPIC_COUNT_INFLIGHT.discard(cid)
+
+
+def _schedule_topic_count_refresh(cluster_ids: list[str]) -> None:
+    """Start one daemon refresh for clusters that are not already probing."""
+    if not cluster_ids:
+        return
+    with _TOPIC_COUNT_LOCK:
+        to_start = [cid for cid in cluster_ids if cid not in _TOPIC_COUNT_INFLIGHT]
+        _TOPIC_COUNT_INFLIGHT.update(to_start)
+    if not to_start:
+        return
+    threading.Thread(
+        target=_refresh_topic_counts_background,
+        args=(to_start,),
+        daemon=True,
+        name="federation-topic-count-refresh",
+    ).start()
+
+
 @router.get("/overview")
 def federation_overview(
     force: bool = Query(False, description="Bypass the 30s topic-count cache"),
@@ -108,13 +140,11 @@ def federation_overview(
             else:
                 to_probe.append(c.id)
 
-    # Parallel fan-out — capped at 8 concurrent so we don't smoke the box
-    if to_probe:
-        with ThreadPoolExecutor(max_workers=min(8, len(to_probe))) as ex:
-            for cid, count in ex.map(_fetch_topic_count, to_probe):
-                cached[cid] = count
-                with _TOPIC_COUNT_LOCK:
-                    _TOPIC_COUNT_CACHE[cid] = (time.time(), count)
+    # Topic counts are intentionally best-effort. A dead broker or slow SSH
+    # fallback can take ~60s, which used to make nginx return 504 for the
+    # whole page. Return the cluster inventory immediately and refresh stale
+    # counts in the background for the next request.
+    _schedule_topic_count_refresh(to_probe)
 
     # Pre-fetch service rows for all managed clusters in one query
     managed_ids = [c.id for c in clusters if (c.kind or "managed") == "managed"]

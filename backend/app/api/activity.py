@@ -111,7 +111,7 @@ def list_activity(
 
     entries.sort(key=lambda e: e.occurred_at, reverse=True)
     sliced = entries[offset : offset + limit]
-    return ActivityResponse(entries=sliced, count=len(sliced), has_more=len(entries) > offset + limit)
+    return ActivityResponse(entries=sliced, count=len(entries), has_more=len(entries) > offset + limit)
 
 
 def _to_utc(dt: datetime) -> datetime:

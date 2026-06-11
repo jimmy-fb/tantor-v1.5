@@ -1,6 +1,7 @@
 import json
 import re
 import secrets
+import shlex
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -29,6 +30,11 @@ if TYPE_CHECKING:
 _TOPIC_LIST_CACHE: dict[str, tuple[float, list[dict]]] = {}
 _TOPIC_LIST_CACHE_TTL = 5.0
 _TOPIC_LIST_CACHE_LOCK = threading.Lock()
+
+_ACL_RESOURCE_TYPES = {"topic", "group", "cluster", "transactional-id"}
+_ACL_PATTERN_TYPES = {"literal", "prefixed"}
+_ACL_OPERATIONS = {"Read", "Write", "Create", "Describe", "Alter", "Delete", "All"}
+_ACL_PERMISSION_TYPES = {"Allow", "Deny"}
 
 
 def _topic_list_cached(cluster_id: str) -> list[dict] | None:
@@ -369,6 +375,11 @@ class KafkaAdmin:
                 continue
             if len(g) > 256:
                 continue
+            # Filter out ISO timestamps that slip through (e.g., 2026-05-12T11:44:57...)
+            if _re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}', g):
+                continue
+            if g.startswith("console-consumer-"):
+                continue
             # Final strict pattern check
             if not _GROUP_ID_PATTERN.match(g):
                 continue
@@ -385,8 +396,7 @@ class KafkaAdmin:
         )
 
         if exit_code2 != 0:
-            # Fallback: return basic info without details
-            return [{"group_id": g, "state": "Unknown", "members": 0, "topics": [], "offsets": []} for g in groups]
+            return []
 
         # Parse all groups from the combined output
         result = []
@@ -394,7 +404,7 @@ class KafkaAdmin:
         current_lines: list[str] = []
 
         for line in stdout2.splitlines():
-            if line.startswith("GROUP") or not line.strip():
+            if not line.strip() or line.startswith("GROUP") or line.startswith(("[", "WARN", "INFO", "ERROR", "Error:", "Exception")):
                 continue
             # New group section detected by group name in first column
             parts = line.split()
@@ -402,7 +412,9 @@ class KafkaAdmin:
                 gid = parts[0]
                 if gid != current_group:
                     if current_group and current_lines:
-                        result.append(KafkaAdmin._parse_consumer_group(current_group, "\n".join(current_lines)))
+                        parsed = KafkaAdmin._parse_consumer_group(current_group, "\n".join(current_lines))
+                        if parsed["state"] != "Unknown":
+                            result.append(parsed)
                     current_group = gid
                     current_lines = []
                 current_lines.append(line)
@@ -413,13 +425,9 @@ class KafkaAdmin:
                         break
 
         if current_group and current_lines:
-            result.append(KafkaAdmin._parse_consumer_group(current_group, "\n".join(current_lines)))
-
-        # Add any groups that weren't in the describe output
-        found_ids = {r["group_id"] for r in result}
-        for g in groups:
-            if g not in found_ids:
-                result.append({"group_id": g, "state": "Unknown", "members": 0, "topics": [], "offsets": []})
+            parsed = KafkaAdmin._parse_consumer_group(current_group, "\n".join(current_lines))
+            if parsed["state"] != "Unknown":
+                result.append(parsed)
 
         return result
 
@@ -526,18 +534,44 @@ class KafkaAdmin:
             line = line.strip()
             if not line:
                 continue
-            # Defensive: skip lines that obviously look like log4j2
-            # records — anything starting with "[YYYY-..." or "INFO/" /
-            # "ERROR/" is a stray log, not a real Kafka record. With
-            # 2>/dev/null this shouldn't happen, but in case kafka-
-            # console-consumer changes its output format, this
-            # backstop keeps the consume tab clean.
+            # Defensive: skip lines that are Kafka/Java internal logs,
+            # not real consumer records. With 2>/dev/null most stderr
+            # is suppressed, but SSH buffer merging and some edge cases
+            # still leak noise.  The filter is intentionally aggressive
+            # — it's better to drop a stray log line than to show a
+            # Java stack trace as a "message" in the UI.
             import re as _re
+
+            # 1. Log4j timestamp prefix: [2026-05-13 ... or 15:49:45.545 [main]
             if _re.match(r"^\[\d{4}-\d{2}-\d{2}", line):
                 continue
-            if _re.match(r"^(INFO|WARN|ERROR|FATAL|DEBUG)\s", line):
+            if _re.match(r"^\d{2}:\d{2}:\d{2}[.,]\d+\s+\[", line):
                 continue
-            if "StatusLogger" in line or "Reconfiguration failed" in line:
+            # 2. Log severity prefix: INFO ..., ERROR ..., WARN ...
+            if _re.match(r"^(INFO|WARN|ERROR|FATAL|DEBUG|TRACE)\s", line):
+                continue
+            # 3. Java stack trace lines
+            if _re.match(r"^\s+at\s+[\w.$]+", line):
+                continue
+            # 4. Java exception class names (org.apache.kafka...Exception)
+            if _re.match(r"^(org\.|java\.|javax\.|io\.)\S+\.(Exception|Error|Timeout)", line):
+                continue
+            # 5. Caused by: ... lines
+            if line.startswith("Caused by:"):
+                continue
+            # 6. Kafka consumer-specific noise
+            if any(marker in line for marker in (
+                "StatusLogger",
+                "Reconfiguration failed",
+                "Error processing message",
+                "terminating consumer process",
+                "ConsoleConsumer",
+                "TimeoutException",
+                "Processed a total of",
+                "SLF4J:",
+                "log4j",
+                "kafka.tools",
+            )):
                 continue
             msg = KafkaAdmin._parse_consumer_line(line)
             if msg:
@@ -557,8 +591,9 @@ class KafkaAdmin:
         try:
             parts = line.split("\t")
             if len(parts) < 5:
-                # Fallback: treat entire line as value
-                return {"timestamp": None, "partition": None, "offset": None, "key": None, "value": line, "headers": None}
+                # Reject lines that don't match expected format —
+                # these are almost certainly leaked log lines, not messages.
+                return None
 
             timestamp_raw = parts[0]
             partition_raw = parts[1]
@@ -1059,9 +1094,59 @@ class KafkaAdmin:
         return KafkaAdmin._parse_acl_list(stdout)
 
     @staticmethod
+    def _normalize_acl_create_request(acl_req: dict) -> dict:
+        principal = (acl_req.get("principal") or "").strip()
+        if not principal:
+            raise ValueError("Principal is required")
+        if ":" not in principal:
+            principal = f"User:{principal}"
+
+        resource_type = (acl_req.get("resource_type") or "").strip().lower()
+        if resource_type not in _ACL_RESOURCE_TYPES:
+            raise ValueError(f"Invalid ACL resource type: {resource_type}")
+
+        resource_name = (acl_req.get("resource_name") or "").strip()
+        if resource_type != "cluster" and not resource_name:
+            raise ValueError("Resource name is required")
+        if resource_type == "cluster" and not resource_name:
+            resource_name = "kafka-cluster"
+
+        pattern_type = (acl_req.get("pattern_type") or "literal").strip().lower()
+        if pattern_type not in _ACL_PATTERN_TYPES:
+            raise ValueError(f"Invalid ACL pattern type: {pattern_type}")
+
+        permission_input = (acl_req.get("permission_type") or "Allow").strip().lower()
+        permission_type = permission_input.capitalize()
+        if permission_type not in _ACL_PERMISSION_TYPES:
+            raise ValueError(f"Invalid ACL permission type: {acl_req.get('permission_type')}")
+
+        operations = []
+        for op in acl_req.get("operations") or []:
+            normalized_op = str(op).strip().capitalize()
+            if normalized_op not in _ACL_OPERATIONS:
+                raise ValueError(f"Invalid ACL operation: {op}")
+            operations.append(normalized_op)
+        if not operations:
+            raise ValueError("At least one ACL operation is required")
+
+        acl_host = (acl_req.get("host") or "*").strip() or "*"
+
+        return {
+            **acl_req,
+            "principal": principal,
+            "resource_type": resource_type,
+            "resource_name": resource_name,
+            "pattern_type": pattern_type,
+            "operations": operations,
+            "permission_type": permission_type,
+            "host": acl_host,
+        }
+
+    @staticmethod
     def create_acl(cluster_id: str, acl_req: dict, db: Session,
                     actor: "User | None" = None) -> dict:
         """Create one or more ACL entries in Kafka."""
+        acl_req = KafkaAdmin._normalize_acl_create_request(acl_req)
         ext = _is_external(cluster_id, db)
         if ext:
             # The managed CLI accepts a list of operations; loop them through
@@ -1098,33 +1183,34 @@ class KafkaAdmin:
         permission_flag = "--allow-principal" if permission_type == "Allow" else "--deny-principal"
 
         cmd_parts = [
-            f"{kh}/bin/kafka-acls.sh",
-            f"--bootstrap-server {bootstrap}",
+            shlex.quote(f"{kh}/bin/kafka-acls.sh"),
+            f"--bootstrap-server {shlex.quote(bootstrap)}",
             "--add",
-            f"{permission_flag} {principal}",
+            f"{permission_flag} {shlex.quote(principal)}",
         ]
 
         if resource_type == "topic":
-            cmd_parts.append(f"--topic {resource_name}")
+            cmd_parts.append(f"--topic {shlex.quote(resource_name)}")
         elif resource_type == "group":
-            cmd_parts.append(f"--group {resource_name}")
+            cmd_parts.append(f"--group {shlex.quote(resource_name)}")
         elif resource_type == "cluster":
             cmd_parts.append("--cluster")
         elif resource_type == "transactional-id":
-            cmd_parts.append(f"--transactional-id {resource_name}")
+            cmd_parts.append(f"--transactional-id {shlex.quote(resource_name)}")
 
         for op in operations:
-            cmd_parts.append(f"--operation {op}")
+            cmd_parts.append(f"--operation {shlex.quote(op)}")
 
-        cmd_parts.append(f"--resource-pattern-type {pattern_type}")
+        cmd_parts.append(f"--resource-pattern-type {shlex.quote(pattern_type)}")
 
         if acl_host != "*":
-            cmd_parts.append(f"--host {acl_host}")
+            cmd_parts.append(f"--host {shlex.quote(acl_host)}")
 
         cmd = " ".join(cmd_parts)
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(host, cmd)
         if exit_code != 0:
-            raise ValueError(f"Failed to create ACL: {stderr}")
+            error_detail = (stderr or stdout or f"kafka-acls.sh exited with code {exit_code}").strip()
+            raise ValueError(f"Failed to create ACL: {error_detail}")
 
         details = json.dumps({
             "principal": principal,
@@ -1358,7 +1444,8 @@ class KafkaAdmin:
 
         # Write topics JSON to temp file on broker
         safe_json = topics_json.replace("'", "'\\''")
-        write_cmd = f"echo '{safe_json}' > /tmp/tantor_topics_to_move.json"
+        topics_file = f"/tmp/tantor_topics_to_move_{secrets.token_hex(8)}.json"
+        write_cmd = f"printf '%s' '{safe_json}' > {shlex.quote(topics_file)}"
         exit_code, _, stderr = KafkaAdmin._run_kafka_cmd(host, write_cmd)
         if exit_code != 0:
             raise ValueError(f"Failed to write topics file: {stderr}")
@@ -1366,7 +1453,7 @@ class KafkaAdmin:
         cmd = (
             f"{kh}/bin/kafka-reassign-partitions.sh "
             f"--bootstrap-server {bootstrap} "
-            f"--topics-to-move-json-file /tmp/tantor_topics_to_move.json "
+            f"--topics-to-move-json-file {shlex.quote(topics_file)} "
             f"--broker-list \"{broker_list}\" "
             f"--generate"
         )
@@ -1400,13 +1487,14 @@ class KafkaAdmin:
         return {"current": current, "proposed": proposed}
 
     @staticmethod
-    def execute_reassignment(cluster_id: str, reassignment_json: dict, db: Session) -> dict:
+    def execute_reassignment(cluster_id: str, reassignment_json: dict, db: Session, actor: "User | None" = None) -> dict:
         """Execute a partition reassignment plan."""
         host, bootstrap, kh = KafkaAdmin._get_broker_with_paths(cluster_id, db)
 
         reassign_str = json.dumps(reassignment_json)
         safe_json = reassign_str.replace("'", "'\\''")
-        write_cmd = f"echo '{safe_json}' > /tmp/tantor_reassignment.json"
+        reassignment_file = f"/tmp/tantor_reassignment_{secrets.token_hex(8)}.json"
+        write_cmd = f"printf '%s' '{safe_json}' > {shlex.quote(reassignment_file)}"
         exit_code, _, stderr = KafkaAdmin._run_kafka_cmd(host, write_cmd)
         if exit_code != 0:
             raise ValueError(f"Failed to write reassignment file: {stderr}")
@@ -1414,7 +1502,7 @@ class KafkaAdmin:
         cmd = (
             f"{kh}/bin/kafka-reassign-partitions.sh "
             f"--bootstrap-server {bootstrap} "
-            f"--reassignment-json-file /tmp/tantor_reassignment.json "
+            f"--reassignment-json-file {shlex.quote(reassignment_file)} "
             f"--execute"
         )
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(host, cmd, timeout=120)
@@ -1422,7 +1510,7 @@ class KafkaAdmin:
             raise ValueError(f"Failed to execute reassignment: {stderr}")
 
         KafkaAdmin._audit(db, cluster_id, "partition_reassignment_executed", "cluster", cluster_id,
-                          f"partitions: {len(reassignment_json.get('partitions', []))}")
+                          f"partitions: {len(reassignment_json.get('partitions', []))}", actor=actor)
         db.commit()
 
         return {"success": True, "message": stdout.strip() or "Reassignment started"}
@@ -1434,7 +1522,8 @@ class KafkaAdmin:
 
         reassign_str = json.dumps(reassignment_json)
         safe_json = reassign_str.replace("'", "'\\''")
-        write_cmd = f"echo '{safe_json}' > /tmp/tantor_reassignment.json"
+        reassignment_file = f"/tmp/tantor_reassignment_{secrets.token_hex(8)}.json"
+        write_cmd = f"printf '%s' '{safe_json}' > {shlex.quote(reassignment_file)}"
         exit_code, _, stderr = KafkaAdmin._run_kafka_cmd(host, write_cmd)
         if exit_code != 0:
             raise ValueError(f"Failed to write reassignment file: {stderr}")
@@ -1442,7 +1531,7 @@ class KafkaAdmin:
         cmd = (
             f"{kh}/bin/kafka-reassign-partitions.sh "
             f"--bootstrap-server {bootstrap} "
-            f"--reassignment-json-file /tmp/tantor_reassignment.json "
+            f"--reassignment-json-file {shlex.quote(reassignment_file)} "
             f"--verify"
         )
         exit_code, stdout, stderr = KafkaAdmin._run_kafka_cmd(host, cmd, timeout=60)

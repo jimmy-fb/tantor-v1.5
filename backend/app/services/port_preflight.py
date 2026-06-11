@@ -157,6 +157,15 @@ def _list_listening(client, ports: Iterable[int]) -> dict[int, str]:
     return result
 
 
+def list_listening_ports(client, ports: Iterable[int]) -> dict[int, str]:
+    """Public wrapper for lifecycle cleanup/status code.
+
+    Keep the parsing logic in one place so stop/delete and deploy pre-flight
+    report port holders in the same format.
+    """
+    return _list_listening(client, ports)
+
+
 def check_ports(checks: list[PortCheck], hosts: dict[str, Host]) -> list[PortConflict]:
     """Run port-availability checks against every host in `checks`.
 

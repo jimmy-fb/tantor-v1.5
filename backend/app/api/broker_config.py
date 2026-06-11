@@ -33,6 +33,11 @@ def get_configs(cluster_id: str, db: Session = Depends(get_db), _: User = Depend
         return config_manager.get_broker_configs(cluster_id, db)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        err_type = str(type(e))
+        if any(err in err_type for err in ("NoBrokersAvailable", "KafkaTimeoutError", "NodeNotReadyError", "ConnectionError")):
+            raise HTTPException(status_code=503, detail="Broker is currently offline or restarting. Please try again in a moment.")
+        raise
 
 
 @router.put("/clusters/{cluster_id}/brokers/{broker_id}/config")
@@ -47,7 +52,8 @@ def update_config(
             cluster_id, broker_id, req.config_key, req.config_value, user.username, db,
         )
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        status = 400 if "SSH_REQUIRED" in str(e) else 404
+        raise HTTPException(status_code=status, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -162,39 +162,17 @@ class LogManager:
             f"else sudo -n tail -f {log_path} 2>/dev/null; fi"
         )
 
-        client = None
         try:
-            import io
-            import paramiko
-            from app.services.crypto import decrypt
-
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            credential = decrypt(host.encrypted_credential)
-
-            if host.auth_type == "password":
-                client.connect(
-                    hostname=host.ip_address, port=host.ssh_port,
-                    username=host.username, password=credential,
-                    timeout=15, look_for_keys=False, allow_agent=False,
-                )
-            else:
-                pkey = paramiko.RSAKey.from_private_key(io.StringIO(credential))
-                client.connect(
-                    hostname=host.ip_address, port=host.ssh_port,
-                    username=host.username, pkey=pkey,
-                    timeout=15, look_for_keys=False, allow_agent=False,
-                )
-
-            _, stdout, _ = client.exec_command(cmd, get_pty=True)
-            for line in stdout:
-                yield line.strip()
+            with SSHManager.connect(
+                host.ip_address, host.ssh_port, host.username,
+                host.auth_type, host.encrypted_credential,
+            ) as client:
+                _, stdout, _ = client.exec_command(cmd, get_pty=True)
+                for line in stdout:
+                    yield line.strip()
         except Exception as e:
             logger.error(f"Log tail failed for {host.ip_address}: {e}")
             yield f"Error: {e}"
-        finally:
-            if client:
-                client.close()
 
 
 log_manager = LogManager()

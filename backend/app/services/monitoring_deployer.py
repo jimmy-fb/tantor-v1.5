@@ -2,8 +2,12 @@
 
 import json
 import logging
+import re
 import time
+import ipaddress
 from pathlib import Path
+import urllib.error
+import urllib.request
 
 from sqlalchemy.orm import Session
 
@@ -25,6 +29,7 @@ GRAFANA_VERSION = getattr(settings, "GRAFANA_VERSION", "10.4.1")
 ALERTMANAGER_VERSION = getattr(settings, "ALERTMANAGER_VERSION", "0.27.0")
 JMX_EXPORTER_VERSION = "0.20.0"
 JMX_EXPORTER_PORT = 7071
+_HOST_PORT_RE = re.compile(r"^[A-Za-z0-9_.:-]+:\d{1,5}$")
 
 
 class MonitoringDeployer:
@@ -61,6 +66,9 @@ class MonitoringDeployer:
                     broker_hosts.append(host)
 
         steps = []
+        external_jmx_targets = MonitoringDeployer._normalize_external_jmx_endpoints(
+            external_jmx_endpoints or []
+        ) if is_external else []
 
         # Step 1: Deploy JMX exporter on each broker (managed clusters only)
         if not is_external:
@@ -98,7 +106,7 @@ class MonitoringDeployer:
                 # for a value that doesn't exist on the samples and
                 # show "No data" even when scrape is healthy.
                 MonitoringDeployer._deploy_prometheus_external(
-                    mon_host, external_jmx_endpoints or [], prometheus_port,
+                    mon_host, external_jmx_targets, prometheus_port,
                     cluster_id=cluster_id, cluster_name=cluster.name,
                 )
             else:
@@ -117,9 +125,12 @@ class MonitoringDeployer:
         # Step 4: Deploy Alertmanager (alongside Prometheus on the same host)
         try:
             MonitoringDeployer._deploy_alertmanager(mon_host, settings.ALERTMANAGER_PORT)
+            MonitoringDeployer._verify_alertmanager_reachable(mon_host)
             steps.append({"step": "Alertmanager", "status": "success"})
         except Exception as e:
             steps.append({"step": "Alertmanager", "status": "failed", "error": str(e)})
+
+        MonitoringDeployer._fail_deploy_if_needed(steps, cluster_id, db)
 
         # Step 5: Render initial Tantor rules + alertmanager.yml from DB
         try:
@@ -127,6 +138,8 @@ class MonitoringDeployer:
             steps.append({"step": "Alert rules + receivers", "status": "success"})
         except Exception as e:
             steps.append({"step": "Alert rules + receivers", "status": "failed", "error": str(e)})
+
+        MonitoringDeployer._fail_deploy_if_needed(steps, cluster_id, db)
 
         # Step 6: Provision dashboards
         try:
@@ -157,6 +170,60 @@ class MonitoringDeployer:
             "grafana_url": f"http://{mon_host.ip_address}:{grafana_port}",
             "prometheus_url": f"http://{mon_host.ip_address}:{prometheus_port}",
         }
+
+    @staticmethod
+    def _normalize_external_jmx_endpoints(jmx_endpoints: list[str]) -> list[str]:
+        endpoints = [ep.strip() for ep in jmx_endpoints if ep and ep.strip()]
+        if not endpoints:
+            raise ValueError("At least one external JMX endpoint is required")
+        invalid = [ep for ep in endpoints if not _HOST_PORT_RE.match(ep)]
+        if invalid:
+            raise ValueError(f"Invalid JMX endpoint(s): {', '.join(invalid)}")
+        bad_ports = [ep for ep in endpoints if not (1 <= int(ep.rsplit(':', 1)[1]) <= 65535)]
+        if bad_ports:
+            raise ValueError(f"Invalid JMX port(s): {', '.join(bad_ports)}")
+        loopback = [ep for ep in endpoints if MonitoringDeployer._is_loopback_jmx_endpoint(ep)]
+        if loopback:
+            raise ValueError(
+                "External JMX endpoint(s) must use broker IP/hostname reachable "
+                f"from the monitoring host, not localhost/loopback: {', '.join(loopback)}"
+            )
+        return endpoints
+
+    @staticmethod
+    def _is_loopback_jmx_endpoint(endpoint: str) -> bool:
+        host = endpoint.rsplit(":", 1)[0].strip().strip("[]").lower()
+        if host in {"localhost", "0.0.0.0"}:
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_loopback or ip.is_unspecified
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _fail_deploy_if_needed(steps: list[dict], cluster_id: str, db: Session) -> None:
+        failed = [s for s in steps if s.get("status") == "failed"]
+        if not failed:
+            return
+        config = db.query(MonitoringConfig).filter(MonitoringConfig.cluster_id == cluster_id).first()
+        if config:
+            config.deployed = False
+            db.commit()
+        details = "; ".join(
+            f"{s.get('step')}: {s.get('error', 'failed')}" for s in failed
+        )
+        raise RuntimeError(f"Monitoring deployment failed: {details}")
+
+    @staticmethod
+    def _verify_alertmanager_reachable(host: Host) -> None:
+        am_url = f"http://{host.ip_address}:{settings.ALERTMANAGER_PORT}/-/healthy"
+        try:
+            with urllib.request.urlopen(am_url, timeout=5) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Alertmanager health returned HTTP {response.status}")
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
+            raise RuntimeError(f"Alertmanager is not reachable at {am_url}: {e}") from e
 
     @staticmethod
     def _ssh_exec(host: Host, command: str, timeout: int = 60) -> tuple:
@@ -365,7 +432,15 @@ curl -sf http://localhost:{port}/-/healthy && echo "PROM_OK" || echo "PROM_FAIL"
 
         # Tolerate missing endpoints — the operator can start with just rules
         # and add scrape targets later by re-running the monitoring deploy.
-        targets = ", ".join([f'"{ep.strip()}"' for ep in jmx_endpoints if ep.strip()]) or '""'
+        targets = ", ".join([f'"{ep}"' for ep in jmx_endpoints])
+        jmx_checks = "\n".join(
+            f"""if timeout 3 bash -c '</dev/tcp/{ep.rsplit(':', 1)[0]}/{ep.rsplit(':', 1)[1]}' 2>/dev/null; then
+    echo "JMX_OK {ep}"
+else
+    echo "JMX_FAIL {ep}"
+fi"""
+            for ep in jmx_endpoints
+        )
         # Inject static labels so every sample has cluster=<id>.
         labels_block = ""
         if cluster_id:
@@ -433,10 +508,18 @@ sudo systemctl enable prometheus
 sudo systemctl restart prometheus
 sleep 2
 curl -sf http://localhost:{port}/-/healthy && echo "PROM_OK" || echo "PROM_FAIL"
+
+{jmx_checks}
 """
         exit_code, stdout, stderr = MonitoringDeployer._ssh_exec(host, commands, timeout=180)
         if "PROM_OK" not in stdout:
             raise RuntimeError(f"Prometheus deploy failed: {stderr}")
+        failed_targets = [ep for ep in jmx_endpoints if f"JMX_FAIL {ep}" in stdout]
+        if failed_targets:
+            raise RuntimeError(
+                "External JMX endpoint(s) unreachable from monitoring host: "
+                + ", ".join(failed_targets)
+            )
 
     @staticmethod
     def _deploy_grafana(host: Host, grafana_port: int, prometheus_port: int):
@@ -782,16 +865,16 @@ sudo bash -c 'cat > /etc/alertmanager/alertmanager.yml << "TANTORAMEOF"
 {am_yml}TANTORAMEOF'
 
 # Validate before reloading; bail loudly so the operator sees the issue.
-sudo /opt/prometheus/promtool check rules /etc/prometheus/rules/tantor.yml >/tmp/rules_check 2>&1 \\
-  && echo "RULES_OK" \\
-  || (echo "RULES_INVALID"; cat /tmp/rules_check; exit 1)
-sudo /opt/alertmanager/amtool check-config /etc/alertmanager/alertmanager.yml >/tmp/am_check 2>&1 \\
-  && echo "AM_CONFIG_OK" \\
-  || (echo "AM_CONFIG_INVALID"; cat /tmp/am_check; exit 1)
+sudo bash -c '/opt/prometheus/promtool check rules /etc/prometheus/rules/tantor.yml >/tmp/rules_check 2>&1' \
+  && echo "RULES_OK" \
+  || (echo "RULES_INVALID"; sudo cat /tmp/rules_check; exit 1)
+sudo bash -c '/opt/alertmanager/amtool check-config /etc/alertmanager/alertmanager.yml >/tmp/am_check 2>&1' \
+  && echo "AM_CONFIG_OK" \
+  || (echo "AM_CONFIG_INVALID"; sudo cat /tmp/am_check; exit 1)
 
 # Reload via HTTP API (no restart, no scrape gap).
 curl -sf -X POST http://localhost:{settings.PROMETHEUS_PORT}/-/reload && echo "PROM_RELOADED" || echo "PROM_RELOAD_FAILED"
-curl -sf -X POST http://localhost:{settings.ALERTMANAGER_PORT}/-/reload && echo "AM_RELOADED" || echo "AM_RELOAD_FAILED"
+curl -sf -X POST http://localhost:{settings.ALERTMANAGER_PORT}/-/reload && echo "AM_RELOADED" || echo "AM_RELOADED_FAILED"
 """
         _, stdout, stderr = MonitoringDeployer._ssh_exec(host, push_cmd, timeout=60)
         if "RULES_OK" not in stdout or "AM_CONFIG_OK" not in stdout:

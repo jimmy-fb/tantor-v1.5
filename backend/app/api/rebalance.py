@@ -57,11 +57,11 @@ def execute_reassignment(
     cluster_id: str,
     data: ExecuteRequest,
     db: Session = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ):
     """Execute a partition reassignment plan."""
     try:
-        return kafka_admin.execute_reassignment(cluster_id, data.reassignment, db)
+        return kafka_admin.execute_reassignment(cluster_id, data.reassignment, db, actor=current_user)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

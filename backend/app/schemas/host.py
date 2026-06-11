@@ -1,5 +1,9 @@
 from datetime import datetime
+from typing import Literal
+
 from pydantic import BaseModel
+
+HostAuthType = Literal["password", "key", "arcos"]
 
 
 class HostCreate(BaseModel):
@@ -7,8 +11,8 @@ class HostCreate(BaseModel):
     ip_address: str
     ssh_port: int = 22
     username: str
-    auth_type: str  # "password" or "key"
-    credential: str  # plaintext password or private key content
+    auth_type: HostAuthType
+    credential: str  # plaintext password, ARCOS token/password, or private key content
 
 
 class HostUpdate(BaseModel):
@@ -16,7 +20,7 @@ class HostUpdate(BaseModel):
     ip_address: str | None = None
     ssh_port: int | None = None
     username: str | None = None
-    auth_type: str | None = None
+    auth_type: HostAuthType | None = None
     credential: str | None = None
 
 
@@ -26,7 +30,7 @@ class HostResponse(BaseModel):
     ip_address: str
     ssh_port: int
     username: str
-    auth_type: str
+    auth_type: HostAuthType
     os_info: str | None
     status: str
     created_at: datetime

@@ -8,13 +8,14 @@ all:
           ansible_host: "{{ svc.ip_address }}"
           ansible_port: {{ svc.port }}
           ansible_user: "{{ svc.username }}"
-{% if svc.auth_type == "password" %}
+{% if svc.auth_type in ["password", "arcos"] %}
           ansible_ssh_pass: "{{ svc.credential }}"
           ansible_become_pass: "{{ svc.credential }}"
 {% else %}
           ansible_ssh_private_key_file: "{{ svc.key_file }}"
 {% endif %}
           ansible_become: true
+          ansible_python_interpreter: /usr/bin/python3.9
           node_id: {{ svc.node_id }}
           service_role: "{{ svc.role }}"
 {% if svc.broker_keystore_src is defined %}

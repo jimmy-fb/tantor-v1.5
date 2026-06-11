@@ -139,7 +139,7 @@ export default function Monitoring() {
 
   useEffect(() => {
     getClusters().then((data: Cluster[]) => {
-      const running = data.filter((c: Cluster) => c.state === 'running');
+      const running = data.filter((c: Cluster) => c.state === 'running' || c.state === 'connected');
       setClusters(running);
       if (running.length > 0) setSelectedCluster(running[0].id);
     }).finally(() => setLoading(false));
@@ -215,8 +215,8 @@ export default function Monitoring() {
         </h1>
         <div className="bg-gray-50 border border-gray-200 rounded-xl p-12 text-center">
           <Server size={40} className="mx-auto text-gray-300 mb-4" />
-          <h3 className="text-lg font-semibold text-gray-600">No Running Clusters</h3>
-          <p className="text-gray-400 mt-2">Deploy a Kafka cluster first, then monitoring metrics will appear here automatically.</p>
+          <h3 className="text-lg font-semibold text-gray-600">No Active Clusters</h3>
+          <p className="text-gray-400 mt-2">Deploy or connect a Kafka cluster first, then monitoring metrics will appear here automatically.</p>
         </div>
       </div>
     );

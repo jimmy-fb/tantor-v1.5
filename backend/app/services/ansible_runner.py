@@ -54,7 +54,7 @@ class AnsibleRunner:
         for svc in services:
             if svc["auth_type"] == "key":
                 key_path = keys_dir / f"id_{svc['ip_address']}_{svc['node_id']}"
-                key_path.write_text(svc["credential"])
+                key_path.write_text(svc["credential"], encoding="utf-8")
                 key_path.chmod(0o600)
                 svc["key_file"] = str(key_path)
             if tls_keystores:
@@ -65,7 +65,7 @@ class AnsibleRunner:
 
         content = template.render(groups=groups)
         inv_path = work_dir / "inventory.yml"
-        inv_path.write_text(content)
+        inv_path.write_text(content, encoding="utf-8")
         return inv_path
 
     @staticmethod
@@ -95,7 +95,7 @@ class AnsibleRunner:
         configs_dir = work_dir / "configs"
         configs_dir.mkdir(exist_ok=True)
         for filename, content in configs.items():
-            (configs_dir / filename).write_text(content)
+            (configs_dir / filename).write_text(content, encoding="utf-8")
         return configs_dir
 
     @staticmethod
@@ -104,7 +104,7 @@ class AnsibleRunner:
         units_dir = work_dir / "systemd"
         units_dir.mkdir(exist_ok=True)
         for filename, content in units.items():
-            (units_dir / filename).write_text(content)
+            (units_dir / filename).write_text(content, encoding="utf-8")
         return units_dir
 
     @staticmethod
@@ -119,7 +119,7 @@ class AnsibleRunner:
         out = work_dir / "kafka" / "log4j2.yaml"
         out.parent.mkdir(exist_ok=True, parents=True)
         template = kafka_env.get_template("log4j2.yaml.j2")
-        out.write_text(template.render(kafka_log_dir=kafka_log_dir))
+        out.write_text(template.render(kafka_log_dir=kafka_log_dir), encoding="utf-8")
         return out
 
     @staticmethod
@@ -129,7 +129,7 @@ class AnsibleRunner:
         content = template.render(**context)
         pb_name = template_name.replace(".j2", "")
         pb_path = work_dir / pb_name
-        pb_path.write_text(content)
+        pb_path.write_text(content, encoding="utf-8")
         return pb_path
 
     @staticmethod

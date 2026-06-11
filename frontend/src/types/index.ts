@@ -1,10 +1,12 @@
+export type HostAuthType = 'password' | 'key' | 'arcos';
+
 export interface Host {
   id: string;
   hostname: string;
   ip_address: string;
   ssh_port: number;
   username: string;
-  auth_type: 'password' | 'key';
+  auth_type: HostAuthType;
   os_info: string | null;
   status: 'online' | 'offline' | 'unknown';
   created_at: string;
@@ -15,7 +17,7 @@ export interface HostCreate {
   ip_address: string;
   ssh_port: number;
   username: string;
-  auth_type: 'password' | 'key';
+  auth_type: HostAuthType;
   credential: string;
 }
 
@@ -56,6 +58,46 @@ export interface ClusterConfig {
   ksqldb_port: number;
   connect_port: number;
   connect_rest_port: number;
+  /**
+   * Optional operator-supplied Kafka binary install directory.
+   *
+   * When omitted (or empty string) the backend auto-derives a unique path
+   * from the cluster UUID, e.g. /opt/kafka-prod-a1b2c3d4, so that multiple
+   * clusters on the same broker host coexist without collision.
+   *
+   * Must be an absolute path if provided. Validated server-side.
+   */
+  kafka_install_dir?: string;
+  /**
+   * Optional operator-supplied Kafka data directory (log.dirs in
+   * server.properties).
+   *
+   * When omitted the backend auto-derives a unique path, e.g.
+   * /var/lib/kafka-prod-a1b2c3d4/data. Must be an absolute path if
+   * provided. Validated server-side.
+   */
+  kafka_data_dir?: string;
+}
+
+/**
+ * One ACL rule to pre-seed during cluster deployment.
+ * Applied by the deployer immediately after the broker TCP port becomes
+ * reachable (up to 60 s wait). Failures are warnings, not errors.
+ */
+export interface InitialAcl {
+  principal: string;       // "User:myapp" or bare "myapp"
+  resource_type: string;   // "topic" | "group" | "cluster" | "transactional-id"
+  resource_name: string;   // specific name, prefix, or "*"
+  pattern_type: string;    // "literal" | "prefixed"
+  operations: string[];    // ["Read", "Write", "Describe", ...]
+  permission_type: string; // "Allow" | "Deny"
+  host: string;            // source IP filter, "*" = any
+  cpu_quota?: string;
+  memory_max?: string;
+  retention_hours?: number;
+  jvm_performance_opts?: string;
+  jmx_port?: number;
+  gc_logging_enabled?: boolean;
 }
 
 export interface ClusterCreate {
@@ -65,6 +107,8 @@ export interface ClusterCreate {
   services: ServiceAssignment[];
   config: ClusterConfig;
   environment?: string;
+  /** ACLs to apply right after the broker comes up. Optional. */
+  initial_acls?: InitialAcl[];
 }
 
 export interface Cluster {
@@ -79,6 +123,11 @@ export interface Cluster {
   kind?: 'managed' | 'external';
   // QA #51: optional env tag (dev / qa / prod / etc).
   environment?: string;
+  // v1.4.5: resolved deploy paths — present on managed clusters created with
+  // per-cluster path support (v1.3.5+). Null for legacy rows (use defaults).
+  kafka_install_dir?: string | null;
+  kafka_data_dir?: string | null;
+  kafka_unit_name?: string | null;
 }
 
 export interface ServiceInfo {

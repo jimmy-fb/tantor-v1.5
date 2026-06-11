@@ -6,6 +6,8 @@ import {
 } from 'lucide-react';
 import axios from 'axios';
 import { getAccessToken } from '../../lib/auth';
+import AddHostModal from '../hosts/AddHostModal';
+import { createHost, getExternalBrokerHosts, setExternalBrokerHosts } from '../../lib/api';
 
 interface Props {
   clusterId: string;
@@ -114,6 +116,9 @@ export default function BrokerConfigManager({ clusterId }: Props) {
     config_key: string; broker_count: number; success_count: number;
     results: Array<{ broker_id: number; ok: boolean; error?: string }>;
   } | null>(null);
+
+  // SSH Prompt state for external clusters
+  const [showSshPrompt, setShowSshPrompt] = useState(false);
 
   // Audit state
   const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
@@ -351,9 +356,36 @@ export default function BrokerConfigManager({ clusterId }: Props) {
       refetchUntilMatch();
     } catch (err: unknown) {
       const axErr = err as { response?: { data?: { detail?: string } } };
-      setSaveError(axErr.response?.data?.detail || 'Failed to update configuration');
+      const detail = axErr.response?.data?.detail || '';
+      if (detail.includes('SSH_REQUIRED')) {
+        setShowSshPrompt(true);
+        setSaving(false);
+        return; // Pause the save flow, leave editing open
+      }
+      setSaveError(detail || 'Failed to update configuration');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSshSubmit = async (data: Parameters<typeof createHost>[0]) => {
+    try {
+      // 1. Create the host
+      const host = await createHost(data);
+      // 2. Link it to the broker
+      const existing = await getExternalBrokerHosts(clusterId).catch(() => []);
+      const newHosts = [
+        ...existing.filter(h => h.broker_id !== editBrokerId),
+        { host_id: host.id, kafka_unit: 'kafka.service', broker_id: editBrokerId }
+      ];
+      await setExternalBrokerHosts(clusterId, newHosts);
+      
+      // 3. Close the modal and re-trigger save
+      setShowSshPrompt(false);
+      handleSave();
+    } catch (err: unknown) {
+      const axErr = err as { response?: { data?: { detail?: string } } };
+      alert(axErr.response?.data?.detail || 'Failed to setup SSH');
     }
   };
 
@@ -477,7 +509,11 @@ export default function BrokerConfigManager({ clusterId }: Props) {
 
           {/* Error banner */}
           {configsError && (
-            <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded-lg px-4 py-3 mb-4 text-sm text-red-700">
+            <div className={`flex items-center gap-2 border rounded-lg px-4 py-3 mb-4 text-sm ${
+              configsError.includes('restarting') || configsError.includes('offline')
+                ? 'bg-yellow-50 border-yellow-200 text-yellow-700'
+                : 'bg-red-50 border-red-200 text-red-700'
+            }`}>
               <AlertCircle size={16} />
               <span>{configsError}</span>
               <button onClick={fetchConfigs} className="ml-auto text-xs underline">Retry</button>
@@ -1033,6 +1069,16 @@ export default function BrokerConfigManager({ clusterId }: Props) {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Inline SSH prompt when static config requires restart */}
+      {showSshPrompt && (
+        <AddHostModal
+          onSubmit={handleSshSubmit}
+          onClose={() => setShowSshPrompt(false)}
+          initialIpAddress={(brokerConfigs.find(b => b.broker_id === editBrokerId)?.host_ip || '').split(':')[0]}
+          initialHostname={`broker-${editBrokerId}`}
+        />
       )}
     </div>
   );

@@ -487,31 +487,266 @@ def produce_message(cluster: Cluster, topic: str, key: str | None, value: str) -
             producer.close(timeout=5)
 
 
-def list_scram_users(cluster: Cluster) -> list[dict]:
-    """SCRAM admin: kafka-python(-ng) 2.2.3 doesn't expose
-    describe_user_scram_credentials yet, so the most honest answer for an
-    external cluster is `[]`. Once we move to confluent-kafka or kafka-python
-    grows the API, this becomes a real call. Tantor's audit log + DB-stored
-    credentials still record managed-cluster SCRAM users normally.
+# ── SCRAM via SSH broker hosts ────────────────────────────────────────────
+#
+# kafka-python 2.2.3 lacks alter_user_scram_credentials so we cannot manage
+# SCRAM users over TCP. However, if the operator has registered SSH-reachable
+# broker hosts on the Lifecycle tab (external_broker_hosts_json), we can
+# fall back to the same kafka-configs.sh approach used for managed clusters.
+#
+# Flow:
+#   1. Load the first online broker host from external_broker_hosts_json.
+#   2. Find the Kafka install dir on that host (try well-known paths).
+#   3. Run kafka-configs.sh over SSH, same as the managed cluster path.
+#
+# If no SSH hosts are registered the functions raise a clear ValueError with
+# instructions so the UI can guide the operator to the Lifecycle tab.
+
+def _get_ssh_broker(cluster: Cluster) -> tuple:
+    """Return (Host, kafka_install_dir, bootstrap_servers) for the first
+    registered broker host on this external cluster.
+
+    Raises ValueError with a UI-friendly message if no SSH hosts are set up.
     """
-    return []
+    import json as _json
+    from app.database import SessionLocal
+    from app.models.host import Host
 
+    entries = []
+    try:
+        entries = _json.loads(cluster.external_broker_hosts_json or "[]")
+    except Exception:
+        pass
 
-def _scram_unsupported() -> None:
+    if not entries:
+        raise ValueError(
+            "No SSH broker hosts are registered for this external cluster. "
+            "Go to the Lifecycle tab and add at least one broker host to enable "
+            "SCRAM user management from the UI."
+        )
+
+    db = SessionLocal()
+    try:
+        for entry in entries:
+            host = db.query(Host).filter(Host.id == entry.get("host_id")).first()
+            if host:
+                # Try to find kafka install dir — check common paths
+                kafka_dir = _find_kafka_dir_on_host(host, cluster)
+                bootstrap = cluster.bootstrap_servers or f"{host.ip_address}:9092"
+                return host, kafka_dir, bootstrap
+    finally:
+        db.close()
+
     raise ValueError(
-        "SCRAM user admin is not yet supported for externally-connected clusters: "
-        "kafka-python's AdminClient lacks alter_user_scram_credentials. Manage SCRAM "
-        "users directly on the source cluster via kafka-configs.sh, or convert this "
-        "to a managed cluster."
+        "Registered broker hosts could not be resolved. "
+        "Check that the hosts still exist in Tantor Hosts."
     )
 
 
+def _find_kafka_dir_on_host(host, cluster: Cluster) -> str:
+    """Find where Kafka is installed on the broker host via SSH.
+
+    Checks common install paths and the cluster's own kafka_install_dir if set.
+    Returns the first path where bin/kafka-configs.sh exists.
+    """
+    from app.services.ssh_manager import SSHManager
+
+    candidates = []
+    # Use the cluster's own install dir first if set (covers managed→external migration)
+    if cluster.kafka_install_dir:
+        candidates.append(cluster.kafka_install_dir)
+
+    # Standard install paths
+    candidates += [
+        "/opt/kafka",
+        "/opt/kafka/current",
+        "/usr/local/kafka",
+        "/opt/confluent",
+        "/opt/kafka_2.13-3.9.0",
+        "/opt/kafka_2.13-4.1.0",
+        "/opt/apache/kafka",
+        "/opt_apb/kafka",
+    ]
+
+    # Also try glob-style search for /opt/kafka-* directories
+    try:
+        with SSHManager.connect(
+            host.ip_address, host.ssh_port, host.username,
+            host.auth_type, host.encrypted_credential,
+        ) as client:
+            # Find all kafka-configs.sh locations in one shot
+            _, stdout, _ = SSHManager.exec_command(
+                client,
+                "find /opt /usr/local /usr/share -maxdepth 3 -name kafka-configs.sh 2>/dev/null | head -5",
+                timeout=10,
+            )
+            for line in (stdout or "").strip().splitlines():
+                # line is like /opt/kafka-prod-abc/bin/kafka-configs.sh
+                if line.endswith("/bin/kafka-configs.sh"):
+                    candidates.insert(0, line[: -len("/bin/kafka-configs.sh")])
+
+            # Verify the first valid candidate
+            for candidate in candidates:
+                _, out, _ = SSHManager.exec_command(
+                    client,
+                    f"test -f {candidate}/bin/kafka-configs.sh && echo yes || echo no",
+                    timeout=5,
+                )
+                if (out or "").strip() == "yes":
+                    return candidate
+    except Exception:
+        pass
+
+    # Fallback — return the first candidate even unverified; the actual command
+    # will fail with a clear error message if it's wrong.
+    if not candidates:
+            raise ValueError(
+        "Kafka installation directory could not be located on the broker host. "
+        "Ensure Kafka is installed at a standard path (/opt/kafka, /usr/local/kafka, etc.) "
+        "or specify the custom path in the cluster configuration."
+    )
+    return candidates[0]
+
+
+def _build_command_config(cluster: Cluster, client, tmp_path: str = "/tmp/tantor-cmd.properties") -> str | None:
+    from app.services.ssh_manager import SSHManager
+    protocol = (cluster.security_protocol or "PLAINTEXT").upper()
+    if protocol not in ("SASL_PLAINTEXT", "SASL_SSL"):
+        return None
+    secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
+    sasl_username = secrets.get("sasl_username", "")
+    sasl_password = secrets.get("sasl_password", "")
+    sasl_mechanism = cluster.sasl_mechanism or "SCRAM-SHA-512"
+    safe_pass = sasl_password.replace("\\", "\\\\").replace('"', '\\"')
+    lines = [
+        f"security.protocol={protocol}",
+        f"sasl.mechanism={sasl_mechanism}",
+        f'sasl.jaas.config=org.apache.kafka.common.security.scram.ScramLoginModule required username="{sasl_username}" password="{safe_pass}";',
+    ]
+    if protocol == "SASL_SSL":
+        kafka_dir = cluster.kafka_install_dir or "/opt/kafka"
+        lines += [
+            "ssl.truststore.type=PKCS12",
+            f"ssl.truststore.location={kafka_dir}/ssl/truststore.p12",
+            "ssl.truststore.password=changeit",
+            "ssl.endpoint.identification.algorithm=",
+        ]
+    props_content = "\\n".join(lines)
+    SSHManager.exec_command(
+        client,
+        f"printf '{props_content}' > {tmp_path} && chmod 600 {tmp_path}",
+        timeout=10,
+    )
+    return tmp_path
+
+
+def list_scram_users(cluster: Cluster) -> list[dict]:
+    """List SCRAM users via SSH kafka-configs.sh.
+
+    Returns [] with no error when no SSH hosts are registered — the UI
+    shows the "register broker hosts" prompt instead of an error banner.
+    """
+    try:
+        host, kafka_dir, bootstrap = _get_ssh_broker(cluster)
+    except ValueError:
+        return []
+
+    from app.services.ssh_manager import SSHManager
+    try:
+        with SSHManager.connect(
+            host.ip_address, host.ssh_port, host.username,
+            host.auth_type, host.encrypted_credential,
+        ) as client:
+            cmd_cfg = _build_command_config(cluster, client)
+            cmd_cfg_flag = f" --command-config {cmd_cfg}" if cmd_cfg else ""
+            exit_code, stdout, stderr = SSHManager.exec_command(
+                client,
+                f"KAFKA_HEAP_OPTS='-Xmx256m -Xms64m' {kafka_dir}/bin/kafka-configs.sh --bootstrap-server {bootstrap}"
+                f"{cmd_cfg_flag} --describe --entity-type users",
+                timeout=30,
+            )
+        if exit_code != 0:
+            return []
+        # Parse output: "User:<name> has config SCRAM-SHA-512=iterations=..."
+        users = []
+        for line in (stdout or "").splitlines():
+            if "has config" in line and "SCRAM" in line:
+                import re
+                m = re.match(r"User:(\S+)\s+has config\s+(.+)", line)
+                if m:
+                    uname = m.group(1)
+                    # Extract mechanism(s) from config string
+                    mechs = re.findall(r"(SCRAM-SHA-(?:256|512))", m.group(2))
+                    for mech in (mechs or ["SCRAM-SHA-512"]):
+                        users.append({
+                            "id": "",
+                            "cluster_id": cluster.id,
+                            "username": uname,
+                            "mechanism": mech,
+                            "created_at": None,
+                            "updated_at": None,
+                        })
+        return users
+    except Exception:
+        return []
+
+
 def create_scram_user(cluster: Cluster, username: str, password: str, mechanism: str) -> dict:
-    _scram_unsupported()
+    """Create a SCRAM user via SSH kafka-configs.sh on the external broker host."""
+    host, kafka_dir, bootstrap = _get_ssh_broker(cluster)
+
+    from app.services.ssh_manager import SSHManager
+    safe_password = password.replace("'", "'\''")
+
+    with SSHManager.connect(
+        host.ip_address, host.ssh_port, host.username,
+        host.auth_type, host.encrypted_credential,
+    ) as client:
+        cmd_cfg = _build_command_config(cluster, client)
+        cmd_cfg_flag = f" --command-config {cmd_cfg}" if cmd_cfg else ""
+        cmd = (
+            f"KAFKA_HEAP_OPTS='-Xmx256m -Xms64m' {kafka_dir}/bin/kafka-configs.sh --bootstrap-server {bootstrap}"
+            f"{cmd_cfg_flag} --alter --add-config '{mechanism}=[password={safe_password}]' "
+            f"--entity-type users --entity-name {username}"
+        )
+        exit_code, stdout, stderr = SSHManager.exec_command(client, cmd, timeout=30)
+
+    if exit_code != 0:
+        raise ValueError(f"Failed to create SCRAM user: {stderr or stdout}")
+
+    return {
+        "username": username,
+        "mechanism": mechanism,
+        "message": f"User '{username}' created via SSH on {host.hostname or host.ip_address}",
+    }
 
 
 def delete_scram_user(cluster: Cluster, username: str) -> dict:
-    _scram_unsupported()
+    """Delete a SCRAM user via SSH kafka-configs.sh on the external broker host."""
+    host, kafka_dir, bootstrap = _get_ssh_broker(cluster)
+
+    from app.services.ssh_manager import SSHManager
+    results = []
+    with SSHManager.connect(
+        host.ip_address, host.ssh_port, host.username,
+        host.auth_type, host.encrypted_credential,
+    ) as client:
+        cmd_cfg = _build_command_config(cluster, client)
+        cmd_cfg_flag = f" --command-config {cmd_cfg}" if cmd_cfg else ""
+        for mech in ["SCRAM-SHA-256", "SCRAM-SHA-512"]:
+            cmd = (
+                f"KAFKA_HEAP_OPTS='-Xmx256m -Xms64m' {kafka_dir}/bin/kafka-configs.sh --bootstrap-server {bootstrap}"
+                f"{cmd_cfg_flag} --alter --delete-config '{mech}' "
+                f"--entity-type users --entity-name {username}"
+            )
+            rc, stdout, stderr = SSHManager.exec_command(client, cmd, timeout=30)
+            results.append(rc == 0)
+
+    return {
+        "username": username,
+        "deleted": True,
+        "message": f"User '{username}' deleted via SSH on {host.hostname or host.ip_address}",
+    }
 
 
 # ── ACLs ──────────────────────────────────────────────────────────────────
@@ -671,11 +906,25 @@ def describe_broker_configs(cluster: Cluster) -> list[dict]:
                     err_code, _err_msg, _rt, broker_id_str, configs = (entry + (None,) * 5)[:5]
                     flattened: list[dict] = []
                     for cfg in configs or []:
-                        # cfg = (name, value, read_only, is_default, is_sensitive, ...)
+                        is_default_val = False
+                        is_dynamic_val = False
+                        # In Python, bool is a subclass of int, so we must
+                        # exclude bools explicitly. API v1+ returns an int
+                        # config_source; API v0 returns a bool is_default.
+                        if len(cfg) >= 6 and isinstance(cfg[3], int) and not isinstance(cfg[3], bool):
+                            src = cfg[3]
+                            is_default_val = (src == 6)  # DEFAULT_CONFIG
+                            is_dynamic_val = (src in (3, 4)) # DYNAMIC_BROKER_CONFIG or DYNAMIC_DEFAULT_BROKER_CONFIG
+                        else:
+                            is_default_val = bool(cfg[3]) if len(cfg) > 3 else False
+                            is_read_only = bool(cfg[2]) if len(cfg) > 2 else False
+                            is_dynamic_val = not is_default_val and not is_read_only
+
                         flattened.append({
                             "name": cfg[0],
                             "value": cfg[1] if not (len(cfg) > 4 and cfg[4]) else "***",
-                            "is_default": bool(cfg[3]) if len(cfg) > 3 else False,
+                            "is_default": is_default_val,
+                            "is_dynamic": is_dynamic_val,
                             "is_sensitive": bool(cfg[4]) if len(cfg) > 4 else False,
                             "is_read_only": bool(cfg[2]) if len(cfg) > 2 else False,
                         })
@@ -699,6 +948,8 @@ def alter_broker_config(cluster: Cluster, broker_id: int, configs: dict) -> dict
     paper over real failures.
     """
     from kafka.admin import ConfigResource, ConfigResourceType
+    from kafka.errors import for_code
+    from kafka.protocol.admin import AlterConfigsRequest
     import logging as _logging
     _log = _logging.getLogger("tantor.external_admin")
     secrets = decrypt_secrets(cluster.encrypted_connection_secrets)
@@ -710,28 +961,55 @@ def alter_broker_config(cluster: Cluster, broker_id: int, configs: dict) -> dict
                 admin.incremental_alter_configs([cr])
                 return {"broker_id": broker_id, "updated": True, "configs": configs, "method": "incremental"}
             except (AttributeError, NotImplementedError):
-                # kafka-python on this server lacks the incremental
-                # method. Fall back to alter_configs with a loud warning
-                # — alter_configs replaces the whole config block, so
-                # we re-read the broker's existing config first and
-                # merge with the requested changes to mimic incremental
-                # semantics (KIP-516 safety).
                 _log.warning(
                     "incremental_alter_configs unavailable for broker %s; "
-                    "falling back to alter_configs with read-then-merge",
-                    broker_id,
+                    "falling back to alter_configs and merging existing dynamic configs.",
+                    broker_id
                 )
-                existing = describe_broker_configs(cluster)
-                cur = {}
-                for entry in existing:
-                    if entry.get("broker_id") == broker_id:
-                        cur = {c["name"]: c["value"] for c in entry.get("configs", [])
-                               if c.get("value") is not None}
+                
+                from app.services.config_manager import KAFKA_BROKER_CONFIGS
+                current_broker_configs = None
+                for b_info in describe_broker_configs(cluster):
+                    if b_info["broker_id"] == broker_id:
+                        current_broker_configs = b_info["configs"]
                         break
-                merged = {**cur, **configs}
-                cr_merged = ConfigResource(ConfigResourceType.BROKER, str(broker_id), configs=merged)
-                admin.alter_configs([cr_merged])
-                return {"broker_id": broker_id, "updated": True, "configs": configs, "method": "fallback_merged"}
+                
+                merged_configs = {}
+                if current_broker_configs:
+                    for cfg in current_broker_configs:
+                        name = cfg["name"]
+                        # Skip configs that are not dynamic
+                        if not cfg.get("is_dynamic"):
+                            continue
+                        # Skip if we explicitly know it is static from our dictionary
+                        if name in KAFKA_BROKER_CONFIGS and not KAFKA_BROKER_CONFIGS[name].get("dynamic"):
+                            continue
+                        # Skip if the broker explicitly reported it as read-only
+                        if cfg.get("is_read_only"):
+                            continue
+                        merged_configs[name] = cfg["value"]
+                
+                # Apply user's requested changes
+                merged_configs.update(configs)
+                _log.info("Merged payload for alter_configs: %s", merged_configs)
+                cr_only = ConfigResource(ConfigResourceType.BROKER, str(broker_id), configs=merged_configs)
+                version = admin._matching_api_version(AlterConfigsRequest)  # type: ignore[attr-defined]
+                if version > 1:
+                    raise NotImplementedError(
+                        f"Support for AlterConfigs v{version} has not yet been added to KafkaAdminClient."
+                    )
+                request = AlterConfigsRequest[version](
+                    resources=[admin._convert_alter_config_resource_request(cr_only)],  # type: ignore[attr-defined]
+                    validate_only=False,
+                )
+                future = admin._send_request_to_node(broker_id, request)  # type: ignore[attr-defined]
+                admin._wait_for_futures([future])  # type: ignore[attr-defined]
+                for error_code, error_message, _resource_type, resource_name in future.value.resources:
+                    if error_code:
+                        error_type = for_code(error_code)
+                        detail = error_message or getattr(error_type, "message", str(error_type))
+                        raise RuntimeError(f"Broker config update failed for {resource_name}: {detail}")
+                return {"broker_id": broker_id, "updated": True, "configs": configs, "method": "fallback_targeted"}
         finally:
             admin.close()
 

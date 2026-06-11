@@ -43,7 +43,7 @@ from app.services.crypto import decrypt as fernet_decrypt, encrypt as fernet_enc
 logger = logging.getLogger("tantor.certs")
 
 
-CERTS_BASE = Path("/var/lib/tantor/certs")
+CERTS_BASE = Path(settings.CERTS_DIR)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -374,10 +374,15 @@ def materialize_broker_keystores(cluster: Cluster, db, broker_infos: list[dict])
     return out
 
 
-def issue_client_cert(cluster: Cluster, db, common_name: str, ttl_days: int = 365) -> dict:
+def issue_client_cert(cluster: Cluster, db, common_name: str, ttl_days: int = 365, force_rotate: bool = False) -> dict:
     """Mint + persist a client cert. Returns the bundle for download."""
     if not cluster.ssl_enabled:
         raise ValueError("SSL is not enabled on this cluster")
+
+    cdir = _cluster_dir(cluster.id) / "clients" / common_name
+    if cdir.exists() and not force_rotate:
+        raise ValueError(f"Client certificate for '{common_name}' already exists. Use rotation to replace it.")
+
     ca_cert, ca_key = load_ca(cluster)
     ca_pem = ca_cert.public_bytes(serialization.Encoding.PEM)
     cert_pem, key_pem = _issue_signed_cert(
@@ -389,7 +394,7 @@ def issue_client_cert(cluster: Cluster, db, common_name: str, ttl_days: int = 36
         days_valid=ttl_days,
     )
     password = _ensure_tls_password(cluster, db)
-    cdir = _cluster_dir(cluster.id) / "clients" / common_name
+    
     cdir.mkdir(parents=True, exist_ok=True)
     (cdir / "client.crt").write_bytes(cert_pem)
     _write_secure(cdir / "client.key", key_pem)

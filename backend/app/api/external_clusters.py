@@ -36,6 +36,36 @@ logger = logging.getLogger("tantor.external_clusters")
 router = APIRouter(prefix="/api/external-clusters", tags=["external-clusters"])
 
 
+def _validate_bootstrap_address(addr: str) -> bool:
+    addr = addr.strip()
+    if not addr or ":" not in addr:
+        return False
+    if addr.count(":") > 1 and not addr.startswith("["):
+        return False
+    host, _, port = addr.rpartition(":")
+    if not host or not port.isdigit():
+        return False
+    if addr.startswith("[") and not host.endswith("]"):
+        return False
+    port_number = int(port)
+    return 1 <= port_number <= 65535
+
+
+def _validate_bootstrap_servers(value: str) -> None:
+    servers = [s.strip() for s in value.split(",") if s.strip()]
+    if not servers:
+        raise HTTPException(status_code=400, detail="bootstrap_servers is required")
+    invalid = [s for s in servers if not _validate_bootstrap_address(s)]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "bootstrap_servers must be a comma-separated list of host:port "
+                "entries; IPv6 addresses must use [ipv6]:port"
+            ),
+        )
+
+
 def _to_response(cluster: Cluster) -> ExternalClusterResponse:
     redacted = external_admin.redact_connection(cluster)
     return ExternalClusterResponse(
@@ -75,8 +105,7 @@ def create_external(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    if not data.bootstrap_servers.strip():
-        raise HTTPException(status_code=400, detail="bootstrap_servers is required")
+    _validate_bootstrap_servers(data.bootstrap_servers)
 
     secrets_dict = data.secrets.model_dump(exclude_none=True) if data.secrets else {}
     cluster = Cluster(
@@ -117,7 +146,9 @@ def update_external(
     if not cluster:
         raise HTTPException(status_code=404, detail="External cluster not found")
     if data.name is not None: cluster.name = data.name
-    if data.bootstrap_servers is not None: cluster.bootstrap_servers = data.bootstrap_servers
+    if data.bootstrap_servers is not None:
+        _validate_bootstrap_servers(data.bootstrap_servers)
+        cluster.bootstrap_servers = data.bootstrap_servers
     if data.security_protocol is not None: cluster.security_protocol = data.security_protocol
     if data.sasl_mechanism is not None: cluster.sasl_mechanism = data.sasl_mechanism
     if data.ssl_verify is not None: cluster.ssl_verify = data.ssl_verify
@@ -158,6 +189,7 @@ def test_connection_unsaved(
     Used by the UI's 'Test Connection' button before save. Builds a stand-in
     Cluster object and runs the same probe as test_connection_saved.
     """
+    _validate_bootstrap_servers(data.bootstrap_servers)
     transient = Cluster(
         id="<unsaved>",
         name="<unsaved>",
@@ -324,6 +356,7 @@ def consume(
 class BrokerHostEntry(BaseModel):
     host_id: str
     kafka_unit: str = "kafka.service"
+    broker_id: int | None = None
 
 
 class BrokerHostsRequest(BaseModel):
@@ -337,6 +370,32 @@ def _read_external_broker_hosts(cluster: Cluster) -> list[dict]:
         return json.loads(cluster.external_broker_hosts_json)
     except Exception:
         return []
+
+
+@router.get("/{cluster_id}/live-brokers")
+def get_live_brokers(
+    cluster_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_monitor_or_above),
+):
+    """Return the live broker list from Kafka's describe_cluster.
+
+    The UI uses this to pre-populate the broker-hosts table so the
+    operator can map each Kafka broker to a Tantor Host without
+    manually typing broker IDs.
+    """
+    cluster = db.query(Cluster).filter(Cluster.id == cluster_id, Cluster.kind == "external").first()
+    if not cluster:
+        raise HTTPException(status_code=404, detail="External cluster not found")
+    try:
+        info = external_admin.test_connection(cluster)
+        if not info.get("success"):
+            raise HTTPException(status_code=502, detail=info.get("message", "Connection failed"))
+        return info.get("brokers", [])
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
 
 
 @router.get("/{cluster_id}/broker-hosts")
@@ -355,6 +414,7 @@ def list_broker_hosts(
         enriched.append({
             "host_id": e["host_id"],
             "kafka_unit": e.get("kafka_unit", "kafka.service"),
+            "broker_id": e.get("broker_id"),
             "hostname": h.hostname if h else None,
             "ip_address": h.ip_address if h else None,
             "online": h.status == "online" if h else False,
@@ -381,7 +441,7 @@ def set_broker_hosts(
     if bad:
         raise HTTPException(status_code=400, detail=f"Unknown host_id(s): {bad}")
     cluster.external_broker_hosts_json = json.dumps(
-        [{"host_id": e.host_id, "kafka_unit": e.kafka_unit} for e in body.hosts]
+        [{"host_id": e.host_id, "kafka_unit": e.kafka_unit, "broker_id": e.broker_id} for e in body.hosts]
     )
     db.commit()
     return list_broker_hosts(cluster_id, db, _)

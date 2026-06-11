@@ -1,4 +1,5 @@
 """Security Scanner — Vulnerability Assessment for Kafka Clusters."""
+import json
 import logging
 from sqlalchemy.orm import Session
 from app.models.cluster import Cluster
@@ -17,29 +18,33 @@ class SecurityScanner:
         if not cluster:
             raise ValueError("Cluster not found")
 
-        services = db.query(Service).filter(Service.cluster_id == cluster_id).all()
+        is_external = (cluster.kind or "managed") == "external"
+        services = [] if is_external else db.query(Service).filter(Service.cluster_id == cluster_id).all()
         hosts = {h.id: h for h in db.query(Host).all()}
 
         findings = []
 
         # Get config from first broker
         broker_configs = {}
-        first_broker = None
-        for svc in services:
-            if svc.role in ("broker", "broker_controller"):
-                first_broker = svc
-                host = hosts.get(svc.host_id)
-                if host:
-                    try:
-                        with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                            exit_code, stdout, _ = SSHManager.exec_command(
-                                client, f"cat {settings.KAFKA_INSTALL_DIR}/config/server.properties", timeout=15
-                            )
-                            if exit_code == 0:
-                                broker_configs = self._parse_properties(stdout)
-                    except Exception as e:
-                        logger.error(f"Failed to read broker config: {e}")
-                break
+        if is_external:
+            broker_configs = self._get_external_broker_configs(cluster)
+            if not broker_configs:
+                findings.append(self._external_config_unavailable_finding(cluster))
+        else:
+            for svc in services:
+                if svc.role in ("broker", "broker_controller"):
+                    host = hosts.get(svc.host_id)
+                    if host:
+                        try:
+                            with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
+                                exit_code, stdout, _ = SSHManager.exec_command(
+                                    client, f"cat {settings.KAFKA_INSTALL_DIR}/config/server.properties", timeout=15
+                                )
+                                if exit_code == 0:
+                                    broker_configs = self._parse_properties(stdout)
+                        except Exception as e:
+                            logger.error(f"Failed to read broker config: {e}")
+                    break
 
         # Run all checks
         findings.extend(self._check_authentication(broker_configs))
@@ -48,19 +53,25 @@ class SecurityScanner:
         findings.extend(self._check_data_protection(broker_configs))
 
         # OS-level checks (run on each host)
-        for svc in services:
-            if svc.role not in ("broker", "broker_controller"):
-                continue
-            host = hosts.get(svc.host_id)
+        os_targets = self._external_os_targets(cluster, hosts) if is_external else [
+            {"host": hosts.get(svc.host_id), "node_id": svc.node_id}
+            for svc in services
+            if svc.role in ("broker", "broker_controller")
+        ]
+        if is_external and not os_targets:
+            findings.append(self._external_os_unavailable_finding(cluster))
+        for target in os_targets:
+            host = target.get("host")
+            node_id = target.get("node_id", 0)
             if host:
                 try:
                     with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                        findings.extend(self._check_os_security(client, host.ip_address, svc.node_id))
+                        findings.extend(self._check_os_security(client, host.ip_address, node_id))
                 except Exception as e:
                     findings.append({
-                        "id": f"os-err-{svc.node_id}",
+                        "id": f"os-err-{node_id}",
                         "category": "OS Security",
-                        "check": f"OS Security Check (Node {svc.node_id})",
+                        "check": f"OS Security Check (Node {node_id})",
                         "severity": "high",
                         "status": "error",
                         "message": f"Could not check OS security on {host.ip_address}: {e}",
@@ -97,6 +108,69 @@ class SecurityScanner:
         }
 
     # ── Authentication Checks ────────────────────────────
+
+    def _get_external_broker_configs(self, cluster: Cluster) -> dict:
+        """Read external broker configs through Kafka AdminClient."""
+        try:
+            from app.services import external_admin
+
+            broker_entries = external_admin.describe_broker_configs(cluster)
+            if not broker_entries:
+                return {}
+            first = broker_entries[0]
+            return {
+                cfg["name"]: cfg["value"]
+                for cfg in first.get("configs", [])
+                if cfg.get("value") is not None
+            }
+        except Exception as e:
+            logger.error("Failed to read external broker config: %s", e)
+            return {}
+
+    def _external_os_targets(self, cluster: Cluster, hosts: dict) -> list[dict]:
+        """Return SSH targets registered for an external cluster, if any."""
+        if not cluster.external_broker_hosts_json:
+            return []
+        try:
+            entries = json.loads(cluster.external_broker_hosts_json)
+        except Exception:
+            return []
+        targets = []
+        for idx, entry in enumerate(entries):
+            host = hosts.get(entry.get("host_id"))
+            if host:
+                targets.append({"host": host, "node_id": idx})
+        return targets
+
+    def _external_os_unavailable_finding(self, cluster: Cluster) -> dict:
+        return {
+            "id": "os-external-unavailable",
+            "category": "OS Security",
+            "check": "External Broker OS Checks",
+            "severity": "medium",
+            "status": "warning",
+            "message": "OS-level checks were skipped because no SSH broker hosts are registered for this external cluster.",
+            "recommendation": "Register broker hosts in the external cluster Lifecycle tab if you want Tantor to run host-level security checks.",
+            "details": {
+                "cluster_kind": "external",
+                "bootstrap_servers": cluster.bootstrap_servers or "",
+            },
+        }
+
+    def _external_config_unavailable_finding(self, cluster: Cluster) -> dict:
+        return {
+            "id": "cfg-external-unavailable",
+            "category": "Configuration",
+            "check": "External Broker Config Read",
+            "severity": "high",
+            "status": "error",
+            "message": "Tantor could not read broker configs from this external cluster through the Kafka Admin API.",
+            "recommendation": "Verify the external cluster connection, ACL permissions for DescribeConfigs, and the configured security protocol/credentials.",
+            "details": {
+                "cluster_kind": "external",
+                "bootstrap_servers": cluster.bootstrap_servers or "",
+            },
+        }
 
     def _check_authentication(self, configs: dict) -> list[dict]:
         findings = []
