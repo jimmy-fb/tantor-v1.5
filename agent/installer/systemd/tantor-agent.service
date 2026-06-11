@@ -1,0 +1,39 @@
+[Unit]
+Description=Tantor host agent (reverse-tunnel to Tantor SCM)
+Documentation=https://github.com/jimmy-fb/tantor/blob/main/docs/AGENT_PROTOCOL.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tantor-agent
+Group=tantor-agent
+ExecStart=/usr/local/bin/tantor-agent --config /etc/tantor-agent/config.yaml
+Restart=always
+RestartSec=5
+
+# Hardening — the agent only needs read on its config, write on /var/lib/tantor-agent
+# (for the persisted JWT), and the ability to exec sudo for the allowlisted ops.
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tantor-agent
+DevicePolicy=closed
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateMounts=true
+
+# A modest CPU/memory cap — the agent is mostly idle.
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

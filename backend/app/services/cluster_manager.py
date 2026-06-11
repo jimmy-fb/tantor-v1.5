@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.models.cluster import Cluster
 from app.models.host import Host
 from app.models.service import Service
-from app.services import cluster_paths, port_preflight
+from app.services import agent_transport, cluster_paths, port_preflight
 from app.services.ssh_manager import SSHManager
 
 
@@ -448,25 +448,51 @@ class ClusterManager:
                 continue
 
             try:
-                with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-                    unit_name, status_raw = _probe_status(client, _unit_candidates(cluster, svc.role))
-                    if status_raw in ("active", "activating"):
-                        svc.status = "running"
-                    elif status_raw == "inactive":
-                        svc.status = "stopped"
-                    elif status_raw == "failed":
-                        svc.status = "error"
+                # Agent-first dispatch: if the host has a connected
+                # tantor-agent we ask it for systemctl is-active over the
+                # reverse tunnel. ~100x faster than SSH+CLI (no fork+JVM)
+                # and works without inbound SSH from the SCM. Falls
+                # through to the existing SSH path when no agent is
+                # connected. See docs/AGENT_PROTOCOL.md.
+                unit_name = None
+                status_raw = None
+                if agent_transport.agent_available(host.id):
+                    candidates = _unit_candidates(cluster, svc.role)
+                    for cand in candidates:
+                        res = agent_transport.try_systemctl_is_active(host, cand)
+                        if res is None:
+                            break  # agent dropped mid-call; fall through to SSH
+                        _, raw = res
+                        if raw in ("active", "activating", "deactivating", "failed"):
+                            unit_name = cand
+                            status_raw = raw
+                            break
+                        if status_raw is None:
+                            unit_name = cand
+                            status_raw = raw or "unknown"
 
-                    results.append({
-                        "service_id": svc.id,
-                        "host": host.ip_address,
-                        "hostname": host.hostname,
-                        "role": svc.role,
-                        "node_id": svc.node_id,
-                        "unit": unit_name,
-                        "status": svc.status,
-                        "raw": status_raw,
-                    })
+                if status_raw is None:
+                    with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
+                        unit_name, status_raw = _probe_status(client, _unit_candidates(cluster, svc.role))
+
+                if status_raw in ("active", "activating"):
+                    svc.status = "running"
+                elif status_raw == "inactive":
+                    svc.status = "stopped"
+                elif status_raw == "failed":
+                    svc.status = "error"
+
+                results.append({
+                    "service_id": svc.id,
+                    "host": host.ip_address,
+                    "hostname": host.hostname,
+                    "role": svc.role,
+                    "node_id": svc.node_id,
+                    "unit": unit_name,
+                    "status": svc.status,
+                    "raw": status_raw,
+                    "via": "agent" if agent_transport.agent_available(host.id) else "ssh",
+                })
             except Exception as e:
                 results.append({
                     "service_id": svc.id,

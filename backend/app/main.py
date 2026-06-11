@@ -11,7 +11,7 @@ from app.api import (
     hosts, clusters, ws, versions, topics, kafka_connect, security, ksqldb,
     auth, logs, monitoring, broker_config, rolling_restart,
     upgrades, security_scan, cluster_linking, rebalance, ldap, activity, alerts,
-    schema_registry, external_clusters, security_tls, federation,
+    schema_registry, external_clusters, security_tls, federation, agents,
 )
 from app.models.kafka_user import KafkaUser  # noqa: F401 - ensure table creation
 from app.models.audit_log import AuditLog  # noqa: F401 - ensure table creation
@@ -26,6 +26,7 @@ from app.models.deployment_task import DeploymentTask  # noqa: F401 - ensure tab
 from app.models.alert_rule import AlertRule  # noqa: F401 - ensure table creation
 from app.models.notification_channel import NotificationChannel  # noqa: F401 - ensure table creation
 from app.models.alert_incident import AlertIncident  # noqa: F401 - ensure table creation
+from app.models.agent import Agent  # noqa: F401 - ensure table creation (agent-based deploy)
 from app.services.auth_service import AuthService
 from app.services.migrations import apply_runtime_migrations
 
@@ -107,6 +108,7 @@ app.include_router(schema_registry.router)
 app.include_router(external_clusters.router)
 app.include_router(security_tls.router)
 app.include_router(federation.router)
+app.include_router(agents.router)
 
 
 @app.get("/api/health")

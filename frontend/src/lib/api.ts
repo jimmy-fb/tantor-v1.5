@@ -123,6 +123,43 @@ export const deleteHost = (id: string) => api.delete(`/hosts/${id}`);
 export const testHost = (id: string) => api.post<HostTestResult>(`/hosts/${id}/test`).then(r => r.data);
 export const checkPrereqs = (id: string) => api.post<PrereqResult>(`/hosts/${id}/prerequisites`).then(r => r.data);
 
+// ── Agents (reverse-tunnel host agents) ──────────────
+// See docs/AGENT_PROTOCOL.md.
+
+export interface AgentRow {
+  id: string;
+  host_id: string;
+  hostname: string;
+  ip_address: string;
+  is_active: boolean;
+  agent_version: string | null;
+  os_family: string | null;
+  os_version: string | null;
+  kernel: string | null;
+  features: string[];
+  connected: boolean;
+  last_registered_at: string | null;
+  last_heartbeat_at: string | null;
+  has_pending_token: boolean;
+  registration_token_expires_at: string | null;
+}
+
+export interface MintAgentTokenResponse {
+  registration_token: string;
+  expires_at: string;
+  agent_id: string;
+  host_id: string;
+  config_hint: { scm_url: string; registration_token: string };
+}
+
+export const listAgents = () => api.get<AgentRow[]>('/agents').then(r => r.data);
+export const listConnectedAgents = () =>
+  api.get<{ connected_host_ids: string[]; count: number }>('/agents/connected').then(r => r.data);
+export const mintAgentToken = (host_id: string) =>
+  api.post<MintAgentTokenResponse>(`/hosts/${host_id}/agent/token`).then(r => r.data);
+export const revokeAgent = (host_id: string) =>
+  api.delete<{ revoked: boolean; agent_id: string }>(`/hosts/${host_id}/agent`).then(r => r.data);
+
 // ── Clusters ─────────────────────────────────────────
 export const getClusters = () => api.get<Cluster[]>('/clusters').then(r => r.data);
 export const getCluster = (id: string) => api.get<ClusterDetail>(`/clusters/${id}`).then(r => r.data);

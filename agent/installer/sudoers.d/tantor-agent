@@ -1,0 +1,62 @@
+# Tantor agent passwordless sudo allowlist.
+#
+# Installed by the agent's install script as /etc/sudoers.d/tantor-agent (mode 0440).
+# Validate after editing with:  sudo visudo -c -f /etc/sudoers.d/tantor-agent
+#
+# Defense in depth: the agent ALSO enforces its own allowlist in code. Both
+# the in-agent list and this file have to permit a command for it to run.
+
+# Hard-coded absolute paths only — no shell expansion, no wildcards in the
+# command line itself. The wildcards in `/opt/kafka-*/bin/*` are sudoers
+# glob expansion (path-only), not shell.
+
+Cmnd_Alias TANTOR_SYSTEMCTL = \
+    /bin/systemctl is-active *, \
+    /bin/systemctl status *, \
+    /bin/systemctl start kafka-*, \
+    /bin/systemctl stop kafka-*, \
+    /bin/systemctl restart kafka-*, \
+    /bin/systemctl start zookeeper-*, \
+    /bin/systemctl stop zookeeper-*, \
+    /bin/systemctl restart zookeeper-*, \
+    /usr/bin/systemctl is-active *, \
+    /usr/bin/systemctl status *, \
+    /usr/bin/systemctl start kafka-*, \
+    /usr/bin/systemctl stop kafka-*, \
+    /usr/bin/systemctl restart kafka-*, \
+    /usr/bin/systemctl start zookeeper-*, \
+    /usr/bin/systemctl stop zookeeper-*, \
+    /usr/bin/systemctl restart zookeeper-*
+
+Cmnd_Alias TANTOR_JOURNALCTL = \
+    /bin/journalctl -u *, \
+    /usr/bin/journalctl -u *
+
+Cmnd_Alias TANTOR_FILEREAD = \
+    /bin/cat /etc/kafka/*, \
+    /bin/cat /opt/kafka-*/config/*, \
+    /usr/bin/cat /etc/kafka/*, \
+    /usr/bin/cat /opt/kafka-*/config/*
+
+Cmnd_Alias TANTOR_FILEWRITE = \
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /opt/kafka-*/config/server.properties, \
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /opt/kafka-*/config/server.properties.bak
+
+Cmnd_Alias TANTOR_KAFKA_CLI = \
+    /opt/kafka-*/bin/kafka-topics.sh, \
+    /opt/kafka-*/bin/kafka-configs.sh, \
+    /opt/kafka-*/bin/kafka-acls.sh, \
+    /opt/kafka-*/bin/kafka-consumer-groups.sh
+
+Cmnd_Alias TANTOR_EXEC = \
+    /bin/ss -tnlp, \
+    /usr/sbin/ss -tnlp, \
+    /usr/bin/ss -tnlp, \
+    /bin/systemd-cgls --unit * --no-pager, \
+    /usr/bin/systemd-cgls --unit * --no-pager
+
+tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_KAFKA_CLI, TANTOR_EXEC
+
+# Reject shell escapes outright. Even though the cmd alias paths don't include
+# any shell, this defends against operator-added entries that might.
+Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_KAFKA_CLI,TANTOR_EXEC !requiretty

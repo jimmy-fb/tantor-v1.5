@@ -5,6 +5,7 @@ import { testHost, checkPrereqs, deleteHost, updateHost } from '../../lib/api';
 import { isAdmin } from '../../lib/auth';
 import PrereqResults from './PrereqResults';
 import EditHostModal from './EditHostModal';
+import AgentControls from './AgentControls';
 
 interface Props {
   hosts: Host[];
@@ -118,6 +119,8 @@ export default function HostList({ hosts, onRefresh }: Props) {
               <PrereqResults result={prereqResults[host.id]} />
             </div>
           )}
+
+          <AgentControls hostId={host.id} />
         </div>
       ))}
 
