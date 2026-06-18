@@ -1,21 +1,25 @@
 """Agent registration + connection endpoints.
 
-POST   /api/hosts/{host_id}/agent/token   — mint a one-shot registration token
-DELETE /api/hosts/{host_id}/agent         — revoke/disable agent for host
-GET    /api/agents                        — list agents (admin/monitor)
-GET    /api/agents/connected              — live connection map (per-worker)
-WS     /api/agents/connect                — the actual agent connection
+POST   /api/hosts/{host_id}/agent/token       — mint a one-shot registration token
+DELETE /api/hosts/{host_id}/agent             — revoke/disable agent for host
+GET    /api/agents                            — list agents (admin/monitor)
+GET    /api/agents/connected                  — live connection map (per-worker)
+GET    /api/agents/install.sh                 — one-line bootstrap installer
+GET    /api/agents/binary/{platform}          — download the platform-matched binary
+WS     /api/agents/connect                    — the actual agent connection
 
-The token endpoint is admin-only; everything else is admin/monitor.
+The token endpoint and install.sh are admin-only; everything else is admin/monitor.
 """
 from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import FileResponse, PlainTextResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import require_admin, require_monitor_or_above
@@ -46,19 +50,37 @@ router = APIRouter(prefix="/api", tags=["agents"])
 # Default server-side allowlist a fresh agent receives. The agent has its
 # own local allowlist (defense in depth) — the intersection of the two wins.
 DEFAULT_ALLOWED_OPS = [
+    # Service lifecycle (used by cluster_manager start/stop/restart, status probes,
+    # cleanup-on-delete, rolling restart).
     "systemctl.is_active",
     "systemctl.status",
+    "systemctl.cat",
     "systemctl.start",
     "systemctl.stop",
     "systemctl.restart",
+    "systemctl.enable",
+    "systemctl.disable",
+    "systemctl.reset_failed",
+    "systemctl.reset_failed_all",
+    "systemctl.kill",
+    "systemctl.daemon_reload",
+    # Logs (logs.py)
     "journalctl.read",
+    # File ops (broker_config.py edits, agent-based deploy writes unit files
+    # to /etc/systemd/system/kafka-*).
     "file.read:/etc/kafka/",
     "file.read:/opt/kafka-*/config/",
     "file.write:/opt/kafka-*/config/server.properties",
+    "file.write:/etc/systemd/system/kafka-*.service",
+    "file.write:/etc/systemd/system/zookeeper-*.service",
+    "file.delete:/etc/systemd/system/kafka-*.service",
+    "file.delete:/etc/systemd/system/zookeeper-*.service",
+    # kafka CLI (kafka_admin.py SSH fallback path swaps onto this).
     "kafka_cli.topics",
     "kafka_cli.configs",
     "kafka_cli.acls",
     "kafka_cli.consumer_groups",
+    # Diagnostics
     "exec.ss",
     "exec.systemd-cgls",
 ]
@@ -68,7 +90,7 @@ DEFAULT_ALLOWED_OPS = [
 
 
 @router.post("/hosts/{host_id}/agent/token", status_code=201)
-def mint_token(host_id: str, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+def mint_token(host_id: str, request: Request, db: Session = Depends(get_db), _: User = Depends(require_admin)):
     """Generate a one-shot registration token for the named host.
 
     The plaintext token is returned ONCE; we persist only its bcrypt hash.
@@ -95,15 +117,26 @@ def mint_token(host_id: str, db: Session = Depends(get_db), _: User = Depends(re
     db.commit()
     db.refresh(agent)
 
+    # Build the one-line install command the operator can paste into the
+    # broker host. Uses the inbound Host header so the URL points back to
+    # the same SCM that minted the token.
+    scm_http_url = f"{request.url.scheme}://{request.headers.get('host', request.base_url.hostname or 'tantor.local')}"
+    install_cmd = (
+        f"curl -fsSL '{scm_http_url}/api/agents/install.sh?host={host_id}&token={plaintext}' | sudo bash"
+    )
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    scm_ws_url = f"{scheme}://{request.headers.get('host', 'tantor.local')}/api/agents/connect"
+
     return {
         "registration_token": plaintext,
         "expires_at": expires.isoformat(),
         "agent_id": agent.id,
         "host_id": host_id,
-        # Pre-rendered config snippet the admin can paste into
-        # /etc/tantor-agent/config.yaml on the broker host.
+        # One-line installer the operator runs on the broker host.
+        "install_command": install_cmd,
+        # Config snippet for manual installs (air-gapped, custom packaging).
         "config_hint": {
-            "scm_url": _public_ws_url(),
+            "scm_url": scm_ws_url,
             "registration_token": plaintext,
         },
     }
@@ -133,6 +166,232 @@ def _public_ws_url() -> str:
     """Return a placeholder wss:// URL — the admin overrides this in the
     agent's config.yaml with the actual SCM hostname."""
     return "wss://<TANTOR-PUBLIC-HOSTNAME>/api/agents/connect"
+
+
+# ---------- Bootstrap installer ----------
+#
+# Operators run a single curl|sh on the broker host to install the agent.
+# The flow:
+#   1. UI calls POST /api/hosts/{id}/agent/token to mint a one-shot token.
+#   2. UI shows the operator: `curl -fsSL https://<SCM>/api/agents/install.sh?host=<id>&token=<tok> | sudo bash`
+#   3. install.sh detects the platform (linux/amd64 vs linux/arm64), downloads
+#      the matching binary from /api/agents/binary/<platform>, drops the
+#      systemd unit + sudoers profile, writes config.yaml with the SCM URL +
+#      token, and `systemctl enable --now tantor-agent`.
+#
+# Zero SSH needed. The customer's network admin only needs outbound 443 from
+# the broker host to the SCM — the same connection the agent will use for
+# normal operations.
+#
+# The endpoint that serves install.sh is intentionally NOT auth-gated by
+# JWT — the secret material is the registration token embedded in the
+# URL, which is one-shot and host-specific. Anyone who has the URL has
+# already been given enough credential to install the agent.
+
+_AGENT_BIN_DIR = os.environ.get("TANTOR_AGENT_BIN_DIR", "/opt/tantor/agent-binaries")
+_AGENT_PLATFORMS = {
+    "linux-amd64": "tantor-agent-linux-amd64",
+    "linux-arm64": "tantor-agent-linux-arm64",
+}
+
+
+@router.get("/agents/install.sh", response_class=PlainTextResponse)
+def install_script(request: Request, host: str = Query(..., description="Host UUID minted via POST /api/hosts/{id}/agent/token"), token: str = Query(..., description="Registration token plaintext")):
+    """Renders the bootstrap install script with the SCM URL and token baked in."""
+    # SCM URL: figure out from the inbound request's host header so the
+    # script always points back to the same SCM the admin reached.
+    scheme = "wss" if request.url.scheme == "https" else "ws"
+    scm_host = request.headers.get("host", str(request.base_url.hostname or "tantor.local"))
+    scm_ws_url = f"{scheme}://{scm_host}/api/agents/connect"
+    scm_http_url = f"{request.url.scheme}://{scm_host}"
+
+    # Note: this script is rendered server-side once per install. The
+    # token + URL are embedded inline; the agent will swap to a long-lived
+    # JWT on first connect.
+    script = f"""#!/usr/bin/env bash
+# Tantor agent bootstrap installer — auto-generated by the SCM.
+# Run as root on a fresh broker host:
+#   curl -fsSL '{scm_http_url}/api/agents/install.sh?host={host}&token={token}' | sudo bash
+set -euo pipefail
+
+if [ "$(id -u)" != "0" ]; then
+    echo "tantor-agent installer must run as root" >&2; exit 1
+fi
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64|amd64)  PLATFORM=linux-amd64 ;;
+    aarch64|arm64) PLATFORM=linux-arm64 ;;
+    *) echo "Unsupported architecture: $ARCH" >&2; exit 1 ;;
+esac
+
+SCM_URL="{scm_http_url}"
+WS_URL="{scm_ws_url}"
+HOST_ID="{host}"
+REG_TOKEN="{token}"
+BIN_DIR=/usr/local/bin
+CFG_DIR=/etc/tantor-agent
+STATE_DIR=/var/lib/tantor-agent
+
+echo "[tantor-agent] detected platform: $PLATFORM"
+echo "[tantor-agent] SCM: $SCM_URL"
+
+# 1) Service account + dirs
+if ! id tantor-agent >/dev/null 2>&1; then
+    useradd --system --shell /usr/sbin/nologin --home-dir "$STATE_DIR" tantor-agent
+fi
+install -d -o tantor-agent -g tantor-agent -m 0700 "$STATE_DIR"
+install -d -o root -g tantor-agent -m 0750 "$CFG_DIR"
+
+# 2) Download binary
+echo "[tantor-agent] downloading binary..."
+TMP_BIN=$(mktemp)
+curl -fsSL "$SCM_URL/api/agents/binary/$PLATFORM" -o "$TMP_BIN"
+install -m 0755 -o root -g root "$TMP_BIN" "$BIN_DIR/tantor-agent"
+rm -f "$TMP_BIN"
+
+# 3) Write config.yaml
+cat > "$CFG_DIR/config.yaml" <<EOF
+scm_url: "$WS_URL"
+registration_token: "$REG_TOKEN"
+tls_verify: true
+state_dir: "$STATE_DIR"
+
+allowed_operations:
+  - systemctl.is_active
+  - systemctl.status
+  - systemctl.cat
+  - systemctl.start
+  - systemctl.stop
+  - systemctl.restart
+  - systemctl.enable
+  - systemctl.disable
+  - systemctl.reset_failed
+  - systemctl.reset_failed_all
+  - systemctl.kill
+  - systemctl.daemon_reload
+  - journalctl.read
+  - file.read:/etc/kafka/
+  - file.read:/opt/kafka-*/config/
+  - file.write:/opt/kafka-*/config/server.properties
+  - file.write:/etc/systemd/system/kafka-*.service
+  - file.write:/etc/systemd/system/zookeeper-*.service
+  - file.delete:/etc/systemd/system/kafka-*.service
+  - file.delete:/etc/systemd/system/zookeeper-*.service
+  - kafka_cli.topics
+  - kafka_cli.configs
+  - kafka_cli.acls
+  - kafka_cli.consumer_groups
+  - exec.ss
+  - exec.systemd-cgls
+EOF
+chmod 0640 "$CFG_DIR/config.yaml"
+chown root:tantor-agent "$CFG_DIR/config.yaml"
+
+# 4) Sudoers profile
+cat > /etc/sudoers.d/tantor-agent.tmp <<'SUDOERS_EOF'
+Cmnd_Alias TANTOR_SYSTEMCTL = \\
+    /bin/systemctl is-active *, /bin/systemctl status *, /bin/systemctl cat *, \\
+    /bin/systemctl start kafka-*, /bin/systemctl stop kafka-*, /bin/systemctl restart kafka-*, \\
+    /bin/systemctl enable kafka-*, /bin/systemctl disable kafka-*, /bin/systemctl reset-failed kafka-*, \\
+    /bin/systemctl reset-failed, /bin/systemctl kill --kill-who=* kafka-*, /bin/systemctl daemon-reload, \\
+    /bin/systemctl start zookeeper-*, /bin/systemctl stop zookeeper-*, /bin/systemctl restart zookeeper-*, \\
+    /bin/systemctl enable zookeeper-*, /bin/systemctl disable zookeeper-*, /bin/systemctl reset-failed zookeeper-*, \\
+    /bin/systemctl kill --kill-who=* zookeeper-*, \\
+    /usr/bin/systemctl is-active *, /usr/bin/systemctl status *, /usr/bin/systemctl cat *, \\
+    /usr/bin/systemctl start kafka-*, /usr/bin/systemctl stop kafka-*, /usr/bin/systemctl restart kafka-*, \\
+    /usr/bin/systemctl enable kafka-*, /usr/bin/systemctl disable kafka-*, /usr/bin/systemctl reset-failed kafka-*, \\
+    /usr/bin/systemctl reset-failed, /usr/bin/systemctl kill --kill-who=* kafka-*, /usr/bin/systemctl daemon-reload, \\
+    /usr/bin/systemctl start zookeeper-*, /usr/bin/systemctl stop zookeeper-*, /usr/bin/systemctl restart zookeeper-*, \\
+    /usr/bin/systemctl enable zookeeper-*, /usr/bin/systemctl disable zookeeper-*, /usr/bin/systemctl reset-failed zookeeper-*, \\
+    /usr/bin/systemctl kill --kill-who=* zookeeper-*
+Cmnd_Alias TANTOR_JOURNALCTL = /bin/journalctl -u *, /usr/bin/journalctl -u *
+Cmnd_Alias TANTOR_FILEREAD = /bin/cat /etc/kafka/*, /bin/cat /opt/kafka-*/config/*, /usr/bin/cat /etc/kafka/*, /usr/bin/cat /opt/kafka-*/config/*
+Cmnd_Alias TANTOR_FILEWRITE = \\
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /opt/kafka-*/config/server.properties, \\
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /opt/kafka-*/config/server.properties.bak, \\
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /etc/systemd/system/kafka-*.service, \\
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /etc/systemd/system/zookeeper-*.service
+Cmnd_Alias TANTOR_FILEDELETE = \\
+    /bin/rm -f /etc/systemd/system/kafka-*.service, /bin/rm -f /etc/systemd/system/zookeeper-*.service, \\
+    /usr/bin/rm -f /etc/systemd/system/kafka-*.service, /usr/bin/rm -f /etc/systemd/system/zookeeper-*.service
+Cmnd_Alias TANTOR_KAFKA_CLI = /opt/kafka-*/bin/kafka-topics.sh, /opt/kafka-*/bin/kafka-configs.sh, /opt/kafka-*/bin/kafka-acls.sh, /opt/kafka-*/bin/kafka-consumer-groups.sh
+Cmnd_Alias TANTOR_EXEC = /bin/ss -tnlp, /usr/sbin/ss -tnlp, /usr/bin/ss -tnlp, /bin/systemd-cgls --unit * --no-pager, /usr/bin/systemd-cgls --unit * --no-pager
+
+tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_FILEDELETE, TANTOR_KAFKA_CLI, TANTOR_EXEC
+Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_FILEDELETE,TANTOR_KAFKA_CLI,TANTOR_EXEC !requiretty
+SUDOERS_EOF
+visudo -c -f /etc/sudoers.d/tantor-agent.tmp >/dev/null
+install -m 0440 -o root -g root /etc/sudoers.d/tantor-agent.tmp /etc/sudoers.d/tantor-agent
+rm -f /etc/sudoers.d/tantor-agent.tmp
+
+# 5) systemd unit
+cat > /etc/systemd/system/tantor-agent.service <<'SYSTEMD_EOF'
+[Unit]
+Description=Tantor host agent (reverse-tunnel to Tantor SCM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tantor-agent
+Group=tantor-agent
+ExecStart=/usr/local/bin/tantor-agent --config /etc/tantor-agent/config.yaml
+Restart=always
+RestartSec=5
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/tantor-agent
+NoNewPrivileges=false
+CPUQuota=50%
+MemoryMax=256M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+chmod 0644 /etc/systemd/system/tantor-agent.service
+
+# 6) Enable + start
+systemctl daemon-reload
+systemctl enable --now tantor-agent
+
+# 7) Wait briefly for first connect to validate
+sleep 3
+if systemctl is-active --quiet tantor-agent; then
+    echo "[tantor-agent] installed and running. Watch logs with: journalctl -u tantor-agent -f"
+else
+    echo "[tantor-agent] WARNING: service not active. Check: journalctl -u tantor-agent -n 50"
+    exit 1
+fi
+"""
+    return PlainTextResponse(content=script, media_type="text/x-shellscript")
+
+
+@router.get("/agents/binary/{platform}")
+def download_binary(platform: str):
+    """Serve the platform-matched agent binary. Used by install.sh.
+
+    Operators populate TANTOR_AGENT_BIN_DIR with the cross-compiled binaries
+    at install time (or via the rpm/deb package). The default location is
+    `/opt/tantor/agent-binaries/`.
+    """
+    binary_name = _AGENT_PLATFORMS.get(platform)
+    if binary_name is None:
+        raise HTTPException(status_code=404, detail=f"unknown platform {platform!r}; expected one of {sorted(_AGENT_PLATFORMS)}")
+    path = os.path.join(_AGENT_BIN_DIR, binary_name)
+    if not os.path.isfile(path):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"agent binary not present at {path}. "
+                f"Operators must populate {_AGENT_BIN_DIR}/ on the SCM host "
+                f"with cross-compiled binaries (`make agent-binaries` or "
+                f"`cd agent && GOOS=linux GOARCH=amd64 go build ...`)."
+            ),
+        )
+    return FileResponse(path, media_type="application/octet-stream", filename=binary_name)
 
 
 @router.get("/agents")

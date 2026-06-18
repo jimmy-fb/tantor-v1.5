@@ -13,20 +13,42 @@
 Cmnd_Alias TANTOR_SYSTEMCTL = \
     /bin/systemctl is-active *, \
     /bin/systemctl status *, \
+    /bin/systemctl cat *, \
     /bin/systemctl start kafka-*, \
     /bin/systemctl stop kafka-*, \
     /bin/systemctl restart kafka-*, \
+    /bin/systemctl enable kafka-*, \
+    /bin/systemctl disable kafka-*, \
+    /bin/systemctl reset-failed kafka-*, \
+    /bin/systemctl reset-failed, \
+    /bin/systemctl kill --kill-who=* kafka-*, \
+    /bin/systemctl daemon-reload, \
     /bin/systemctl start zookeeper-*, \
     /bin/systemctl stop zookeeper-*, \
     /bin/systemctl restart zookeeper-*, \
+    /bin/systemctl enable zookeeper-*, \
+    /bin/systemctl disable zookeeper-*, \
+    /bin/systemctl reset-failed zookeeper-*, \
+    /bin/systemctl kill --kill-who=* zookeeper-*, \
     /usr/bin/systemctl is-active *, \
     /usr/bin/systemctl status *, \
+    /usr/bin/systemctl cat *, \
     /usr/bin/systemctl start kafka-*, \
     /usr/bin/systemctl stop kafka-*, \
     /usr/bin/systemctl restart kafka-*, \
+    /usr/bin/systemctl enable kafka-*, \
+    /usr/bin/systemctl disable kafka-*, \
+    /usr/bin/systemctl reset-failed kafka-*, \
+    /usr/bin/systemctl reset-failed, \
+    /usr/bin/systemctl kill --kill-who=* kafka-*, \
+    /usr/bin/systemctl daemon-reload, \
     /usr/bin/systemctl start zookeeper-*, \
     /usr/bin/systemctl stop zookeeper-*, \
-    /usr/bin/systemctl restart zookeeper-*
+    /usr/bin/systemctl restart zookeeper-*, \
+    /usr/bin/systemctl enable zookeeper-*, \
+    /usr/bin/systemctl disable zookeeper-*, \
+    /usr/bin/systemctl reset-failed zookeeper-*, \
+    /usr/bin/systemctl kill --kill-who=* zookeeper-*
 
 Cmnd_Alias TANTOR_JOURNALCTL = \
     /bin/journalctl -u *, \
@@ -40,7 +62,15 @@ Cmnd_Alias TANTOR_FILEREAD = \
 
 Cmnd_Alias TANTOR_FILEWRITE = \
     /usr/bin/install -m * /tmp/tantor-agent-write-* /opt/kafka-*/config/server.properties, \
-    /usr/bin/install -m * /tmp/tantor-agent-write-* /opt/kafka-*/config/server.properties.bak
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /opt/kafka-*/config/server.properties.bak, \
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /etc/systemd/system/kafka-*.service, \
+    /usr/bin/install -m * /tmp/tantor-agent-write-* /etc/systemd/system/zookeeper-*.service
+
+Cmnd_Alias TANTOR_FILEDELETE = \
+    /bin/rm -f /etc/systemd/system/kafka-*.service, \
+    /bin/rm -f /etc/systemd/system/zookeeper-*.service, \
+    /usr/bin/rm -f /etc/systemd/system/kafka-*.service, \
+    /usr/bin/rm -f /etc/systemd/system/zookeeper-*.service
 
 Cmnd_Alias TANTOR_KAFKA_CLI = \
     /opt/kafka-*/bin/kafka-topics.sh, \
@@ -55,8 +85,8 @@ Cmnd_Alias TANTOR_EXEC = \
     /bin/systemd-cgls --unit * --no-pager, \
     /usr/bin/systemd-cgls --unit * --no-pager
 
-tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_KAFKA_CLI, TANTOR_EXEC
+tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_FILEDELETE, TANTOR_KAFKA_CLI, TANTOR_EXEC
 
 # Reject shell escapes outright. Even though the cmd alias paths don't include
 # any shell, this defends against operator-added entries that might.
-Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_KAFKA_CLI,TANTOR_EXEC !requiretty
+Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_FILEDELETE,TANTOR_KAFKA_CLI,TANTOR_EXEC !requiretty

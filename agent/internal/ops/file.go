@@ -27,15 +27,36 @@ type fileWriteArgs struct {
 	Sudo    bool   `json:"use_sudo"` // when true, `sudo install -m ...`
 }
 
+type fileDeleteArgs struct {
+	Path string `json:"path"`
+}
+
 func (d *Dispatcher) runFile(ctx context.Context, cmd *proto.CmdPayload, timeout time.Duration) (*proto.ResultPayload, *proto.ErrorPayload) {
 	switch cmd.Op {
 	case "file.read":
 		return d.runFileRead(ctx, cmd, timeout)
 	case "file.write":
 		return d.runFileWrite(ctx, cmd, timeout)
+	case "file.delete":
+		return d.runFileDelete(ctx, cmd, timeout)
 	default:
 		return nil, &proto.ErrorPayload{Code: proto.ErrBadArgs, Message: fmt.Sprintf("unsupported file op %q", cmd.Op)}
 	}
+}
+
+func (d *Dispatcher) runFileDelete(ctx context.Context, cmd *proto.CmdPayload, timeout time.Duration) (*proto.ResultPayload, *proto.ErrorPayload) {
+	var args fileDeleteArgs
+	if err := json.Unmarshal(cmd.Args, &args); err != nil {
+		return nil, &proto.ErrorPayload{Code: proto.ErrBadArgs, Message: err.Error()}
+	}
+	clean := filepath.Clean(args.Path)
+	if clean != args.Path || strings.Contains(clean, "..") {
+		return nil, &proto.ErrorPayload{Code: proto.ErrBadArgs, Message: "path must be absolute and free of '..'"}
+	}
+	// `rm` is locked down via sudoers — only specific unit-file globs are
+	// allowed (see installer/sudoers.d/tantor-agent). Other paths refuse.
+	r, err := exec.Run(ctx, timeout, true, "rm", "-f", clean)
+	return runResult(r, err)
 }
 
 func (d *Dispatcher) runFileRead(ctx context.Context, cmd *proto.CmdPayload, timeout time.Duration) (*proto.ResultPayload, *proto.ErrorPayload) {

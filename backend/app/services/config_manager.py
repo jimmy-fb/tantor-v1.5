@@ -265,69 +265,112 @@ class ConfigManager:
         if not host:
             raise ValueError("Host not found")
 
-        from app.services import cluster_paths
+        from app.services import agent_transport, cluster_paths
         config_path = f"{cluster_paths.install_dir(cluster)}/config/server.properties"
 
-        with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
-            # Read current config (sudo — file is owned by kafka:kafka mode 640)
-            exit_code, stdout, stderr = SSHManager.exec_command(client, f"sudo -n cat {config_path}", timeout=15)
-            if exit_code != 0:
-                raise RuntimeError(f"Failed to read config: {stderr}")
-
-            current_configs = self._parse_properties(stdout)
-            old_value = current_configs.get(config_key)
-
-            # Update the config file
-            lines = stdout.splitlines()
-            updated = False
-            new_lines = []
-            for line in lines:
-                stripped = line.strip()
-                if stripped.startswith(f"{config_key}=") or stripped.startswith(f"{config_key} ="):
+        # Agent-first: read + write server.properties through the host's
+        # connected tantor-agent so we never need SSH for broker config edits.
+        used_agent = False
+        if agent_transport.agent_available(host.id):
+            try:
+                ok_read, stdout_agent = agent_transport.file_read_via_agent(host, config_path)
+                if not ok_read:
+                    raise RuntimeError(f"Failed to read config via agent: {stdout_agent}")
+                stdout = stdout_agent
+                current_configs = self._parse_properties(stdout)
+                old_value = current_configs.get(config_key)
+                lines = stdout.splitlines()
+                updated = False
+                new_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith(f"{config_key}=") or stripped.startswith(f"{config_key} ="):
+                        new_lines.append(f"{config_key}={config_value}")
+                        updated = True
+                    else:
+                        new_lines.append(line)
+                if not updated:
                     new_lines.append(f"{config_key}={config_value}")
-                    updated = True
-                else:
-                    new_lines.append(line)
-            if not updated:
-                new_lines.append(f"{config_key}={config_value}")
+                new_content = "\n".join(new_lines) + "\n"
+                ok_write, write_msg = agent_transport.file_write_via_agent(
+                    host, config_path, new_content, mode=0o640,
+                )
+                if not ok_write:
+                    raise RuntimeError(f"Failed to write config via agent: {write_msg}")
+                used_agent = True
+            except RuntimeError:
+                raise
+            except Exception as e:
+                # Any transport-level error falls back to the SSH path so
+                # operators in mixed environments stay covered.
+                import logging as _logging
+                _logging.getLogger("tantor.config_manager").warning(
+                    "agent broker-config edit failed (%s); falling back to SSH", e,
+                )
 
-            new_content = "\n".join(new_lines) + "\n"
+        if not used_agent:
+            with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
+                # Read current config (sudo — file is owned by kafka:kafka mode 640)
+                exit_code, stdout, stderr = SSHManager.exec_command(client, f"sudo -n cat {config_path}", timeout=15)
+                if exit_code != 0:
+                    raise RuntimeError(f"Failed to read config: {stderr}")
 
-            # Write back. SFTP can't write a file the SSH user doesn't own,
-            # so we stage in /tmp via SFTP then `sudo install` to the kafka
-            # location preserving the kafka:kafka ownership and 640 mode.
-            import uuid as _uuid
-            tmp_path = f"/tmp/tantor-{_uuid.uuid4().hex}.properties"
-            SSHManager.upload_content(client, new_content, tmp_path)
-            install_cmd = (
-                f"sudo -n install -o kafka -g kafka -m 640 {tmp_path} {config_path} "
-                f"&& sudo -n rm -f {tmp_path}"
-            )
-            rc, out, err = SSHManager.exec_command(client, install_cmd, timeout=15)
-            if rc != 0:
-                raise RuntimeError(f"Failed to write config (sudo install): {err or out}")
+                current_configs = self._parse_properties(stdout)
+                old_value = current_configs.get(config_key)
 
-            # Audit log
-            audit = ConfigAuditLog(
-                cluster_id=cluster_id,
-                broker_id=broker_id,
-                config_key=config_key,
-                old_value=old_value,
-                new_value=config_value,
-                changed_by=username,
-                change_type="update",
-            )
-            db.add(audit)
-            db.commit()
+                # Update the config file
+                lines = stdout.splitlines()
+                updated = False
+                new_lines = []
+                for line in lines:
+                    stripped = line.strip()
+                    if stripped.startswith(f"{config_key}=") or stripped.startswith(f"{config_key} ="):
+                        new_lines.append(f"{config_key}={config_value}")
+                        updated = True
+                    else:
+                        new_lines.append(line)
+                if not updated:
+                    new_lines.append(f"{config_key}={config_value}")
 
-            logger.info(f"Config updated: {config_key}={config_value} on broker {broker_id} by {username}")
-            return {
-                "broker_id": broker_id,
-                "config_key": config_key,
-                "old_value": old_value,
-                "new_value": config_value,
-                "requires_restart": not KAFKA_BROKER_CONFIGS.get(config_key, {}).get("dynamic", False),
-            }
+                new_content = "\n".join(new_lines) + "\n"
+
+                # Write back. SFTP can't write a file the SSH user doesn't own,
+                # so we stage in /tmp via SFTP then `sudo install` to the kafka
+                # location preserving the kafka:kafka ownership and 640 mode.
+                import uuid as _uuid
+                tmp_path = f"/tmp/tantor-{_uuid.uuid4().hex}.properties"
+                SSHManager.upload_content(client, new_content, tmp_path)
+                install_cmd = (
+                    f"sudo -n install -o kafka -g kafka -m 640 {tmp_path} {config_path} "
+                    f"&& sudo -n rm -f {tmp_path}"
+                )
+                rc, out, err = SSHManager.exec_command(client, install_cmd, timeout=15)
+                if rc != 0:
+                    raise RuntimeError(f"Failed to write config (sudo install): {err or out}")
+
+        # Audit log — runs whichever transport (agent or SSH) actually
+        # made the change.
+        audit = ConfigAuditLog(
+            cluster_id=cluster_id,
+            broker_id=broker_id,
+            config_key=config_key,
+            old_value=old_value,
+            new_value=config_value,
+            changed_by=username,
+            change_type="update",
+        )
+        db.add(audit)
+        db.commit()
+
+        logger.info(f"Config updated: {config_key}={config_value} on broker {broker_id} via {'agent' if used_agent else 'ssh'} by {username}")
+        return {
+            "broker_id": broker_id,
+            "config_key": config_key,
+            "old_value": old_value,
+            "new_value": config_value,
+            "requires_restart": not KAFKA_BROKER_CONFIGS.get(config_key, {}).get("dynamic", False),
+            "via": "agent" if used_agent else "ssh",
+        }
 
     def bulk_update_broker_config(
         self, cluster_id: str, config_key: str, config_value: str,

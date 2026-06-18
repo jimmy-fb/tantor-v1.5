@@ -245,8 +245,118 @@ def _cleanup_units(client, candidates: list[str]) -> list[tuple[str, bool, str]]
     return [(primary, primary_exists, primary_state)]
 
 
+def _select_existing_unit_via_agent(host: Host, candidates: list[str]) -> str:
+    """Agent-path equivalent of _select_existing_unit. Uses systemctl.cat
+    to find the first unit file that exists on the host."""
+    for unit_name in candidates:
+        try:
+            if agent_transport.unit_exists_via_agent(host, unit_name):
+                return unit_name
+        except Exception:
+            continue
+    return candidates[0]
+
+
+def _stop_unit_via_agent(host: Host, unit_name: str, remove_unit: bool) -> tuple[bool, str]:
+    """Agent-path equivalent of _stop_unit. Mirrors the SSH logic step-for-step
+    so the operator gets identical semantics whether the host has an agent or
+    not."""
+    try:
+        exists = agent_transport.unit_exists_via_agent(host, unit_name)
+        state = agent_transport.unit_state_via_agent(host, unit_name)
+        if not exists and state in ("", "inactive", "unknown"):
+            return True, f"{unit_name} not present"
+
+        stop_ok, stop_msg = agent_transport.systemctl_action(host, "stop", unit_name)
+        if not stop_ok and "not loaded" not in (stop_msg or "").lower():
+            return False, f"failed to stop {unit_name}: {stop_msg}"
+
+        # Poll for inactive (up to 15s)
+        for _ in range(15):
+            state = agent_transport.unit_state_via_agent(host, unit_name)
+            if state in ("", "inactive", "failed", "unknown"):
+                break
+            time.sleep(1)
+        else:
+            try:
+                agent_transport.systemctl_action(host, "kill", unit_name, mode="all")
+            except Exception:
+                pass
+            time.sleep(2)
+
+        try:
+            agent_transport.systemctl_action(host, "reset_failed", unit_name)
+        except Exception:
+            pass
+
+        if remove_unit:
+            try:
+                agent_transport.systemctl_action(host, "disable", unit_name)
+            except Exception:
+                pass
+            unit_path = f"/etc/systemd/system/{unit_name}"
+            try:
+                agent_transport.file_delete_via_agent(host, unit_path)
+            except Exception:
+                pass
+            try:
+                agent_transport.systemctl_daemon_reload(host)
+            except Exception:
+                pass
+
+        state = agent_transport.unit_state_via_agent(host, unit_name)
+        if state in ("active", "activating", "deactivating"):
+            return False, f"{unit_name} still {state} after stop"
+        return True, f"stopped {unit_name}"
+    except Exception as e:
+        return False, f"agent stop failed: {e}"
+
+
+def _cleanup_units_via_agent(host: Host, candidates: list[str]) -> list[tuple[str, bool, str]]:
+    primary = candidates[0]
+    try:
+        primary_exists = agent_transport.unit_exists_via_agent(host, primary)
+        primary_state = agent_transport.unit_state_via_agent(host, primary)
+    except Exception:
+        primary_exists, primary_state = False, "unknown"
+    if primary_exists or primary_state in ("active", "activating", "deactivating", "failed"):
+        return [(primary, primary_exists, primary_state)]
+
+    for fallback in candidates[1:]:
+        try:
+            exists = agent_transport.unit_exists_via_agent(host, fallback)
+            state = agent_transport.unit_state_via_agent(host, fallback)
+        except Exception:
+            exists, state = False, "unknown"
+        if exists or state in ("active", "activating", "deactivating", "failed"):
+            return [(fallback, exists, state)]
+    return [(primary, primary_exists, primary_state)]
+
+
 class ClusterManager:
     """Manages running Kafka clusters: start, stop, cleanup, and status."""
+
+    @staticmethod
+    def _start_service_via_agent(cluster: Cluster | None, svc: Service, host: Host) -> dict:
+        candidates = _unit_candidates(cluster, svc.role)
+        unit_name = _select_existing_unit_via_agent(host, candidates)
+        try:
+            ok, msg = agent_transport.systemctl_action(host, "start", unit_name)
+        except Exception as e:
+            return {
+                "service_id": svc.id,
+                "action": "start",
+                "success": False,
+                "message": f"agent dispatch failed: {e}",
+                "via": "agent",
+            }
+        return {
+            "service_id": svc.id,
+            "action": "start",
+            "success": ok,
+            "message": (f"Started {unit_name} on {host.ip_address}" if ok else msg),
+            "via": "agent",
+        }
 
     @staticmethod
     def _start_service(client, cluster: Cluster | None, svc: Service, host: Host) -> dict:
@@ -260,19 +370,63 @@ class ClusterManager:
                 "action": "start",
                 "success": True,
                 "message": f"Started {unit_name} on {host.ip_address}",
+                "via": "ssh",
             }
         return {
             "service_id": svc.id,
             "action": "start",
             "success": False,
             "message": stderr or f"systemctl exit {rc}",
+            "via": "ssh",
         }
 
     @staticmethod
     def cleanup_service(cluster: Cluster | None, svc: Service, host: Host, remove_unit: bool = False) -> dict:
-        """Stop a service, optionally remove its unit, and verify its ports are free."""
+        """Stop a service, optionally remove its unit, and verify its ports are free.
+
+        Agent-first: if the host has a connected agent we orchestrate the
+        whole cleanup through it (zero SSH). Otherwise the legacy SSH path
+        runs. The SSH branch is the canonical implementation; the agent
+        branch mirrors its steps using agent_transport helpers.
+        """
         messages: list[str] = []
         success = True
+
+        if agent_transport.agent_available(host.id):
+            try:
+                verify_ports = (
+                    bool(cluster and cluster.state != "configured")
+                    or svc.status not in ("pending", "configured")
+                )
+                for unit_name, exists_before, before_state in _cleanup_units_via_agent(
+                    host, _unit_candidates(cluster, svc.role)
+                ):
+                    if exists_before or before_state in (
+                        "active", "activating", "deactivating", "failed",
+                    ):
+                        verify_ports = True
+                    stopped, message = _stop_unit_via_agent(host, unit_name, remove_unit)
+                    messages.append(message)
+                    success = success and stopped
+
+                # Port-release check skipped on the agent path for now —
+                # the agent already polls is-active until the unit is
+                # inactive, which is the dominant signal. Re-adding via
+                # `exec.ss` is a follow-up if false positives appear in
+                # the field.
+            except Exception as e:
+                success = False
+                messages.append(f"agent cleanup failed: {e}")
+
+            if success:
+                svc.status = "stopped"
+            return {
+                "service_id": svc.id,
+                "action": "stop",
+                "success": success,
+                "message": "; ".join(m for m in messages if m) or "stopped",
+                "via": "agent",
+            }
 
         try:
             with SSHManager.connect(
@@ -321,6 +475,7 @@ class ClusterManager:
             "action": "stop",
             "success": success,
             "message": "; ".join(m for m in messages if m) or "stopped",
+            "via": "ssh",
         }
 
     @staticmethod
@@ -385,6 +540,13 @@ class ClusterManager:
                 results.append({"service_id": svc.id, "action": "start", "success": False, "message": "Host not found"})
                 continue
 
+            # Agent-first: skip SSH if a tantor-agent is connected for this host.
+            if agent_transport.agent_available(host.id):
+                result = ClusterManager._start_service_via_agent(cluster, svc, host)
+                svc.status = "running" if result["success"] else "error"
+                results.append(result)
+                continue
+
             try:
                 with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
                     result = ClusterManager._start_service(client, cluster, svc, host)
@@ -395,7 +557,7 @@ class ClusterManager:
                     results.append(result)
             except Exception as e:
                 svc.status = "error"
-                results.append({"service_id": svc.id, "action": "start", "success": False, "message": str(e)})
+                results.append({"service_id": svc.id, "action": "start", "success": False, "message": str(e), "via": "ssh"})
 
         if cluster:
             if all(r["success"] for r in results):

@@ -116,8 +116,90 @@ class KafkaAdmin:
 
     @staticmethod
     def _run_kafka_cmd(host: Host, cmd: str, timeout: int = 30) -> tuple[int, str, str]:
+        """Execute a kafka-*.sh command. Prefers the agent over SSH so that
+        banking deployments without inbound SSH work transparently.
+
+        The agent path needs structured args (install_dir, script, bootstrap,
+        rest), so we parse the SSH-shaped string back into pieces. If parsing
+        fails (unexpected shape — e.g. `cd /opt/kafka && ./bin/...`), the SSH
+        fallback runs unchanged.
+        """
+        from app.services import agent_transport
+        if agent_transport.agent_available(host.id):
+            parsed = KafkaAdmin._parse_kafka_invocation(cmd)
+            if parsed is not None:
+                verb, install_dir, bootstrap, extra_args, command_config = parsed
+                try:
+                    ok, stdout, stderr = agent_transport.kafka_cli(
+                        host, verb, bootstrap, install_dir, extra_args,
+                        command_config=command_config, timeout_sec=timeout,
+                    )
+                    return (0 if ok else 1), stdout, stderr
+                except Exception as e:
+                    import logging as _logging
+                    _logging.getLogger("tantor.kafka_admin").warning(
+                        "agent kafka_cli.%s dispatch failed: %s; falling back to SSH", verb, e,
+                    )
+
         with SSHManager.connect(host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential) as client:
             return SSHManager.exec_command(client, cmd, timeout=timeout)
+
+    @staticmethod
+    def _parse_kafka_invocation(cmd: str) -> tuple[str, str, str, list[str], str | None] | None:
+        """Parse the SSH-shaped string format that kafka_admin assembles —
+        "<install_dir>/bin/<script>.sh --bootstrap-server <host:port> [args...]
+        [--command-config <path>]" — back into the (verb, install_dir,
+        bootstrap, extra_args, command_config) tuple the agent expects.
+
+        Returns None on any format we don't recognize so the caller can fall
+        back to SSH. Conservative: better to take the slower path than to
+        misroute a command.
+        """
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            return None
+        if not tokens:
+            return None
+
+        # First token must be "<install_dir>/bin/kafka-<verb>.sh"
+        script_path = tokens[0]
+        if "/bin/kafka-" not in script_path or not script_path.endswith(".sh"):
+            return None
+        bin_idx = script_path.rfind("/bin/")
+        install_dir = script_path[:bin_idx]
+        script_basename = script_path[bin_idx + len("/bin/"):]
+        verb_map = {
+            "kafka-topics.sh": "topics",
+            "kafka-configs.sh": "configs",
+            "kafka-acls.sh": "acls",
+            "kafka-consumer-groups.sh": "consumer_groups",
+        }
+        verb = verb_map.get(script_basename)
+        if verb is None:
+            return None
+
+        bootstrap = ""
+        command_config: str | None = None
+        extra_args: list[str] = []
+
+        i = 1
+        while i < len(tokens):
+            t = tokens[i]
+            if t == "--bootstrap-server" and i + 1 < len(tokens):
+                bootstrap = tokens[i + 1]
+                i += 2
+                continue
+            if t == "--command-config" and i + 1 < len(tokens):
+                command_config = tokens[i + 1]
+                i += 2
+                continue
+            extra_args.append(t)
+            i += 1
+
+        if not bootstrap:
+            return None
+        return verb, install_dir, bootstrap, extra_args, command_config
 
     # ── Topics ──────────────────────────────────────────
 

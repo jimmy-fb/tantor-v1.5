@@ -95,6 +95,36 @@ class LogManager:
         else:
             log_path = SERVICE_LOG_FILE_MAP.get(service_role, "/opt/kafka/logs/server.log")
 
+        # Agent-first path. The agent's journalctl.read op covers the
+        # historical-read case fully; the log-file fallback (for hosts
+        # without systemd journal) still lives on the SSH path until we
+        # add a file.read op for arbitrary /opt/kafka-*/logs paths.
+        from app.services import agent_transport
+        if agent_transport.agent_available(host.id):
+            try:
+                ok, body = agent_transport.journal_read(
+                    host, f"{unit_name}.service", lines=lines,
+                    since=since, priority=priority,
+                )
+                if ok:
+                    log_lines = body.splitlines() if body else []
+                    # Apply grep_filter in Python (agent rejects grep for
+                    # safety; see agent/internal/ops/journalctl.go).
+                    if grep_filter:
+                        gl = grep_filter.lower()
+                        log_lines = [ln for ln in log_lines if gl in ln.lower()]
+                    return {
+                        "host_ip": host.ip_address,
+                        "hostname": host.hostname,
+                        "role": service_role,
+                        "lines": log_lines,
+                        "line_count": len(log_lines),
+                        "via": "agent",
+                    }
+                logger.info(f"agent journalctl returned non-zero for {unit_name} ({body[:120]}); falling back to SSH")
+            except Exception as e:
+                logger.warning(f"agent journal_read failed for {host.ip_address}: {e}; falling back to SSH")
+
         try:
             with SSHManager.connect(
                 host.ip_address, host.ssh_port, host.username,
@@ -120,6 +150,7 @@ class LogManager:
                     "role": service_role,
                     "lines": log_lines,
                     "line_count": len(log_lines),
+                    "via": "ssh",
                 }
         except Exception as e:
             logger.error(f"Failed to fetch logs from {host.ip_address}: {e}")
@@ -129,6 +160,7 @@ class LogManager:
                 "role": service_role,
                 "lines": [f"SSH connection failed: {e}"],
                 "line_count": 1,
+                "via": "ssh",
             }
 
     @staticmethod

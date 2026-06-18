@@ -95,12 +95,16 @@ def systemctl_is_active(host: Host, unit: str) -> tuple[bool, str]:
     return state in ("active", "activating"), state
 
 
-def systemctl_action(host: Host, action: str, unit: str) -> tuple[bool, str]:
-    """Run a systemctl start/stop/restart. Returns (success, message)."""
+def systemctl_action(host: Host, action: str, unit: str, *, mode: str | None = None) -> tuple[bool, str]:
+    """Run a systemctl start/stop/restart/enable/disable/kill/reset_failed.
+    Returns (success, message)."""
     op = f"systemctl.{action}"
     if not agent_available(host.id):
         raise RuntimeError("agent not available")
-    res = run_op(host.id, op, {"unit": unit}, timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
+    args: dict[str, Any] = {"unit": unit}
+    if mode is not None:
+        args["mode"] = mode
+    res = run_op(host.id, op, args, timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
     if not res.get("ok"):
         err = res.get("error") or {}
         return False, f"{err.get('code', 'agent_error')}: {err.get('message', '')}"
@@ -108,6 +112,82 @@ def systemctl_action(host: Host, action: str, unit: str) -> tuple[bool, str]:
     if r.get("exit_code", 0) == 0:
         return True, f"{action} {unit} ok"
     return False, (r.get("stderr") or f"systemctl exit {r.get('exit_code')}")
+
+
+def systemctl_daemon_reload(host: Host) -> tuple[bool, str]:
+    """`systemctl daemon-reload` via the agent. No unit needed."""
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    res = run_op(host.id, "systemctl.daemon_reload", {}, timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
+    if not res.get("ok"):
+        err = res.get("error") or {}
+        return False, f"{err.get('code', 'agent_error')}: {err.get('message', '')}"
+    r = res["result"]
+    return r.get("exit_code", 0) == 0, (r.get("stderr") or "")
+
+
+def unit_exists_via_agent(host: Host, unit: str) -> bool:
+    """`systemctl cat <unit>` → exit 0 if the unit file exists."""
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    res = run_op(host.id, "systemctl.cat", {"unit": unit}, timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
+    if not res.get("ok"):
+        return False
+    return res["result"].get("exit_code", 0) == 0
+
+
+def unit_state_via_agent(host: Host, unit: str) -> str:
+    """`systemctl is-active <unit>` → returns the raw state string
+    ("active", "inactive", "failed", "activating", "unknown")."""
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    res = run_op(host.id, "systemctl.is_active", {"unit": unit}, timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
+    if not res.get("ok"):
+        return "unknown"
+    return (res["result"].get("stdout") or "").strip() or "unknown"
+
+
+def file_write_via_agent(host: Host, path: str, content: str, *, mode: int = 0o644) -> tuple[bool, str]:
+    """Write a file through the agent (gated by the in-agent allowlist +
+    the host's sudoers profile). Used by broker_config and agent-based
+    deploy."""
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    res = run_op(host.id, "file.write",
+                 {"path": path, "content": content, "mode": mode},
+                 timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
+    if not res.get("ok"):
+        err = res.get("error") or {}
+        return False, f"{err.get('code', 'agent_error')}: {err.get('message', '')}"
+    r = res["result"]
+    return r.get("exit_code", 0) == 0, (r.get("stderr") or "")
+
+
+def file_delete_via_agent(host: Host, path: str) -> tuple[bool, str]:
+    """Delete a file through the agent. Path is gated by the in-agent
+    allowlist + sudoers (only systemd unit files allowed currently)."""
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    res = run_op(host.id, "file.delete", {"path": path}, timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
+    if not res.get("ok"):
+        err = res.get("error") or {}
+        return False, f"{err.get('code', 'agent_error')}: {err.get('message', '')}"
+    r = res["result"]
+    return r.get("exit_code", 0) == 0, (r.get("stderr") or "")
+
+
+def file_read_via_agent(host: Host, path: str) -> tuple[bool, str]:
+    """Read a file through the agent. Returns (success, content)."""
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    res = run_op(host.id, "file.read", {"path": path}, timeout_sec=DEFAULT_SYSTEMCTL_TIMEOUT_SEC)
+    if not res.get("ok"):
+        err = res.get("error") or {}
+        return False, f"{err.get('code', 'agent_error')}: {err.get('message', '')}"
+    r = res["result"]
+    if r.get("exit_code", 0) != 0:
+        return False, (r.get("stderr") or f"file.read exit {r.get('exit_code')}")
+    return True, r.get("stdout") or ""
 
 
 def journal_read(host: Host, unit: str, lines: int = 200, since: str | None = None, priority: str | None = None) -> tuple[bool, str]:
