@@ -49,7 +49,7 @@ logger = logging.getLogger("tantor.agent_deployer")
 # Where the SCM serves the Kafka tarball from. The customer pre-stages the
 # tarball alongside the Tantor backend (same path the SSH playbook reads
 # from) and this URL is consumed by the agent's file.download op.
-DEFAULT_KAFKA_TARBALL_URL_FMT = "{scm_base}/repo/kafka/{filename}"
+DEFAULT_KAFKA_TARBALL_URL_FMT = "{scm_base}/api/repo/kafka/{filename}"
 
 
 def supports_agent_deploy(cluster: Cluster, services: list[Service], hosts_by_id: dict[str, Host]) -> tuple[bool, str]:

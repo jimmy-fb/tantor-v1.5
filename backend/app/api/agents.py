@@ -251,12 +251,22 @@ STATE_DIR=/var/lib/tantor-agent
 echo "[tantor-agent] detected platform: $PLATFORM"
 echo "[tantor-agent] SCM: $SCM_URL"
 
-# 1) Service account + dirs
+# 1) Service accounts + dirs
 if ! id tantor-agent >/dev/null 2>&1; then
     useradd --system --shell /usr/sbin/nologin --home-dir "$STATE_DIR" tantor-agent
 fi
+# kafka user is pre-created here so install-kafka.sh (which runs under the
+# agent's hardened systemd unit with ProtectSystem=strict — /etc is read-only)
+# doesn't have to. The script's `id kafka >/dev/null` check makes that a no-op.
+if ! id kafka >/dev/null 2>&1; then
+    useradd --system --shell /usr/sbin/nologin --home-dir /opt/kafka kafka
+fi
 install -d -o tantor-agent -g tantor-agent -m 0700 "$STATE_DIR"
 install -d -o root -g tantor-agent -m 0750 "$CFG_DIR"
+# /opt/tantor-stage holds the Kafka tarball (and any other artifacts the
+# agent-based deployer downloads). The agent's file.download op needs
+# this dir present before it can land files there.
+install -d -o root -g root -m 0755 /opt/tantor-stage
 
 # 2) Download binary
 echo "[tantor-agent] downloading binary..."
@@ -379,7 +389,7 @@ RestartSec=5
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/tantor-agent
+ReadWritePaths=/var/lib/tantor-agent /opt /var/lib /etc/systemd/system
 NoNewPrivileges=false
 CPUQuota=50%
 MemoryMax=256M
@@ -423,6 +433,39 @@ def download_agent_script(name: str):
         )
     with open(path, "rb") as f:
         return PlainTextResponse(content=f.read().decode("utf-8"), media_type="text/x-shellscript")
+
+
+_KAFKA_REPO_DIR = os.environ.get(
+    "TANTOR_KAFKA_REPO_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "repo", "kafka"),
+)
+
+
+@router.get("/repo/kafka/{filename}")
+def download_kafka_tarball(filename: str):
+    """Serve a Kafka tarball to the agent's file.download op.
+
+    The repo lives at `backend/repo/kafka/` on the SCM by default and is the
+    same directory the SSH/Ansible deployer reads from — operators stage one
+    place, both transports work. The route is intentionally NOT auth-gated
+    because the agent isn't logged in as a Tantor user; we accept some risk
+    here since the contents are Apache Kafka releases (public artifacts) and
+    the file allowlist below stops anyone from snooping arbitrary paths.
+    """
+    # Allowlist: only kafka tarballs under the repo dir. Reject .. and any
+    # filename that doesn't match the expected shape.
+    import re as _re
+    if not _re.match(r"^kafka_[0-9.]+-[0-9.]+\.tgz$", filename):
+        raise HTTPException(status_code=400, detail="invalid kafka tarball filename")
+    path = os.path.abspath(os.path.join(_KAFKA_REPO_DIR, filename))
+    if not path.startswith(os.path.abspath(_KAFKA_REPO_DIR) + os.sep):
+        raise HTTPException(status_code=400, detail="path traversal attempt")
+    if not os.path.isfile(path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"kafka tarball {filename} not staged on SCM (expected at {_KAFKA_REPO_DIR}/{filename})",
+        )
+    return FileResponse(path, media_type="application/gzip", filename=filename)
 
 
 @router.get("/agents/binary/{platform}")

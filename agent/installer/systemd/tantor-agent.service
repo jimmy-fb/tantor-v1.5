@@ -18,7 +18,10 @@ NoNewPrivileges=false
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/tantor-agent
+# /opt and /var/lib for Kafka install + data dirs; /etc/systemd/system so
+# unit files can be installed via sudo install; /etc/sudoers.d for nothing
+# (the agent doesn't write there, but listing here doesn't grant access).
+ReadWritePaths=/var/lib/tantor-agent /opt /var/lib /etc/systemd/system
 DevicePolicy=closed
 ProtectKernelTunables=true
 ProtectKernelModules=true
