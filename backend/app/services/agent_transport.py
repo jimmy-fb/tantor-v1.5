@@ -190,6 +190,56 @@ def file_read_via_agent(host: Host, path: str) -> tuple[bool, str]:
     return True, r.get("stdout") or ""
 
 
+# ---------- install-time helpers (agent-based deploy) ----------
+
+DEFAULT_DOWNLOAD_TIMEOUT_SEC = 600   # large tarballs over a slow link
+DEFAULT_SCRIPT_TIMEOUT_SEC = 600     # apt-get install + tar extract
+
+
+def file_download_via_agent(host: Host, url: str, dest: str, *, sha256: str | None = None, mode: int = 0o644, timeout_sec: int = DEFAULT_DOWNLOAD_TIMEOUT_SEC) -> tuple[bool, str]:
+    """Tell the agent to fetch <url> and install it at <dest>.
+
+    The agent restricts dest to /opt/kafka-*, /opt/tantor-stage/, or
+    /tmp/tantor-agent-download-* and verifies sha256 (if supplied) before
+    moving the file into place.
+    """
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    args: dict[str, Any] = {"url": url, "dest": dest, "mode": mode}
+    if sha256:
+        args["sha256"] = sha256
+    res = run_op(host.id, "file.download", args, timeout_sec=timeout_sec)
+    if not res.get("ok"):
+        err = res.get("error") or {}
+        return False, f"{err.get('code', 'agent_error')}: {err.get('message', '')}"
+    r = res["result"]
+    if r.get("exit_code", 0) != 0:
+        return False, (r.get("stderr") or f"download exit {r.get('exit_code')}")
+    return True, r.get("stdout") or ""
+
+
+def exec_script_via_agent(host: Host, script: str, script_args: list[str] | None = None, *, timeout_sec: int = DEFAULT_SCRIPT_TIMEOUT_SEC) -> tuple[bool, str, str]:
+    """Run a pre-installed script (under /usr/local/lib/tantor-agent/scripts/)
+    on the host with the supplied positional args. Returns (success, stdout, stderr).
+
+    The agent rejects unknown script names and arguments containing shell
+    metacharacters. Scripts ship as part of the agent package — operators
+    cannot upload new scripts at runtime.
+    """
+    if not agent_available(host.id):
+        raise RuntimeError("agent not available")
+    args: dict[str, Any] = {"script": script}
+    if script_args:
+        args["args"] = list(script_args)
+    res = run_op(host.id, "exec.script", args, timeout_sec=timeout_sec)
+    if not res.get("ok"):
+        err = res.get("error") or {}
+        return False, "", f"{err.get('code', 'agent_error')}: {err.get('message', '')}"
+    r = res["result"]
+    ok = r.get("exit_code", 0) == 0
+    return ok, r.get("stdout") or "", r.get("stderr") or ""
+
+
 def journal_read(host: Host, unit: str, lines: int = 200, since: str | None = None, priority: str | None = None) -> tuple[bool, str]:
     """Read last N lines of a unit's journal via the agent. Returns
     (success, body)."""

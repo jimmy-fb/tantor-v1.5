@@ -63,8 +63,12 @@ func (d *Dispatcher) Run(ctx context.Context, cmd *proto.CmdPayload) (*proto.Res
 		return d.runJournalctl(ctx, cmd, timeout)
 	case strings.HasPrefix(cmd.Op, "kafka_cli."):
 		return d.runKafkaCLI(ctx, cmd, timeout)
+	case cmd.Op == "file.download":
+		return d.runDownload(ctx, cmd, timeout)
 	case strings.HasPrefix(cmd.Op, "file."):
 		return d.runFile(ctx, cmd, timeout)
+	case cmd.Op == "exec.script":
+		return d.runScript(ctx, cmd, timeout)
 	case strings.HasPrefix(cmd.Op, "exec."):
 		return d.runExec(ctx, cmd, timeout)
 	default:

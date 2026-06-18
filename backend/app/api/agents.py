@@ -83,6 +83,9 @@ DEFAULT_ALLOWED_OPS = [
     # Diagnostics
     "exec.ss",
     "exec.systemd-cgls",
+    # Install-time ops (Step 3 — agent-based deployer)
+    "file.download",
+    "exec.script",
 ]
 
 
@@ -193,6 +196,18 @@ _AGENT_PLATFORMS = {
     "linux-amd64": "tantor-agent-linux-amd64",
     "linux-arm64": "tantor-agent-linux-arm64",
 }
+# Scripts shipped alongside the binary. The bootstrap installer pulls these
+# down so the agent can run them via exec.script.
+_AGENT_SCRIPTS_DIR = os.environ.get(
+    "TANTOR_AGENT_SCRIPTS_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agent", "installer", "scripts"),
+)
+_AGENT_SCRIPT_NAMES = (
+    "install-kafka.sh",
+    "install-java.sh",
+    "install-systemd-unit.sh",
+    "uninstall-kafka.sh",
+)
 
 
 @router.get("/agents/install.sh", response_class=PlainTextResponse)
@@ -250,6 +265,18 @@ curl -fsSL "$SCM_URL/api/agents/binary/$PLATFORM" -o "$TMP_BIN"
 install -m 0755 -o root -g root "$TMP_BIN" "$BIN_DIR/tantor-agent"
 rm -f "$TMP_BIN"
 
+# 2b) Download install scripts (used by Tantor's agent-based deployer for
+# install-kafka / install-java / install-systemd-unit / uninstall-kafka).
+echo "[tantor-agent] installing helper scripts..."
+SCRIPTS_DIR=/usr/local/lib/tantor-agent/scripts
+install -d -o root -g root -m 0755 "$SCRIPTS_DIR"
+for SCRIPT in install-kafka.sh install-java.sh install-systemd-unit.sh uninstall-kafka.sh; do
+    TMP_SCRIPT=$(mktemp)
+    curl -fsSL "$SCM_URL/api/agents/scripts/$SCRIPT" -o "$TMP_SCRIPT"
+    install -m 0755 -o root -g root "$TMP_SCRIPT" "$SCRIPTS_DIR/$SCRIPT"
+    rm -f "$TMP_SCRIPT"
+done
+
 # 3) Write config.yaml
 cat > "$CFG_DIR/config.yaml" <<EOF
 scm_url: "$WS_URL"
@@ -284,6 +311,8 @@ allowed_operations:
   - kafka_cli.consumer_groups
   - exec.ss
   - exec.systemd-cgls
+  - file.download
+  - exec.script
 EOF
 chmod 0640 "$CFG_DIR/config.yaml"
 chown root:tantor-agent "$CFG_DIR/config.yaml"
@@ -317,9 +346,17 @@ Cmnd_Alias TANTOR_FILEDELETE = \\
     /usr/bin/rm -f /etc/systemd/system/kafka-*.service, /usr/bin/rm -f /etc/systemd/system/zookeeper-*.service
 Cmnd_Alias TANTOR_KAFKA_CLI = /opt/kafka-*/bin/kafka-topics.sh, /opt/kafka-*/bin/kafka-configs.sh, /opt/kafka-*/bin/kafka-acls.sh, /opt/kafka-*/bin/kafka-consumer-groups.sh
 Cmnd_Alias TANTOR_EXEC = /bin/ss -tnlp, /usr/sbin/ss -tnlp, /usr/bin/ss -tnlp, /bin/systemd-cgls --unit * --no-pager, /usr/bin/systemd-cgls --unit * --no-pager
+Cmnd_Alias TANTOR_INSTALL = \\
+    /usr/local/lib/tantor-agent/scripts/install-kafka.sh *, \\
+    /usr/local/lib/tantor-agent/scripts/install-java.sh *, \\
+    /usr/local/lib/tantor-agent/scripts/install-systemd-unit.sh *, \\
+    /usr/local/lib/tantor-agent/scripts/uninstall-kafka.sh *
+Cmnd_Alias TANTOR_DOWNLOAD = \\
+    /usr/bin/install -m * /tmp/tantor-dl-* /opt/kafka-*/*, \\
+    /usr/bin/install -m * /tmp/tantor-dl-* /opt/tantor-stage/*
 
-tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_FILEDELETE, TANTOR_KAFKA_CLI, TANTOR_EXEC
-Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_FILEDELETE,TANTOR_KAFKA_CLI,TANTOR_EXEC !requiretty
+tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_FILEDELETE, TANTOR_KAFKA_CLI, TANTOR_EXEC, TANTOR_INSTALL, TANTOR_DOWNLOAD
+Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_FILEDELETE,TANTOR_KAFKA_CLI,TANTOR_EXEC,TANTOR_INSTALL,TANTOR_DOWNLOAD !requiretty
 SUDOERS_EOF
 visudo -c -f /etc/sudoers.d/tantor-agent.tmp >/dev/null
 install -m 0440 -o root -g root /etc/sudoers.d/tantor-agent.tmp /etc/sudoers.d/tantor-agent
@@ -367,6 +404,25 @@ else
 fi
 """
     return PlainTextResponse(content=script, media_type="text/x-shellscript")
+
+
+@router.get("/agents/scripts/{name}", response_class=PlainTextResponse)
+def download_agent_script(name: str):
+    """Serve a single agent install script (pulled by the bootstrap installer).
+
+    Only the names in _AGENT_SCRIPT_NAMES are served — the SCM never exposes
+    arbitrary files from its filesystem under this prefix.
+    """
+    if name not in _AGENT_SCRIPT_NAMES:
+        raise HTTPException(status_code=404, detail=f"unknown agent script {name!r}")
+    path = os.path.abspath(os.path.join(_AGENT_SCRIPTS_DIR, name))
+    if not os.path.isfile(path):
+        raise HTTPException(
+            status_code=503,
+            detail=f"agent script {name} not present at {path} (operator deployment issue)",
+        )
+    with open(path, "rb") as f:
+        return PlainTextResponse(content=f.read().decode("utf-8"), media_type="text/x-shellscript")
 
 
 @router.get("/agents/binary/{platform}")

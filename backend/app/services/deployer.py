@@ -27,6 +27,17 @@ logger = logging.getLogger("tantor.deployer")
 _MAX_LOG_LINES = 5000
 
 
+def _append_to_log(task_id: str, message: str) -> None:
+    """Append a single log line using a short-lived DB session. Used by the
+    transport-selection logic before either deployer takes ownership of the
+    task row."""
+    db = SessionLocal()
+    try:
+        _append_log(db, task_id, message)
+    finally:
+        db.close()
+
+
 # ── Task store (DB-backed) ────────────────────────────────────────────────
 
 
@@ -141,7 +152,68 @@ def deploy_cluster(cluster_id: str, task_id: str) -> None:
     closes the moment the HTTP response is sent). Always logs into the
     persisted `deployment_tasks` row so the API can report progress even if
     the worker is on a different process.
+
+    Picks an agent-based deploy when:
+      * `cluster.config_json.deploy_via == "agent"` (operator opted in), OR
+      * the agent path supports this cluster AND every target host has a
+        connected agent — auto-pick.
+
+    Falls back to the legacy Ansible+SSH deployer in every other case.
     """
+    # First, decide which deployer runs. The decision must be made in a
+    # short-lived session so the SSH path (which opens its own session
+    # later) doesn't see the same row.
+    decision_db = SessionLocal()
+    use_agent = False
+    agent_reason = "auto-pick declined"
+    try:
+        cluster = decision_db.query(Cluster).filter(Cluster.id == cluster_id).first()
+        services = decision_db.query(Service).filter(Service.cluster_id == cluster_id).all() if cluster else []
+        hosts_by_id = {h.id: h for h in decision_db.query(Host).all()}
+        if cluster:
+            from app.services import agent_deployer
+            cfg = json.loads(cluster.config_json) if cluster.config_json else {}
+            explicit = (cfg.get("deploy_via") or "").lower()  # "agent" | "ssh" | ""
+            if explicit == "ssh":
+                use_agent = False
+                agent_reason = "operator opted out (deploy_via=ssh)"
+            elif explicit == "agent":
+                ok, reason = agent_deployer.supports_agent_deploy(cluster, services, hosts_by_id)
+                if ok:
+                    use_agent = True
+                    agent_reason = "operator opted in"
+                else:
+                    use_agent = False
+                    agent_reason = f"operator opted in but prereqs not met: {reason}"
+            else:
+                ok, reason = agent_deployer.supports_agent_deploy(cluster, services, hosts_by_id)
+                use_agent = ok
+                agent_reason = "auto-pick: " + reason
+    finally:
+        decision_db.close()
+
+    if use_agent:
+        from app.services import agent_deployer
+        # Resolve SCM base URL + tarball filename. For now we hardcode the
+        # tarball name to match the SSH deployer's convention; the SCM serves
+        # it from /repo/kafka/. SCM URL needs to be reachable BY the broker —
+        # operators set TANTOR_SCM_PUBLIC_URL or we fall back to the bind URL.
+        import os
+        from app.services import cert_manager  # noqa: F401 — keep import order
+        scm_base = os.environ.get("TANTOR_SCM_PUBLIC_URL", "http://127.0.0.1:8000")
+        # Pick the version-specific tarball that already lives under repo/kafka.
+        decision_db = SessionLocal()
+        try:
+            cluster = decision_db.query(Cluster).filter(Cluster.id == cluster_id).first()
+            tarball = f"kafka_2.13-{cluster.kafka_version}.tgz" if cluster and cluster.kafka_version else "kafka_2.13-3.7.0.tgz"
+        finally:
+            decision_db.close()
+        _append_to_log(task_id, f"[deployer] using agent-based deploy (reason: {agent_reason})")
+        agent_deployer.deploy_cluster(cluster_id, task_id, scm_base, tarball)
+        return
+
+    _append_to_log(task_id, f"[deployer] using SSH/Ansible deploy ({agent_reason})")
+
     db = SessionLocal()
     try:
         _deploy_cluster_inner(cluster_id, task_id, db)

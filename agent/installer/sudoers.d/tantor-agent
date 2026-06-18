@@ -85,8 +85,23 @@ Cmnd_Alias TANTOR_EXEC = \
     /bin/systemd-cgls --unit * --no-pager, \
     /usr/bin/systemd-cgls --unit * --no-pager
 
-tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_FILEDELETE, TANTOR_KAFKA_CLI, TANTOR_EXEC
+# Install-time scripts shipped with the agent. The agent only invokes
+# these by NAME under /usr/local/lib/tantor-agent/scripts/, and each
+# script self-validates its path arguments (no shell injection surface).
+Cmnd_Alias TANTOR_INSTALL = \
+    /usr/local/lib/tantor-agent/scripts/install-kafka.sh *, \
+    /usr/local/lib/tantor-agent/scripts/install-java.sh *, \
+    /usr/local/lib/tantor-agent/scripts/install-systemd-unit.sh *, \
+    /usr/local/lib/tantor-agent/scripts/uninstall-kafka.sh *
+
+# Download op needs to drop tarballs into /opt/kafka-* (install-time) and
+# /opt/tantor-stage/ (operator-supplied artifacts staged out-of-band).
+Cmnd_Alias TANTOR_DOWNLOAD = \
+    /usr/bin/install -m * /tmp/tantor-dl-* /opt/kafka-*/*, \
+    /usr/bin/install -m * /tmp/tantor-dl-* /opt/tantor-stage/*
+
+tantor-agent ALL=(root) NOPASSWD: TANTOR_SYSTEMCTL, TANTOR_JOURNALCTL, TANTOR_FILEREAD, TANTOR_FILEWRITE, TANTOR_FILEDELETE, TANTOR_KAFKA_CLI, TANTOR_EXEC, TANTOR_INSTALL, TANTOR_DOWNLOAD
 
 # Reject shell escapes outright. Even though the cmd alias paths don't include
 # any shell, this defends against operator-added entries that might.
-Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_FILEDELETE,TANTOR_KAFKA_CLI,TANTOR_EXEC !requiretty
+Defaults!TANTOR_SYSTEMCTL,TANTOR_JOURNALCTL,TANTOR_FILEREAD,TANTOR_FILEWRITE,TANTOR_FILEDELETE,TANTOR_KAFKA_CLI,TANTOR_EXEC,TANTOR_INSTALL,TANTOR_DOWNLOAD !requiretty
