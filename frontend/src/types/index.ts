@@ -1,4 +1,5 @@
-export type HostAuthType = 'password' | 'key' | 'arcos';
+// 'agent' — v1.5+ reverse-tunnel agent mode (no SSH credentials required).
+export type HostAuthType = 'agent' | 'password' | 'key' | 'arcos';
 
 export interface Host {
   id: string;

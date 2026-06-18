@@ -15,13 +15,18 @@ router = APIRouter(prefix="/api/hosts", tags=["hosts"])
 
 @router.post("", response_model=HostResponse)
 def create_host(host_data: HostCreate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+    # Agent-mode hosts don't need SSH credentials. We still write a
+    # placeholder so the encrypted_credential column (NOT NULL on
+    # existing installs) stays satisfied; SSH paths never touch it for
+    # agent hosts because auth_type == "agent" is checked first.
+    credential_blob = host_data.credential if host_data.credential else "__agent__"
     host = Host(
         hostname=host_data.hostname,
         ip_address=host_data.ip_address,
         ssh_port=host_data.ssh_port,
-        username=host_data.username,
+        username=host_data.username or "tantor-agent",
         auth_type=host_data.auth_type,
-        encrypted_credential=encrypt(host_data.credential),
+        encrypted_credential=encrypt(credential_blob),
     )
     db.add(host)
     db.commit()
@@ -81,6 +86,31 @@ def test_host_connection(host_id: str, db: Session = Depends(get_db), _: User = 
     host = db.query(Host).filter(Host.id == host_id).first()
     if not host:
         raise HTTPException(status_code=404, detail="Host not found")
+
+    # Agent-mode hosts don't have SSH credentials — "is the agent
+    # connected and heartbeating?" IS the test. Reuses the in-memory
+    # registry the WS endpoint maintains; no SSH attempt is made.
+    if host.auth_type == "agent":
+        from app.services import agent_transport
+        if agent_transport.agent_available(host.id):
+            host.status = "online"
+            db.commit()
+            return HostTestResult(
+                success=True,
+                message="tantor-agent is connected and heartbeating",
+                os_info=host.os_info,
+            )
+        host.status = "offline"
+        db.commit()
+        return HostTestResult(
+            success=False,
+            message=(
+                "No tantor-agent connected for this host. Mint a token via "
+                "POST /api/hosts/{id}/agent/token and run the install command "
+                "on the broker host."
+            ),
+            os_info=host.os_info,
+        )
 
     success, message, os_info = ssh_manager.test_connection(
         host.ip_address, host.ssh_port, host.username, host.auth_type, host.encrypted_credential

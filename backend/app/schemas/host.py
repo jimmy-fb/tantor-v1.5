@@ -3,16 +3,21 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-HostAuthType = Literal["password", "key", "arcos"]
+# "agent" — host is managed via the tantor-agent reverse tunnel (v1.5+).
+# No SSH credentials needed. The credential field is unused for agent hosts;
+# the registration token is minted separately via POST /api/hosts/{id}/agent/token.
+HostAuthType = Literal["agent", "password", "key", "arcos"]
 
 
 class HostCreate(BaseModel):
     hostname: str
     ip_address: str
+    # SSH-specific fields are optional. They're only required when auth_type
+    # is "password" / "key" / "arcos". For "agent" hosts they're ignored.
     ssh_port: int = 22
-    username: str
-    auth_type: HostAuthType
-    credential: str  # plaintext password, ARCOS token/password, or private key content
+    username: str = ""
+    auth_type: HostAuthType = "agent"
+    credential: str = ""  # plaintext password, ARCOS token/password, or private key content
 
 
 class HostUpdate(BaseModel):
